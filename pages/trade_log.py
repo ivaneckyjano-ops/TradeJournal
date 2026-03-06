@@ -15,6 +15,7 @@ def _build_df(trades: list[dict], show_pnl: bool = False) -> pd.DataFrame:
     for t in trades:
         pnl = db.compute_pnl(t) if show_pnl else None
         pop_v = t.get("pop_at_entry")
+        comm = t.get("commission") or 0.0
         rows.append({
             "ID": t["id"],
             "Group": t.get("group_id", "") or "",
@@ -27,14 +28,15 @@ def _build_df(trades: list[dict], show_pnl: bool = False) -> pd.DataFrame:
             "Kontrakty": t.get("contracts", 1),
             "Entry": t.get("entry_price"),
             "Exit": t.get("exit_price") if show_pnl else None,
-            "P&L ($)": pnl,
+            "Komisia": comm if show_pnl else None,
+            "P&L čistý ($)": pnl,
             "PoP (entry)": f"{pop_v*100:.1f}%" if pop_v else "—",
             "Entry dátum": t.get("entry_date", ""),
             "Exit dátum": t.get("exit_date", "") if show_pnl else None,
         })
     df = pd.DataFrame(rows)
     if not show_pnl:
-        df = df.drop(columns=["Exit", "P&L ($)", "Exit dátum"], errors="ignore")
+        df = df.drop(columns=["Exit", "Komisia", "P&L čistý ($)", "Exit dátum"], errors="ignore")
     return df
 
 
@@ -45,7 +47,8 @@ def _col_config(pnl: bool = False) -> dict:
     }
     if pnl:
         cfg["Exit"] = st.column_config.NumberColumn(format="$%.2f")
-        cfg["P&L ($)"] = st.column_config.NumberColumn(format="$%.2f")
+        cfg["Komisia"] = st.column_config.NumberColumn(format="$%.2f")
+        cfg["P&L čistý ($)"] = st.column_config.NumberColumn(format="$%.2f")
     return cfg
 
 
@@ -101,13 +104,18 @@ with tab_add:
         with c7:
             expiry_date = st.date_input("Expiry *", value=date.today(), min_value=date.today())
 
-        c8, c9, c10 = st.columns(3)
+        c8, c9, c10, c10b = st.columns([1, 1, 1, 1])
         with c8:
             contracts = st.number_input("Kontrakty", min_value=1, value=1, step=1)
         with c9:
             entry_price = st.number_input("Entry cena (prémia) *", min_value=0.0, step=0.01)
         with c10:
             entry_date = st.date_input("Dátum vstupu", value=date.today())
+        with c10b:
+            commission_input = st.number_input(
+                "Komisia ($)", min_value=0.0, step=0.01, value=0.0,
+                help="Celková komisia brokera za otvorenie (napr. 0.65 × počet kontraktov)"
+            )
 
         st.markdown("**Voliteľné — IV a PoP**")
         c11, c12 = st.columns(2)
@@ -150,6 +158,7 @@ with tab_add:
                 group_id=group_id if group_id else None,
                 iv_at_entry=iv_input if iv_input > 0 else None,
                 pop_at_entry=pop_val,
+                commission=commission_input if commission_input > 0 else None,
             )
             st.success(f"Obchod #{trade_id} uložený! {ticker} {leg_type} {option_type} ${strike:.0f}  |  PoP: {pop_val*100:.1f}%" if pop_val else f"Obchod #{trade_id} uložený!")
             st.rerun()
@@ -223,6 +232,7 @@ with tab_edit:
                 "Kontrakty": int(t.get("contracts", 1)),
                 "Entry $": float(t.get("entry_price", 0.0)),
                 "Exit $": float(t.get("exit_price", 0.0)) if t.get("exit_price") else 0.0,
+                "Komisia $": float(t.get("commission") or 0.0),
                 "Exit Date": t.get("exit_date", ""),
                 "Group ID": t.get("group_id") or "",
                 "Stratégia": t.get("strategy") or "",
@@ -241,6 +251,8 @@ with tab_edit:
                 "Strike": st.column_config.NumberColumn("Strike", format="$%.2f"),
                 "Entry $": st.column_config.NumberColumn("Entry $", format="$%.2f"),
                 "Exit $": st.column_config.NumberColumn("Exit $", format="$%.2f"),
+                "Komisia $": st.column_config.NumberColumn("Komisia $", format="$%.2f",
+                                                            help="Celková komisia brokera (entry + exit)"),
                 "Expiry": st.column_config.TextColumn("Expiry", help="Formát: YYYYMMDD"),
                 "Exit Date": st.column_config.TextColumn("Exit Date", help="Formát: YYYY-MM-DD"),
             },
@@ -277,6 +289,10 @@ with tab_edit:
                 if new_group != (orig.get("group_id") or None): updates["group_id"] = new_group
                 
                 if row["Stratégia"] != orig.get("strategy"): updates["strategy"] = row["Stratégia"]
+
+                new_comm = float(row.get("Komisia $") or 0.0)
+                if new_comm != float(orig.get("commission") or 0.0):
+                    updates["commission"] = new_comm if new_comm > 0 else None
 
                 if updates:
                     db.update_trade(trade_id=tid, **updates)
@@ -363,6 +379,7 @@ with tab_edit:
             open_legs   = [t for t in legs if t.get("status") == "Open"]
             closed_legs = [t for t in legs if t.get("status") == "Closed"]
             real_pnl    = sum(db.compute_pnl(t) or 0 for t in closed_legs)
+            total_comm  = sum(t.get("commission") or 0 for t in legs)
             # Entry cost: súčet entry_price * contracts * 100 pre otvorené nohy
             entry_cost  = sum((t.get("entry_price") or 0) * (t.get("contracts") or 1) * 100
                               for t in open_legs)
@@ -381,9 +398,10 @@ with tab_edit:
             with st.expander(header, expanded=(gid != "— (bez skupiny)")):
                 if gid != "— (bez skupiny)":
                     # Finančná stopa (malý graf alebo metriky)
-                    m1, m2, m3 = st.columns(3)
-                    m1.metric("Realizovaný zisk/strata", f"${real_pnl:+,.0f}")
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Realizovaný zisk/strata (čistý)", f"${real_pnl:+,.0f}")
                     m2.metric("Aktuálny capital", f"${entry_cost:,.0f}")
+                    m4.metric("Zaplatené komisie", f"${total_comm:,.2f}" if total_comm > 0 else "—")
                     
                     # Dátumová stopa
                     all_dates = sorted([d for d in [t.get("entry_date") for t in legs] + [t.get("exit_date") for t in legs] if d])
@@ -417,7 +435,8 @@ with tab_edit:
                         "Kontr.": t.get("contracts", 1),
                         "Entry $": t.get("entry_price"),
                         "Exit $": t.get("exit_price"),
-                        "P&L $": round(pnl_v) if pnl_v is not None else None,
+                        "Komisia $": t.get("commission") or 0.0,
+                        "P&L čistý $": round(pnl_v) if pnl_v is not None else None,
                         "Dátum": t.get("exit_date") or t.get("entry_date", ""),
                         "Stratégia": t.get("strategy", ""),
                     })
@@ -426,10 +445,11 @@ with tab_edit:
                     use_container_width=True,
                     hide_index=True,
                     column_config={
-                        "Strike":  st.column_config.NumberColumn(format="$%.2f"),
-                        "Entry $": st.column_config.NumberColumn(format="$%.2f"),
-                        "Exit $":  st.column_config.NumberColumn(format="$%.2f"),
-                        "P&L $":   st.column_config.NumberColumn(format="$%d"),
+                        "Strike":      st.column_config.NumberColumn(format="$%.2f"),
+                        "Entry $":     st.column_config.NumberColumn(format="$%.2f"),
+                        "Exit $":      st.column_config.NumberColumn(format="$%.2f"),
+                        "Komisia $":   st.column_config.NumberColumn(format="$%.2f"),
+                        "P&L čistý $": st.column_config.NumberColumn(format="$%d"),
                     },
                 )
 

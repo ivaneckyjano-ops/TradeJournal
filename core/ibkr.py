@@ -355,67 +355,131 @@ def fetch_positions() -> dict:
         return {"positions": [], "error": str(e)}
 
 
+def _pos_key(ticker, strike, expiry, leg_type, option_type) -> str:
+    """Unikátny kľúč pre porovnanie pozícií."""
+    return f"{ticker}|{strike}|{expiry}|{leg_type}|{option_type}"
+
+
 def sync_positions_to_db(positions: list[dict], db_module) -> dict:
-    """Porovná IBKR pozície s DB a pridá nové (nekopíruje duplicity)."""
-    existing = db_module.get_open_trades()
-    added = skipped = 0
-    for pos in positions:
-        if pos["sec_type"] != "OPT":
-            skipped += 1
-            continue
-        duplicate = any(
-            t["ticker"] == pos["ticker"]
-            and str(t.get("strike", "")) == str(pos["strike"])
-            and str(t.get("expiry", "")) == str(pos["expiry"])
-            and t.get("leg_type") == pos["leg_type"]
-            and t.get("option_type") == pos["option_type"]
-            for t in existing
-        )
-        if duplicate:
-            skipped += 1
-            continue
-        db_module.add_trade(
-            ticker=pos["ticker"],
-            strategy="Import IBKR",
-            leg_type=pos["leg_type"],
-            option_type=pos["option_type"],
-            strike=pos["strike"],
-            expiry=pos["expiry"],
-            contracts=pos["contracts"],
-            entry_price=pos["avg_cost"] / 100 if pos["avg_cost"] else 0.0,
-            entry_date=datetime.today().strftime("%Y-%m-%d"),
-            group_id=None, iv_at_entry=None, pop_at_entry=None,
-        )
-        added += 1
-    return {"added": added, "skipped": skipped}
+    """
+    Porovná IBKR pozície s DB:
+    1. Pridá nové pozície.
+    2. Aktualizuje contracts + avg_cost pre existujúce.
+    3. Detekuje pozície, ktoré sú v DB ako Open ale v IBKR chýbajú
+       (pravdepodobne uzavreté) → uloží do zoznamu 'possibly_closed'.
+    """
+    existing_open = db_module.get_open_trades()
+    ibkr_opts = [p for p in positions if p["sec_type"] == "OPT"]
+
+    # Mapa IBKR pozícií podľa kľúča
+    ibkr_map: dict[str, dict] = {}
+    for pos in ibkr_opts:
+        k = _pos_key(pos["ticker"], pos["strike"], pos["expiry"],
+                     pos["leg_type"], pos["option_type"])
+        ibkr_map[k] = pos
+
+    # Mapa DB open trades podľa kľúča
+    db_map: dict[str, dict] = {}
+    for t in existing_open:
+        k = _pos_key(t["ticker"], t.get("strike"), t.get("expiry"),
+                     t.get("leg_type"), t.get("option_type"))
+        db_map[k] = t
+
+    added = updated = skipped = 0
+    possibly_closed: list[dict] = []
+
+    # 1. IBKR → DB: pridaj nové, aktualizuj existujúce
+    for k, pos in ibkr_map.items():
+        if k in db_map:
+            t = db_map[k]
+            changes = {}
+            # Aktualizuj počet kontraktov
+            if pos["contracts"] != t.get("contracts"):
+                changes["contracts"] = pos["contracts"]
+            # Aktualizuj priemerné náklady (entry price)
+            new_ep = round(pos["avg_cost"] / 100, 4) if pos.get("avg_cost") else None
+            old_ep = t.get("entry_price") or 0.0
+            if new_ep is not None and abs(new_ep - old_ep) > 0.01:
+                changes["entry_price"] = new_ep
+            if changes:
+                db_module.update_trade(t["id"], **changes)
+                updated += 1
+            else:
+                skipped += 1
+        else:
+            # Nová pozícia — pridaj do DB
+            db_module.add_trade(
+                ticker=pos["ticker"],
+                strategy="Import IBKR",
+                leg_type=pos["leg_type"],
+                option_type=pos["option_type"],
+                strike=pos["strike"],
+                expiry=pos["expiry"],
+                contracts=pos["contracts"],
+                entry_price=round(pos["avg_cost"] / 100, 4) if pos.get("avg_cost") else 0.0,
+                entry_date=datetime.today().strftime("%Y-%m-%d"),
+                group_id=None, iv_at_entry=None, pop_at_entry=None,
+            )
+            added += 1
+
+    # 2. DB → IBKR: zisti pozície, ktoré zmizli z IBKR (možno uzavreté)
+    for k, t in db_map.items():
+        if k not in ibkr_map:
+            possibly_closed.append({
+                "id": t["id"],
+                "ticker": t["ticker"],
+                "leg_type": t.get("leg_type"),
+                "option_type": t.get("option_type"),
+                "strike": t.get("strike"),
+                "expiry": t.get("expiry"),
+                "entry_price": t.get("entry_price"),
+            })
+
+    return {
+        "added": added,
+        "updated": updated,
+        "skipped": skipped,
+        "possibly_closed": possibly_closed,
+    }
 
 
 def fetch_fills() -> dict:
-    """Načíta vykonané obchody (fills) z aktuálnej TWS session."""
+    """Načíta vykonané obchody (fills) z aktuálnej TWS session vrátane komisií."""
     ib = get_ib()
     if not ib or not ib.isConnected():
         return {"fills": [], "error": "Nie je pripojenie na IBKR"}
     _ib_ready()
     try:
+        # Zostavíme mapu execId → komisia z commissionReports
+        commission_map: dict[str, float] = {}
+        for cr in ib.fills():
+            if hasattr(cr, "commissionReport") and cr.commissionReport:
+                rpt = cr.commissionReport
+                eid = getattr(rpt, "execId", None) or getattr(cr.execution, "execId", None)
+                if eid and rpt.commission not in (None, 1.7976931348623157e+308):
+                    commission_map[eid] = float(rpt.commission)
+
         result = []
         for f in ib.fills():
             c = f.contract
             if c.secType != "OPT":
                 continue
             ex = f.execution
-            pos = ex.shares
+            side = ex.side.upper()  # "BOT" alebo "SLD"
+            comm = commission_map.get(ex.execId, 0.0)
             result.append({
                 "ticker": c.symbol,
                 "option_type": "Call" if c.right == "C" else "Put",
                 "strike": float(c.strike),
                 "expiry": c.lastTradeDateOrContractMonth,
-                "contracts": int(abs(pos)),
-                "leg_type": "Long" if pos > 0 else "Short",
+                "contracts": int(abs(ex.shares)),
+                "leg_type": "Long" if side == "BOT" else "Short",
                 "entry_price": ex.price,
-                "entry_date": ex.time[:10] if ex.time else datetime.today().strftime("%Y-%m-%d"),
+                "entry_date": (ex.time.strftime("%Y-%m-%d") if hasattr(ex.time, "strftime") else str(ex.time)[:10]) if ex.time else datetime.today().strftime("%Y-%m-%d"),
                 "exec_id": ex.execId,
-                "side": ex.side,
+                "side": side,
                 "account": ex.acctNumber,
+                "commission": comm,
             })
         return {"fills": result, "error": None}
     except Exception as e:
@@ -423,15 +487,63 @@ def fetch_fills() -> dict:
 
 
 def sync_fills_to_db(fills: list[dict], db_module) -> dict:
-    """Importuje fills do DB. Preskočí duplicity."""
+    """
+    Importuje fills do DB.
+    - BOT fill + existujúca Open Short pozícia → uzavrie ju (close).
+    - SLD fill + existujúca Open Long  pozícia → uzavrie ju (close).
+    - Ostatné fills pridá ako nové obchody (ak ešte neexistujú).
+
+    Poznámka: ex.shares je vždy kladné, preto sa leg_type nedá odvodiť zo znamienka.
+    Namiesto toho porovnáme fill priamo s otvorenými pozíciami v DB.
+    """
     existing = db_module.get_all_trades()
-    added = skipped = 0
+    open_trades = [t for t in existing if t.get("status") == "Open"]
+    added = skipped = closed = 0
+
     for fill in fills:
+        side = fill.get("side", "").upper()   # "BOT" alebo "SLD"
+
+        # Určíme, aký typ otvorenej pozície by tento fill UZATVÁRAL
+        # BOT uzatvára Short; SLD uzatvára Long
+        close_leg = "Short" if side == "BOT" else "Long"
+
+        # Pokús sa nájsť zodpovedajúcu Open pozíciu na uzavretie
+        target = next(
+            (
+                t for t in open_trades
+                if t["ticker"] == fill["ticker"]
+                and str(t.get("strike", "")) == str(fill["strike"])
+                and str(t.get("expiry", "")) == str(fill["expiry"])
+                and t.get("option_type") == fill["option_type"]
+                and t.get("leg_type") == close_leg
+                and t.get("status") == "Open"
+            ),
+            None,
+        )
+
+        if target:
+            # Celková komisia = entry komisia (uložená) + exit komisia (z tohto fillu)
+            existing_comm = float(target.get("commission") or 0.0)
+            exit_comm     = float(fill.get("commission") or 0.0)
+            total_comm    = existing_comm + exit_comm
+            db_module.update_trade(
+                target["id"],
+                exit_price=fill["entry_price"],
+                exit_date=fill["entry_date"],
+                status="Closed",
+                commission=total_comm if total_comm > 0 else None,
+            )
+            open_trades = [t for t in open_trades if t["id"] != target["id"]]
+            closed += 1
+            continue
+
+        # Otváracie plnenie — leg_type podľa smeru (BOT=Long, SLD=Short)
+        open_leg = "Long" if side == "BOT" else "Short"
         duplicate = any(
             t["ticker"] == fill["ticker"]
             and str(t.get("strike", "")) == str(fill["strike"])
             and str(t.get("expiry", "")) == str(fill["expiry"])
-            and t.get("leg_type") == fill["leg_type"]
+            and t.get("leg_type") == open_leg
             and t.get("option_type") == fill["option_type"]
             and t.get("entry_date", "") == fill["entry_date"]
             for t in existing
@@ -442,7 +554,7 @@ def sync_fills_to_db(fills: list[dict], db_module) -> dict:
         db_module.add_trade(
             ticker=fill["ticker"],
             strategy="Import Fills",
-            leg_type=fill["leg_type"],
+            leg_type=open_leg,
             option_type=fill["option_type"],
             strike=fill["strike"],
             expiry=fill["expiry"],
@@ -450,9 +562,10 @@ def sync_fills_to_db(fills: list[dict], db_module) -> dict:
             entry_price=fill["entry_price"],
             entry_date=fill["entry_date"],
             group_id=None, iv_at_entry=None, pop_at_entry=None,
+            commission=fill.get("commission") or 0.0,
         )
         added += 1
-    return {"added": added, "skipped": skipped}
+    return {"added": added, "skipped": skipped, "closed": closed}
 
 
 # ─── Expirácie ─────────────────────────────────────────────────────────────────

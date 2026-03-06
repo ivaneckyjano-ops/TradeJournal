@@ -85,7 +85,8 @@ def init_db() -> None:
             );
         """)
     # Migrácia: pridaj nové stĺpce do existujúcich DB
-    _migrate_symbols(conn if False else get_connection())
+    _migrate_symbols(get_connection())
+    _migrate_trades(get_connection())
 
 
 def _migrate_symbols(conn: sqlite3.Connection) -> None:
@@ -96,6 +97,18 @@ def _migrate_symbols(conn: sqlite3.Connection) -> None:
         "earnings_date_3": "ALTER TABLE symbols ADD COLUMN earnings_date_3 TEXT",
         "earnings_date_4": "ALTER TABLE symbols ADD COLUMN earnings_date_4 TEXT",
         "ir_url":          "ALTER TABLE symbols ADD COLUMN ir_url TEXT",
+    }
+    for col, sql in migrations.items():
+        if col not in existing:
+            conn.execute(sql)
+    conn.commit()
+
+
+def _migrate_trades(conn: sqlite3.Connection) -> None:
+    """Bezpečne pridá nové stĺpce do trades ak ešte neexistujú."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
+    migrations = {
+        "commission": "ALTER TABLE trades ADD COLUMN commission REAL DEFAULT 0.0",
     }
     for col, sql in migrations.items():
         if col not in existing:
@@ -218,15 +231,18 @@ def add_trade(
     group_id: Optional[str] = None,
     iv_at_entry: Optional[float] = None,
     pop_at_entry: Optional[float] = None,
+    commission: Optional[float] = None,
 ) -> int:
     with get_connection() as conn:
         cur = conn.execute(
             """INSERT INTO trades
                (ticker, strategy, leg_type, option_type, strike, expiry,
-                contracts, entry_price, entry_date, group_id, iv_at_entry, pop_at_entry)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                contracts, entry_price, entry_date, group_id, iv_at_entry, pop_at_entry,
+                commission)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (ticker, strategy, leg_type, option_type, strike, expiry,
-             contracts, entry_price, entry_date, group_id, iv_at_entry, pop_at_entry),
+             contracts, entry_price, entry_date, group_id, iv_at_entry, pop_at_entry,
+             commission or 0.0),
         )
         return cur.lastrowid
 
@@ -277,6 +293,7 @@ def update_trade(
     exit_date: Optional[str] = None,
     status: Optional[str] = None,
     group_id: Optional[str] = None,
+    commission: Optional[float] = None,
 ) -> None:
     """Aktualizuje akékoľvek pole obchodu."""
     with get_connection() as conn:
@@ -295,6 +312,7 @@ def update_trade(
             "exit_date": exit_date,
             "status": status,
             "group_id": group_id,
+            "commission": commission,
         }
         for k, v in mapping.items():
             if v is not None:
@@ -487,14 +505,16 @@ def delete_event(event_id: int) -> None:
 # ─── UTILITY ───────────────────────────────────────────────────────────────────
 
 def compute_pnl(trade: dict) -> Optional[float]:
-    """P&L v USD pre jednu noh."""
+    """Čistý P&L v USD pre jednu nohu (po odpočítaní komisie)."""
     ep = trade.get("entry_price")
     xp = trade.get("exit_price")
     if ep is None:
         return None
     contracts = trade.get("contracts", 1) or 1
+    commission = trade.get("commission") or 0.0
     multiplier = 100
     if xp is not None:
         raw = (xp - ep) * contracts * multiplier
-        return raw if trade.get("leg_type") == "Long" else -raw
+        gross = raw if trade.get("leg_type") == "Long" else -raw
+        return gross - commission
     return None

@@ -78,16 +78,25 @@ if sync_btn:
     else:
         sync_result = ibkr.sync_positions_to_db(res["positions"], db)
         st.session_state["last_sync"] = datetime.now().strftime("%H:%M:%S")
+        st.session_state["possibly_closed"] = sync_result.get("possibly_closed", [])
         st.success(
-            f"Synchronizácia hotová — pridané: **{sync_result['added']}**, "
-            f"preskočené (existujú): **{sync_result['skipped']}**"
+            f"Synchronizácia hotová — "
+            f"pridané: **{sync_result['added']}** &nbsp;·&nbsp; "
+            f"aktualizované: **{sync_result.get('updated', 0)}** &nbsp;·&nbsp; "
+            f"nezmenené: **{sync_result['skipped']}**"
         )
+        if sync_result.get("possibly_closed"):
+            st.warning(
+                f"⚠️ **{len(sync_result['possibly_closed'])} pozícií** je v denníku ako *Open*, "
+                f"ale v IBKR portfóliu ich nenašiel. Môžu byť uzavreté. Pozri nižšie."
+            )
         st.rerun()
 
 fills_btn = st.button(
-    "Importuj Fills (história exekúcií)",
+    "Importuj Fills + Uzavri pozície (BOT/SLD)",
     disabled=not ibkr.is_connected(),
-    help="Načíta vykonané obchody z aktuálnej TWS session (BOT/SLD záznamy)",
+    type="primary",
+    help="Načíta vykonané obchody z TWS. Automaticky uzavrie Short pozície (BOT) a Long pozície (SLD).",
 )
 if fills_btn:
     with st.spinner("Načítavam fills z IBKR..."):
@@ -95,11 +104,52 @@ if fills_btn:
     if fills_res["error"]:
         st.error(fills_res["error"])
     elif not fills_res["fills"]:
-        st.info("Žiadne fills v aktuálnej TWS session. Pre staršiu históriu použij manuálny zápis.")
+        st.info("Žiadne fills v aktuálnej TWS session.")
     else:
         sync_f = ibkr.sync_fills_to_db(fills_res["fills"], db)
-        st.success(f"Fills importované — pridané: **{sync_f['added']}**, preskočené: **{sync_f['skipped']}**")
+        msg = (
+            f"Fills spracované — "
+            f"uzavreté: **{sync_f.get('closed', 0)}** &nbsp;·&nbsp; "
+            f"pridané: **{sync_f['added']}** &nbsp;·&nbsp; "
+            f"preskočené: **{sync_f['skipped']}**"
+        )
+        if sync_f.get("closed", 0) > 0:
+            st.success(msg)
+        else:
+            st.info(msg)
         st.rerun()
+
+# ─── Possibly Closed Alert ────────────────────────────────────────────────────
+possibly_closed = st.session_state.get("possibly_closed", [])
+if possibly_closed:
+    with st.container(border=True):
+        st.markdown("### ⚠️ Pozície chýbajúce v IBKR portfóliu")
+        st.caption(
+            "Tieto obchody sú v denníku ako **Open**, ale IBKR ich neukazuje. "
+            "Môžu byť uzavreté. Zadaj exit cenu a uzavri ich, alebo ignoruj ak sú IBKR dáta oneskorené."
+        )
+        for pc in possibly_closed:
+            c1, c2, c3 = st.columns([3, 1, 1])
+            with c1:
+                st.markdown(
+                    f"**#{pc['id']}** &nbsp; {pc['ticker']} "
+                    f"{pc['leg_type']} {pc['option_type']} "
+                    f"${pc['strike']:.0f} &nbsp; exp {pc['expiry']}"
+                )
+            with c2:
+                close_price = st.number_input(
+                    "Exit $", min_value=0.0, step=0.01,
+                    key=f"pc_price_{pc['id']}", label_visibility="collapsed",
+                    placeholder="0.00"
+                )
+            with c3:
+                if st.button("Uzavrieť", key=f"pc_close_{pc['id']}", type="secondary"):
+                    db.close_trade(pc["id"], close_price, date.today().isoformat())
+                    st.success(f"Trade #{pc['id']} uzavretý za ${close_price:.2f}")
+                    st.session_state["possibly_closed"] = [
+                        x for x in possibly_closed if x["id"] != pc["id"]
+                    ]
+                    st.rerun()
 
 if show_ibkr_raw and ibkr.is_connected():
     with st.spinner("Načítavam..."):
@@ -134,6 +184,138 @@ if show_ibkr_raw and ibkr.is_connected():
             df_stk = pd.DataFrame(stks)[["ticker", "leg_type", "contracts", "avg_cost", "market_price", "unrealized_pnl"]]
             df_stk.columns = ["Ticker", "Noha", "Kontr.", "Avg Cost", "Trh. cena", "Unrealized P&L"]
             st.dataframe(df_stk, use_container_width=True, hide_index=True)
+
+st.divider()
+
+# ─── Kontrola: Porovnanie Denník ↔ TWS ────────────────────────────────────────
+st.subheader("Kontrola zhody Denník ↔ TWS")
+
+if not ibkr.is_connected():
+    st.info("Pripoj sa na IBKR pre živé porovnanie.")
+else:
+    check_btn = st.button("Skontroluj zhodu s TWS", type="secondary", use_container_width=False)
+    if check_btn or st.session_state.get("show_check"):
+        st.session_state["show_check"] = True
+        with st.spinner("Porovnávam..."):
+            live_chk = ibkr.fetch_positions()
+
+        if live_chk["error"]:
+            st.error(live_chk["error"])
+        else:
+            tws_opts = [p for p in live_chk["positions"] if p["sec_type"] == "OPT"]
+            db_open  = db.get_open_trades()
+
+            def _pos_key(ticker, strike, expiry, opt_type, leg_type):
+                """Normalizovaný kľúč pre porovnanie."""
+                return (
+                    str(ticker).upper(),
+                    f"{float(strike):.2f}",
+                    str(expiry).replace("-", ""),
+                    str(opt_type).capitalize(),
+                    str(leg_type).capitalize(),
+                )
+
+            tws_keys  = {_pos_key(p["ticker"], p["strike"], p["expiry"],
+                                   p["option_type"], p["leg_type"]): p
+                         for p in tws_opts}
+            db_keys   = {_pos_key(t["ticker"], t["strike"] or 0, t["expiry"] or "",
+                                   t["option_type"] or "", t["leg_type"] or ""): t
+                         for t in db_open}
+
+            rows_cmp = []
+            all_keys = set(tws_keys) | set(db_keys)
+
+            for k in sorted(all_keys):
+                tws_p = tws_keys.get(k)
+                db_p  = db_keys.get(k)
+
+                if tws_p and db_p:
+                    tws_c = int(abs(tws_p.get("contracts", 1)))
+                    db_c  = int(db_p.get("contracts", 1))
+                    if tws_c == db_c:
+                        status = "✅ OK"
+                    else:
+                        status = f"⚠️ Kontrakt: TWS={tws_c} / Denník={db_c}"
+                    rows_cmp.append({
+                        "Stav": status,
+                        "ID": db_p["id"],
+                        "Ticker": k[0],
+                        "Noha": k[4],
+                        "Typ": k[3],
+                        "Strike": float(k[1]),
+                        "Expiry": k[2],
+                        "Kontr. TWS": tws_c if tws_p else "—",
+                        "Kontr. Denník": db_c if db_p else "—",
+                        "Group": db_p.get("group_id") or "—",
+                    })
+                elif tws_p and not db_p:
+                    rows_cmp.append({
+                        "Stav": "❌ Chýba v denníku",
+                        "ID": "—",
+                        "Ticker": k[0],
+                        "Noha": k[4],
+                        "Typ": k[3],
+                        "Strike": float(k[1]),
+                        "Expiry": k[2],
+                        "Kontr. TWS": int(abs(tws_p.get("contracts", 1))),
+                        "Kontr. Denník": "—",
+                        "Group": "—",
+                    })
+                elif db_p and not tws_p:
+                    rows_cmp.append({
+                        "Stav": "⚠️ Chýba v TWS",
+                        "ID": db_p["id"],
+                        "Ticker": k[0],
+                        "Noha": k[4],
+                        "Typ": k[3],
+                        "Strike": float(k[1]),
+                        "Expiry": k[2],
+                        "Kontr. TWS": "—",
+                        "Kontr. Denník": int(db_p.get("contracts", 1)),
+                        "Group": db_p.get("group_id") or "—",
+                    })
+
+            if not rows_cmp:
+                st.success("Denník aj TWS sú prázdne — žiadne otvorené pozície.")
+            else:
+                ok_count    = sum(1 for r in rows_cmp if r["Stav"].startswith("✅"))
+                warn_count  = sum(1 for r in rows_cmp if r["Stav"].startswith("⚠️"))
+                err_count   = sum(1 for r in rows_cmp if r["Stav"].startswith("❌"))
+
+                col_s1, col_s2, col_s3 = st.columns(3)
+                col_s1.metric("✅ Zhoduje sa", ok_count)
+                col_s2.metric("⚠️ Rozdiel / Chýba v TWS", warn_count)
+                col_s3.metric("❌ Chýba v denníku", err_count)
+
+                if warn_count == 0 and err_count == 0:
+                    st.success("Denník je v plnej zhode s TWS portfóliom.")
+                else:
+                    st.warning("Nájdené rozdiely — pozri tabuľku nižšie.")
+
+                df_cmp = pd.DataFrame(rows_cmp)
+                st.dataframe(
+                    df_cmp,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Strike": st.column_config.NumberColumn(format="$%.2f"),
+                        "Stav": st.column_config.TextColumn(width="medium"),
+                    },
+                )
+
+                # Rýchla oprava: ak niečo chýba v denníku, ponúkni import
+                missing_in_db = [r for r in rows_cmp if r["Stav"] == "❌ Chýba v denníku"]
+                if missing_in_db:
+                    st.caption(
+                        "Pozície označené ❌ sú v TWS ale nie v denníku. "
+                        "Klikni na **Importuj pozície z IBKR** vyššie."
+                    )
+                missing_in_tws = [r for r in rows_cmp if "Chýba v TWS" in r["Stav"]]
+                if missing_in_tws:
+                    st.caption(
+                        "Pozície označené ⚠️ Chýba v TWS môžu byť uzavreté. "
+                        "Klikni na **Importuj Fills** alebo ich uzavri manuálne v sekcii vyššie."
+                    )
 
 st.divider()
 

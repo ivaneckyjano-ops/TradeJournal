@@ -138,22 +138,31 @@ if auto_on:
             _sync = ibkr.sync_positions_to_db(_res["positions"], db)
             st.session_state["last_sync"] = datetime.now().strftime("%H:%M:%S")
             st.session_state["sync_count"] = st.session_state.get("sync_count", 0) + 1
+            st.session_state["possibly_closed"] = _sync.get("possibly_closed", [])
             if _sync.get("added", 0) > 0:
                 st.toast(f"Auto-sync: +{_sync['added']} nových pozícií", icon="🔄")
+            if _sync.get("updated", 0) > 0:
+                st.toast(f"Auto-sync: {_sync['updated']} pozícií aktualizovaných", icon="🔄")
+            if _sync.get("possibly_closed"):
+                st.toast(
+                    f"⚠️ {len(_sync['possibly_closed'])} pozícií chýba v IBKR — skontroluj Dashboard",
+                    icon="⚠️"
+                )
 
 # ─── Navigácia ────────────────────────────────────────────────────────────────
-dashboard = st.Page("pages/dashboard.py",  title="Dashboard",      icon=":material/dashboard:",      default=True)
-trade_log = st.Page("pages/trade_log.py",  title="Trade Log",      icon=":material/edit_note:")
-groups    = st.Page("pages/groups.py",     title="Skupiny",        icon=":material/folder:")
-symbols   = st.Page("pages/symbols.py",    title="Symboly",        icon=":material/bookmarks:")
-notes     = st.Page("pages/notes.py",      title="Konzultácie",    icon=":material/chat_bubble:")
-modeler   = st.Page("pages/modeler.py",    title="Roll Simulátor", icon=":material/model_training:")
-calendar  = st.Page("pages/calendar.py",   title="Kalendár",       icon=":material/calendar_month:")
-help_page = st.Page("pages/help.py",       title="Pomocník",       icon=":material/help:")
+dashboard = st.Page("pages/dashboard.py",  title="Dashboard",         icon=":material/dashboard:",      default=True)
+portfolio = st.Page("pages/portfolio.py",  title="Portfolio",         icon=":material/analytics:")
+trade_log = st.Page("pages/trade_log.py",  title="Trade Log",         icon=":material/edit_note:")
+groups    = st.Page("pages/groups.py",     title="Skupiny",           icon=":material/folder:")
+symbols   = st.Page("pages/symbols.py",    title="Symboly",           icon=":material/bookmarks:")
+notes     = st.Page("pages/notes.py",      title="Konzultácie",       icon=":material/chat_bubble:")
+modeler   = st.Page("pages/modeler.py",    title="Roll Simulátor",    icon=":material/model_training:")
+calendar  = st.Page("pages/calendar.py",   title="Kalendár",          icon=":material/calendar_month:")
+help_page = st.Page("pages/help.py",       title="Pomocník",          icon=":material/help:")
 
 pg = st.navigation(
     {
-        "Prehľad":  [dashboard, calendar],
+        "Prehľad":  [dashboard, portfolio, calendar],
         "Obchody":  [trade_log, groups, symbols],
         "Analýza":  [notes, modeler],
         "Info":     [help_page],
@@ -163,6 +172,22 @@ pg = st.navigation(
 
 # ─── Globálny sidebar info ─────────────────────────────────────────────────────
 with st.sidebar:
+    st.divider()
+    st.markdown("### ☁️ Záloha")
+    if st.button("Zálohovať na GitHub", use_container_width=True, help="Odošle aktuálny stav a databázu na GitHub"):
+        with st.spinner("Zálohujem..."):
+            import subprocess
+            try:
+                # Spusti backup skript
+                res = subprocess.run(["./backup.sh"], capture_output=True, text=True)
+                if res.returncode == 0:
+                    st.success("Záloha úspešná!")
+                    st.caption(f"Posledná: {datetime.now().strftime('%H:%M:%S')}")
+                else:
+                    st.error(f"Chyba pri zálohe: {res.stderr}")
+            except Exception as e:
+                st.error(f"Chyba: {e}")
+
     st.divider()
     from core import ibkr
     if ibkr.is_connected():
