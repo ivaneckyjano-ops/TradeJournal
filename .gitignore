@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.streamlit/config.toml
+# .sqlite or .db should NOT be ignored based on user request for backup
+# data/journal.db
