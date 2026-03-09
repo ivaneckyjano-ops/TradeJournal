@@ -1,0 +1,25 @@
+dátum_obchodu,instrument,typ,open_close,množstvo,cena
+2024-12-23,"Lucid Group Inc May2025 4.5 C",Predať,OTVORIŤ,-1,0.350
+2024-12-20,"Lucid Group Inc Jun2025 2.5 P",Kúpiť,ZATVORIŤ,2,0.530
+2024-12-16,"Lucid Group Inc Mar2025 3.5 C",Predať,OTVORIŤ,-1,0.310
+2024-12-05,"Lucid Group Inc Jan2025 3 P",Kúpiť,ZATVORIŤ,1,1.080
+2024-12-05,"Lucid Group Inc Jun2025 3 C",Predať,OTVORIŤ,-1,0.320
+2024-10-23,"Lucid Group Inc Jun2025 3.5 C",Predať,OTVORIŤ,-1,0.380
+2024-10-21,"Lucid Group Inc Jan2025 5.5 C",Kúpiť,ZATVORIŤ,1,0.070
+2024-10-21,"Lucid Group Inc Jun2025 5.5 C",Kúpiť,ZATVORIŤ,2,0.210
+2024-10-21,"Lucid Group Inc Dec2025 4.5 C",Kúpiť,ZATVORIŤ,1,0.520
+2024-08-26,"Lucid Group Inc Jun2025 5.5 C",Predať,OTVORIŤ,-2,0.840
+2024-08-23,"Lucid Group Inc Nov2024 3.5 C",Kúpiť,ZATVORIŤ,1,1.140
+2024-08-23,"Lucid Group Inc Dec2025 4.5 C",Predať,OTVORIŤ,-1,1.290
+2024-08-23,"Lucid Group Inc Jan2025 3 P",Predať,OTVORIŤ,-1,0.410
+2024-08-23,"Lucid Group Inc Jan2025 5.5 C",Predať,OTVORIŤ,-1,0.540
+2024-07-11,"Lucid Group Inc Jun2025 2.5 P",Predať,OTVORIŤ,-1,0.760
+2024-07-12,"Lucid Group Inc Jun2025 2.5 P",Predať,OTVORIŤ,-1,0.700
+2024-06-07,"Lucid Group Inc Jun2024 3.5 P",Predať,OTVORIŤ,-1,1.270
+2024-05-20,"Lucid Group Inc May2024 3 P",Kúpiť,ZATVORIŤ,1,0.490
+2024-04-19,"Lucid Group Inc May2024 3.5 C",Kúpiť,ZATVORIŤ,1,0.040
+2024-04-18,"Lucid Group Inc Aug2024 3 C",Kúpiť,ZATVORIŤ,1,0.290
+2024-03-18,"Lucid Group Inc May2024 3.5 C",Kúpiť,ZATVORIŤ,1,0.210
+2024-03-13,"Lucid Group Inc Apr2024 3 P",Predať,OTVORIŤ,-1,0.410
+2024-02-28,"Lucid Group Inc May2024 3.5 C",Predať,OTVORIŤ,-1,0.430
+2024-02-28,"Lucid Group Inc Mar2024 3 P",Kúpiť,OTVORIŤ,1,0.230

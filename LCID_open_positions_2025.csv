@@ -1,0 +1,7 @@
+instrument_id,product,type,strike,expiration,open_date,quantity,open_price,current_price,currency
+LCID/16F26C,"Lucid Group Inc Jan2026 3.5 C",C,3.50,2026-01-16,2024-04-29,-1,0.6000,1.1700,USD
+LCID/16F26P,"Lucid Group Inc Jan2026 2.5 P",P,2.50,2026-01-16,2024-08-26,-1,0.8700,0.8500,USD
+LCID/20M25,"Lucid Group Inc Jun2025 3.5 C",C,3.50,2025-06-20,2024-10-23,-1,0.3800,0.7000,USD
+LCID/20M25_C3,"Lucid Group Inc Jun2025 3 C",C,3.00,2025-06-20,2024-12-05,-1,0.3200,0.8700,USD
+LCID/21H25,"Lucid Group Inc Mar2025 3.5 C",C,3.50,2025-03-21,2024-12-16,-1,0.3100,0.4400,USD
+LCID/16K25,"Lucid Group Inc May2025 4.5 C",C,4.50,2025-05-16,2024-12-23,-1,0.3500,0.4200,USD

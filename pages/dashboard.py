@@ -162,28 +162,68 @@ if show_ibkr_raw and ibkr.is_connected():
         opts = [p for p in live_res["positions"] if p["sec_type"] == "OPT"]
         stks = [p for p in live_res["positions"] if p["sec_type"] == "STK"]
 
+        opt_upnl = sum(float(p.get("unrealized_pnl") or 0) for p in opts)
+        stk_upnl = sum(float(p.get("unrealized_pnl") or 0) for p in stks)
+        total_upnl = opt_upnl + stk_upnl
+
         if opts:
             st.markdown("**Opcie v portfóliu:**")
             df_live = pd.DataFrame(opts)[[
                 "ticker", "leg_type", "option_type", "strike", "expiry",
                 "contracts", "avg_cost", "market_price", "unrealized_pnl"
-            ]]
+            ]].copy()
             df_live.columns = [
                 "Ticker", "Noha", "Typ", "Strike", "Expiry",
                 "Kontr.", "Avg Cost", "Trh. cena", "Unrealized P&L"
             ]
-            st.dataframe(df_live, use_container_width=True, hide_index=True,
+            # Súčtový riadok pre opcie
+            total_row_opt = pd.DataFrame([{
+                "Ticker": "SPOLU",
+                "Noha": "",
+                "Typ": "",
+                "Strike": None,
+                "Expiry": "",
+                "Kontr.": int(sum(abs(float(p.get("contracts") or 0)) for p in opts)),
+                "Avg Cost": None,
+                "Trh. cena": None,
+                "Unrealized P&L": opt_upnl,
+            }])
+            df_live_total = pd.concat([df_live, total_row_opt], ignore_index=True)
+            st.dataframe(df_live_total, use_container_width=True, hide_index=True,
                          column_config={
                              "Strike": st.column_config.NumberColumn(format="$%.2f"),
                              "Avg Cost": st.column_config.NumberColumn(format="$%.2f"),
                              "Trh. cena": st.column_config.NumberColumn(format="$%.2f"),
                              "Unrealized P&L": st.column_config.NumberColumn(format="$%.2f"),
                          })
+
         if stks:
             st.markdown("**Akcie v portfóliu:**")
-            df_stk = pd.DataFrame(stks)[["ticker", "leg_type", "contracts", "avg_cost", "market_price", "unrealized_pnl"]]
+            df_stk = pd.DataFrame(stks)[["ticker", "leg_type", "contracts", "avg_cost", "market_price", "unrealized_pnl"]].copy()
             df_stk.columns = ["Ticker", "Noha", "Kontr.", "Avg Cost", "Trh. cena", "Unrealized P&L"]
-            st.dataframe(df_stk, use_container_width=True, hide_index=True)
+            total_row_stk = pd.DataFrame([{
+                "Ticker": "SPOLU",
+                "Noha": "",
+                "Kontr.": None,
+                "Avg Cost": None,
+                "Trh. cena": None,
+                "Unrealized P&L": stk_upnl,
+            }])
+            df_stk_total = pd.concat([df_stk, total_row_stk], ignore_index=True)
+            st.dataframe(df_stk_total, use_container_width=True, hide_index=True,
+                         column_config={
+                             "Avg Cost": st.column_config.NumberColumn(format="$%.4f"),
+                             "Trh. cena": st.column_config.NumberColumn(format="$%.4f"),
+                             "Unrealized P&L": st.column_config.NumberColumn(format="$%.2f"),
+                         })
+
+        # Celkový súčet portfólia
+        st.markdown("**Celé portfólio:**")
+        delta_color = "normal" if total_upnl >= 0 else "inverse"
+        pc1, pc2, pc3 = st.columns(3)
+        pc1.metric("Unrealized P&L — Opcie", f"${opt_upnl:+,.2f}")
+        pc2.metric("Unrealized P&L — Akcie", f"${stk_upnl:+,.2f}")
+        pc3.metric("Unrealized P&L — CELKOM", f"${total_upnl:+,.2f}", delta_color=delta_color)
 
 st.divider()
 
