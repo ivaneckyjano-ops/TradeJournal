@@ -311,45 +311,92 @@ def fetch_iv(ticker: str, expiry: str, strike: float, right: str = "C") -> dict:
 # ─── Portfolio / Fills ────────────────────────────────────────────────────────
 
 def fetch_positions() -> dict:
-    """Načíta všetky aktuálne pozície z IBKR portfólia."""
+    """Načíta všetky aktuálne pozície z IBKR portfólia vrátane IV a grekov pre opcie."""
     ib = get_ib()
     if not ib or not ib.isConnected():
         return {"positions": [], "error": "Nie je pripojenie na IBKR"}
 
-    _ib_ready()  # zaistí event loop
+    _ib_ready()
 
     try:
         ib.reqMarketDataType(4)
         raw = ib.portfolio()
+
+        # Požiadaj o market data pre všetky opčné kontrakty naraz
+        opt_tickers: dict = {}  # contract → ticker
+        for item in raw:
+            c = item.contract
+            if c.secType == "OPT":
+                tkr = ib.reqMktData(c, "106", snapshot=False, regulatorySnapshot=False)
+                opt_tickers[id(c)] = (c, tkr)
+
+        # Počkaj na dáta (max 3 s) — TWS ich má hneď pre portfóliové pozície
+        if opt_tickers:
+            ib.sleep(3)
+
         positions = []
         for item in raw:
             c = item.contract
             if c.secType not in ("OPT", "STK"):
                 continue
-            pos_size = item.position
-            leg_type = "Short" if pos_size < 0 else "Long"
-            contracts = int(abs(pos_size))
+            pos_size   = item.position
+            leg_type   = "Short" if pos_size < 0 else "Long"
+            contracts  = int(abs(pos_size))
             base = {
-                "sec_type": c.secType,
-                "ticker": c.symbol,
-                "contracts": contracts,
-                "leg_type": leg_type,
-                "avg_cost": item.averageCost,
-                "market_price": item.marketPrice,
-                "market_value": item.marketValue,
+                "sec_type":       c.secType,
+                "ticker":         c.symbol,
+                "contracts":      contracts,
+                "leg_type":       leg_type,
+                "avg_cost":       item.averageCost,
+                "market_price":   item.marketPrice,
+                "market_value":   item.marketValue,
                 "unrealized_pnl": item.unrealizedPNL,
-                "realized_pnl": item.realizedPNL,
-                "account": item.account,
+                "realized_pnl":   item.realizedPNL,
+                "account":        item.account,
+                "iv":             None,
+                "delta":          None,
+                "gamma":          None,
+                "theta":          None,
+                "vega":           None,
             }
             if c.secType == "OPT":
                 base.update({
                     "option_type": "Call" if c.right == "C" else "Put",
-                    "strike": float(c.strike),
-                    "expiry": c.lastTradeDateOrContractMonth,
+                    "strike":      float(c.strike),
+                    "expiry":      c.lastTradeDateOrContractMonth,
                 })
+                # Prečítaj modelGreeks z TWS (IV, delta, theta, vega, gamma)
+                _tkr_entry = opt_tickers.get(id(c))
+                if _tkr_entry:
+                    _, _tkr = _tkr_entry
+                    mg = getattr(_tkr, "modelGreeks", None)
+                    if mg:
+                        iv_raw = getattr(mg, "impliedVol", None)
+                        if iv_raw and 0 < iv_raw < 50:  # sanity check
+                            base["iv"]    = round(float(iv_raw), 4)
+                        _d = getattr(mg, "delta", None)
+                        _g = getattr(mg, "gamma", None)
+                        _t = getattr(mg, "theta", None)
+                        _v = getattr(mg, "vega",  None)
+                        if _d is not None and abs(_d) <= 1:
+                            base["delta"] = round(float(_d), 4)
+                        if _g is not None:
+                            base["gamma"] = round(float(_g), 6)
+                        if _t is not None:
+                            base["theta"] = round(float(_t), 4)
+                        if _v is not None:
+                            base["vega"]  = round(float(_v), 4)
             else:
                 base.update({"option_type": None, "strike": None, "expiry": None})
             positions.append(base)
+
+        # Zruš market data subscriptions
+        for _, (c, _) in opt_tickers.items():
+            try:
+                ib.cancelMktData(c)
+            except Exception:
+                pass
+
         return {"positions": positions, "error": None}
     except Exception as e:
         return {"positions": [], "error": str(e)}
