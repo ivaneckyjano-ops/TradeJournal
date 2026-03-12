@@ -35,7 +35,11 @@ def _build_df(trades: list[dict], show_pnl: bool = False) -> pd.DataFrame:
             "Exit dátum": t.get("exit_date", "") if show_pnl else None,
         })
     df = pd.DataFrame(rows)
-    if not show_pnl:
+    if show_pnl:
+        df = df.sort_values("Entry dátum", na_position="last").reset_index(drop=True)
+        df["P&L kumulatív ($)"] = df["P&L čistý ($)"].cumsum()
+        df = df.drop(columns=["PoP (entry)"], errors="ignore")
+    else:
         df = df.drop(columns=["Exit", "Komisia", "P&L čistý ($)", "Exit dátum"], errors="ignore")
     return df
 
@@ -49,6 +53,7 @@ def _col_config(pnl: bool = False) -> dict:
         cfg["Exit"] = st.column_config.NumberColumn(format="$%.2f")
         cfg["Komisia"] = st.column_config.NumberColumn(format="$%.2f")
         cfg["P&L čistý ($)"] = st.column_config.NumberColumn(format="$%.2f")
+        cfg["P&L kumulatív ($)"] = st.column_config.NumberColumn(format="$%.2f")
     return cfg
 
 
