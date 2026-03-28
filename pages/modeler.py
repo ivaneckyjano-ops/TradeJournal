@@ -1033,13 +1033,9 @@ with st.expander("📡  Načítať údaje z otvorenej pozície (IBKR)", expanded
                         format="DD.MM.YYYY",
                     )
                     roll_new_dte = max(1, (roll_exp_date - date.today()).days)
-                    roll_exp_row_c2.markdown(
-                        f"<div style='padding-top:28px; color:#9ca3af; font-size:0.85em;'>"
-                        f"Roll DTE: <b style='color:#34d399'>{roll_new_dte} dní</b>"
-                        f"&nbsp;·&nbsp; Aktuálna pozícia DTE: <b style='color:#60a5fa'>{_fd_dte} dní</b>"
-                        f"</div>",
-                        unsafe_allow_html=True,
-                    )
+                    with roll_exp_row_c2:
+                        st.write("")
+                        st.caption(f"Roll DTE: **{roll_new_dte} dní**  ·  Aktuálna pozícia DTE: **{_fd_dte} dní**")
 
                     # BS odhad ceny pre roll target (z roll IV a nového DTE)
                     _roll_bs_est = bs_price(und_p, roll_strike, roll_new_dte, roll_iv, roll_right)
