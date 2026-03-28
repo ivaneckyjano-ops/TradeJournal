@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from datetime import date
+from datetime import date, timedelta
 
 from core.probability import (
     calc_sd_lines,
@@ -999,6 +999,11 @@ with st.expander("📡  Načítať údaje z otvorenej pozície (IBKR)", expanded
                         st.session_state["roll_strike"] = float(k) + 5.0
                         st.session_state["roll_entry"]  = float(mid_price)
                         st.session_state["roll_iv"]     = float(_iv_fd)
+                        try:
+                            _cur_exp_d = date(int(_fd_exp[:4]), int(_fd_exp[4:6]), int(_fd_exp[6:]))
+                            st.session_state["roll_exp_date"] = _cur_exp_d + timedelta(days=30)
+                        except Exception:
+                            st.session_state["roll_exp_date"] = date.today() + timedelta(days=45)
                         st.session_state[_roll_key]     = True
 
                     roll_strike = roll_c1.number_input(
@@ -1017,16 +1022,31 @@ with st.expander("📡  Načítať údaje z otvorenej pozície (IBKR)", expanded
                         key="roll_iv", help="IV pre roll pozíciu (môže byť odlišná)"
                     )
 
-                    # BS odhad ceny pre roll target (z aktuálnej IV)
-                    try:
-                        _roll_dte_est = max(1, (date(int(sel_exp[:4]), int(sel_exp[4:6]), int(sel_exp[6:])) - date.today()).days)
-                    except Exception:
-                        _roll_dte_est = 30
-                    _roll_bs_est = bs_price(und_p, roll_strike, _roll_dte_est, roll_iv, roll_right)
+                    roll_exp_row_c1, roll_exp_row_c2 = st.columns([2, 4])
+                    _roll_exp_default = st.session_state.get("roll_exp_date", date.today() + timedelta(days=45))
+                    roll_exp_date = roll_exp_row_c1.date_input(
+                        "Nový dátum expirácie (roll)",
+                        value=_roll_exp_default,
+                        min_value=date.today(),
+                        key="roll_exp_date",
+                        help="Dátum expirácie novej (roll) pozície — ovplyvní DTE v P&L grafe",
+                        format="DD.MM.YYYY",
+                    )
+                    roll_new_dte = max(1, (roll_exp_date - date.today()).days)
+                    roll_exp_row_c2.markdown(
+                        f"<div style='padding-top:28px; color:#9ca3af; font-size:0.85em;'>"
+                        f"Roll DTE: <b style='color:#34d399'>{roll_new_dte} dní</b>"
+                        f"&nbsp;·&nbsp; Aktuálna pozícia DTE: <b style='color:#60a5fa'>{_fd_dte} dní</b>"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                    # BS odhad ceny pre roll target (z roll IV a nového DTE)
+                    _roll_bs_est = bs_price(und_p, roll_strike, roll_new_dte, roll_iv, roll_right)
                     if _roll_bs_est and _roll_bs_est > 0:
                         st.caption(
-                            f"BS odhad pre ${roll_strike:.0f} {sel_exp} "
-                            f"(IV {roll_iv*100:.1f}%): **${_roll_bs_est:.2f}**  "
+                            f"BS odhad pre ${roll_strike:.0f} exp {roll_exp_date.strftime('%d.%m.%Y')} "
+                            f"(DTE {roll_new_dte}d · IV {roll_iv*100:.1f}%): **${_roll_bs_est:.2f}**  "
                             f"— použi ako referenčnú cenu pri zadávaní roll_entry"
                         )
 
@@ -1042,11 +1062,14 @@ with st.expander("📡  Načítať údaje z otvorenej pozície (IBKR)", expanded
                     cmp_slices = [
                         (_fd_dte,               True,  "#60a5fa", "#22d3ee",  f"Teraz ({_fd_dte}d)"),
                         (max(1, _fd_dte // 2),  True,  "#a78bfa", "#34d399",  f"{_fd_dte//2}d"),
-                        (0,                     True,  "#f43f5e", "#86efac",  "Expirácia"),
+                        (0,                     True,  "#f43f5e", "#86efac",  "Expirácia aktuál"),
                     ]
                     for d_v, _, col_cur, col_roll, lbl in cmp_slices:
+                        # roll má dlhšiu expiráciu — vypočítaj zostatok DTE v rovnakom kalen. čase
+                        _elapsed = _fd_dte - d_v
+                        roll_d_v = max(0, roll_new_dte - _elapsed)
                         cur = _pnl_at_dte(price_range, d_v)
-                        rol = _pnl_roll(price_range, d_v)
+                        rol = _pnl_roll(price_range, roll_d_v)
                         fig_cmp.add_trace(_go.Scatter(
                             x=price_range, y=cur, mode="lines",
                             line=dict(color=col_cur, width=2), name=f"Aktuál {lbl}",
@@ -1067,7 +1090,7 @@ with st.expander("📡  Načítať údaje z otvorenej pozície (IBKR)", expanded
                                       annotation_text=f"K_roll ${roll_strike:.0f}", annotation_font_color="rgba(52,211,153,0.8)")
 
                     fig_cmp.update_layout(
-                        title=f"Roll porovnanie — ${k:.0f} vs. ${roll_strike:.0f}  ·  vstup ${mid_price:.2f} → ${roll_entry:.2f}",
+                        title=f"Roll porovnanie — ${k:.0f} vs. ${roll_strike:.0f}  ·  vstup ${mid_price:.2f} → ${roll_entry:.2f}  ·  nová exp {roll_exp_date.strftime('%d.%m.%Y')} ({roll_new_dte}d)",
                         xaxis_title="Cena podkladu ($)", yaxis_title="P&L ($)",
                         height=460, showlegend=True,
                         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
