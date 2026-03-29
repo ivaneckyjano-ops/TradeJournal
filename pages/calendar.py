@@ -8,22 +8,26 @@ from core import database as db
 db.init_db()
 
 # ─── Konštanty ─────────────────────────────────────────────────────────────────
-EVENT_TYPES = ["earnings", "expiry", "alert", "reminder", "event", "note"]
+EVENT_TYPES = ["earnings", "expiry", "roll", "wb_analysis", "alert", "reminder", "event", "note"]
 EVENT_LABELS = {
-    "earnings": "📊 Earnings",
-    "expiry":   "⏳ Expirácia",
-    "alert":    "🔔 Alert",
-    "reminder": "📌 Pripomienka",
-    "event":    "📅 Udalosť",
-    "note":     "💬 Poznámka",
+    "earnings":    "📊 Earnings",
+    "expiry":      "⏳ Expirácia",
+    "roll":        "🔄 Rolovanie",
+    "wb_analysis": "📈 Analýza WB",
+    "alert":       "🔔 Alert",
+    "reminder":    "📌 Pripomienka",
+    "event":       "📅 Udalosť",
+    "note":        "💬 Poznámka",
 }
 EVENT_COLORS = {
-    "earnings": "#f59e0b",
-    "expiry":   "#ef4444",
-    "alert":    "#8b5cf6",
-    "reminder": "#3b82f6",
-    "event":    "#10b981",
-    "note":     "#6b7280",
+    "earnings":    "#f59e0b",
+    "expiry":      "#ef4444",
+    "roll":        "#2dd4bf",
+    "wb_analysis": "#ec4899",
+    "alert":       "#8b5cf6",
+    "reminder":    "#3b82f6",
+    "event":       "#10b981",
+    "note":        "#6b7280",
 }
 
 DAY_NAMES = ["Po", "Ut", "St", "Št", "Pi", "So", "Ne"]
