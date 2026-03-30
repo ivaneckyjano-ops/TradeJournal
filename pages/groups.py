@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 
 from core import database as db
+from core import agent as ai_agent
 
 db.init_db()
 
@@ -144,6 +145,72 @@ with tab_manage:
                         })
                     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True,
                                  column_config={"Strike": st.column_config.NumberColumn(format="$%.2f")})
+
+                # ── AI Analýza na požiadanie (len otvorené nohy) ─────────────
+                open_legs = [t for t in legs if t.get("status") == "Open"]
+                st.divider()
+                if open_legs:
+                    ai_col1, ai_col2 = st.columns([3, 1])
+                    with ai_col1:
+                        st.markdown("**🤖 AI Analýza pozície**")
+                        st.caption(f"Claude Sonnet · {len(open_legs)} otvorených nôh · výsledok sa uloží do Konzultácií")
+                    with ai_col2:
+                        run_analysis = st.button(
+                            "Analyzovať",
+                            key=f"ai_analyze_{g['id']}",
+                            type="primary",
+                            use_container_width=True,
+                        )
+                    custom_question = st.text_input(
+                        "Špeciálna otázka (voliteľné)",
+                        placeholder="napr. Kedy uzavrieť pri raste AMZN do 15. mája?",
+                        key=f"ai_question_{g['id']}",
+                        label_visibility="collapsed",
+                    )
+
+                    # Zobraz poslednú uloženú AI analýzu pre túto skupinu
+                    ai_notes = [
+                        n for n in all_notes
+                        if n.get("group_id") == gname and n.get("title", "").startswith("🤖 AI Analýza:")
+                    ]
+                    if ai_notes:
+                        with st.expander(f"Posledná AI analýza ({ai_notes[0].get('created_at','')[:10]})", expanded=False):
+                            st.markdown(ai_notes[0].get("content", ""))
+
+                    if run_analysis:
+                        with st.spinner("Claude analyzuje pozíciu..."):
+                            try:
+                                group_notes = [
+                                    n for n in all_notes
+                                    if n.get("group_id") == gname
+                                    and not n.get("title", "").startswith("🤖 AI Analýza:")
+                                ]
+                                analysis_text = ai_agent.analyze_group(
+                                    group=g,
+                                    trades=open_legs,
+                                    compute_pnl=db.compute_pnl,
+                                    question=custom_question,
+                                    notes=group_notes,
+                                )
+                                from datetime import date as _date
+                                note_title = f"🤖 AI Analýza: {gname} ({_date.today().isoformat()})"
+                                db.add_note(
+                                    title=note_title,
+                                    content=analysis_text,
+                                    group_id=gname,
+                                )
+                                st.success("Analýza dokončená a uložená do Konzultácií!")
+                                with st.container(border=True):
+                                    st.markdown(analysis_text)
+                                st.rerun()
+                            except ValueError as e:
+                                st.error(f"Chyba: {e}")
+                            except ImportError as e:
+                                st.error(f"Chýbajúci balíček: {e}")
+                            except Exception as e:
+                                st.error(f"Chyba pri volaní AI: {e}")
+                else:
+                    st.caption("🤖 AI Analýza nie je dostupná – skupina nemá otvorené nohy.")
 
 
 # ─── Tab: Priradiť obchodom ───────────────────────────────────────────────────

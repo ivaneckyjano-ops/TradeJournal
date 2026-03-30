@@ -171,46 +171,110 @@ with tab_add:
 
 # ─── Tab: Otvorené pozície ────────────────────────────────────────────────────
 with tab_open:
-    st.subheader("Otvorené pozície")
     open_trades = db.get_open_trades()
 
     if not open_trades:
         st.info("Žiadne otvorené pozície.")
     else:
-        df_open = _build_df(open_trades, show_pnl=False)
-        st.dataframe(df_open, use_container_width=True, hide_index=True,
-                     column_config=_col_config())
+        # Zoskup podľa group_id
+        grouped: dict[str, list] = {}
+        for t in open_trades:
+            gid = (t.get("group_id") or "").strip() or "— bez skupiny —"
+            grouped.setdefault(gid, []).append(t)
 
-        st.markdown("---")
-        st.markdown("**Uzavrieť pozíciu**")
-        with st.form("close_trade_form"):
-            trade_options = {f"#{t['id']} — {t['ticker']} {t['leg_type']} {t['option_type']} ${t['strike']:.0f} exp {t['expiry']}": t["id"]
-                             for t in open_trades}
-            selected_label = st.selectbox("Vyber obchod na uzavretie", list(trade_options.keys()))
-            c1, c2 = st.columns(2)
-            with c1:
-                exit_price = st.number_input("Exit cena *", min_value=0.0, step=0.01)
-            with c2:
-                exit_date = st.date_input("Dátum výstupu", value=date.today())
-            close_btn = st.form_submit_button("Uzavrieť", type="primary")
+        st.caption(f"{len(open_trades)} otvorených nôh · {len(grouped)} skupín/stratégií")
 
-        if close_btn:
-            trade_id = trade_options[selected_label]
-            db.close_trade(trade_id, exit_price, exit_date.isoformat())
-            st.success(f"Obchod #{trade_id} uzavretý za ${exit_price:.2f}")
-            st.rerun()
+        for gid, legs in sorted(grouped.items()):
+            # Súhrn skupiny
+            tickers = ", ".join(sorted({t["ticker"] for t in legs}))
+            strategies = ", ".join(sorted({t.get("strategy","") for t in legs if t.get("strategy")}))
+            expiries = sorted([t.get("expiry","") for t in legs if t.get("expiry")])
+            dte_list = []
+            for t in legs:
+                exp = t.get("expiry","")
+                if exp:
+                    try:
+                        exp_d = datetime.strptime(exp, "%Y%m%d").date()
+                        dte_list.append((datetime.now().date() - exp_d).days * -1)
+                    except Exception:
+                        pass
+            nearest_dte = min(dte_list) if dte_list else None
+            dte_badge = f"⏳ {nearest_dte} dní" if nearest_dte is not None else ""
 
-        st.markdown("---")
-        st.markdown("**Zmazať pozíciu**")
-        with st.form("delete_trade_form"):
-            del_options = {f"#{t['id']} — {t['ticker']} {t['leg_type']} {t['option_type']} ${t['strike']:.0f}": t["id"]
-                           for t in open_trades}
-            del_label = st.selectbox("Vyber obchod na zmazanie", list(del_options.keys()))
-            del_btn = st.form_submit_button("Zmazať", type="secondary")
-        if del_btn:
-            db.delete_trade(del_options[del_label])
-            st.warning("Obchod zmazaný.")
-            st.rerun()
+            # Farba podľa DTE
+            if nearest_dte is not None and nearest_dte <= 21:
+                icon = "🔴"
+            elif nearest_dte is not None and nearest_dte <= 45:
+                icon = "🟡"
+            else:
+                icon = "🟢"
+
+            header = f"{icon} **{gid}** &nbsp;·&nbsp; {tickers} &nbsp;·&nbsp; {strategies} &nbsp;·&nbsp; {len(legs)} nôh &nbsp;·&nbsp; {dte_badge}"
+
+            with st.expander(header, expanded=True):
+                # Tabuľka nôh
+                leg_rows = []
+                for t in sorted(legs, key=lambda x: x.get("expiry","")):
+                    exp_raw = t.get("expiry","")
+                    exp_fmt = exp_raw
+                    dte_val = None
+                    if exp_raw:
+                        try:
+                            exp_d = datetime.strptime(exp_raw, "%Y%m%d").date()
+                            exp_fmt = exp_d.strftime("%d.%m.%Y")
+                            dte_val = (exp_d - datetime.now().date()).days
+                        except Exception:
+                            pass
+                    leg_rows.append({
+                        "ID": t["id"],
+                        "Noha": t.get("leg_type",""),
+                        "Typ": t.get("option_type",""),
+                        "Strike $": t.get("strike"),
+                        "Expiry": exp_fmt,
+                        "DTE": dte_val,
+                        "Kontr.": t.get("contracts",1),
+                        "Entry $": t.get("entry_price"),
+                        "IV entry": t.get("iv_at_entry"),
+                        "PoP entry": f"{t['pop_at_entry']*100:.0f}%" if t.get("pop_at_entry") else "—",
+                    })
+                st.dataframe(
+                    pd.DataFrame(leg_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Strike $": st.column_config.NumberColumn(format="$%.2f"),
+                        "Entry $":  st.column_config.NumberColumn(format="$%.2f"),
+                        "DTE":      st.column_config.NumberColumn(format="%d dní"),
+                    },
+                )
+
+                # Uzavrieť nohu
+                with st.expander("Uzavrieť / Zmazať nohu"):
+                    leg_opts = {
+                        f"#{t['id']} {t.get('leg_type','')} {t.get('option_type','')} ${t.get('strike',0):.0f} exp {t.get('expiry','')}": t["id"]
+                        for t in legs
+                    }
+                    with st.form(f"close_form_{gid.replace(' ','_')}"):
+                        sel_leg = st.selectbox("Noha", list(leg_opts.keys()), key=f"cl_sel_{gid}")
+                        cc1, cc2 = st.columns(2)
+                        with cc1:
+                            exit_p = st.number_input("Exit cena", min_value=0.0, step=0.01, key=f"cl_ep_{gid}")
+                        with cc2:
+                            exit_d = st.date_input("Exit dátum", value=date.today(), key=f"cl_ed_{gid}")
+                        cb1, cb2 = st.columns(2)
+                        with cb1:
+                            close_btn = st.form_submit_button("Uzavrieť", type="primary", use_container_width=True)
+                        with cb2:
+                            del_btn = st.form_submit_button("Zmazať", type="secondary", use_container_width=True)
+
+                    if close_btn:
+                        db.close_trade(leg_opts[sel_leg], exit_p, exit_d.isoformat())
+                        st.success(f"Noha #{leg_opts[sel_leg]} uzavretá za ${exit_p:.2f}")
+                        st.rerun()
+                    if del_btn:
+                        db.delete_trade(leg_opts[sel_leg])
+                        st.warning("Noha zmazaná.")
+                        st.rerun()
 
 
 # ─── Tab: Upraviť / Zoskupiť ─────────────────────────────────────────────────
@@ -220,12 +284,24 @@ with tab_edit:
     if not all_edit_trades:
         st.info("Žiadne obchody.")
     else:
-        # ── 1. Priama editácia tabuľky ─────────────────────────────────────
-        st.subheader("Priama editácia (Všetky polia)")
-        st.caption("Tu môžeš opraviť čokoľvek — Ticker, Strike, Expiráciu, Status aj ceny. Pre uloženie klikni **Uložiť zmeny**.")
+        # ── 1. Prepínač Open / Closed ───────────────────────────────────────
+        edit_filter = st.radio(
+            "Zobraz",
+            ["Otvorené", "Uzavreté", "Všetky"],
+            horizontal=True,
+            key="edit_filter_radio",
+        )
+        if edit_filter == "Otvorené":
+            edit_trades_filtered = [t for t in all_edit_trades if t.get("status") == "Open"]
+        elif edit_filter == "Uzavreté":
+            edit_trades_filtered = [t for t in all_edit_trades if t.get("status") == "Closed"]
+        else:
+            edit_trades_filtered = all_edit_trades
+
+        st.caption(f"{len(edit_trades_filtered)} záznam(ov) · Uprav priamo v tabuľke, potom klikni **Uložiť zmeny**.")
 
         edit_rows = []
-        for t in all_edit_trades:
+        for t in edit_trades_filtered:
             edit_rows.append({
                 "ID": t["id"],
                 "Ticker": t["ticker"],
@@ -372,113 +448,96 @@ with tab_edit:
 
         st.divider()
 
-        # ── 3. Prehľad skupín ───────────────────────────────────────────────
-        st.subheader("Prehľad skupín — finančný stav")
-        groups_map: dict[str, list] = {}
-        for t in all_edit_trades:
-            # Oprava duplikátov: strip() a jednotné zaobchádzanie s None
-            gid = (t.get("group_id") or "").strip() or "— (bez skupiny)"
-            groups_map.setdefault(gid, []).append(t)
-
-        for gid, legs in sorted(groups_map.items()):
-            open_legs   = [t for t in legs if t.get("status") == "Open"]
-            closed_legs = [t for t in legs if t.get("status") == "Closed"]
-            real_pnl    = sum(db.compute_pnl(t) or 0 for t in closed_legs)
-            total_comm  = sum(t.get("commission") or 0 for t in legs)
-            # Entry cost: súčet entry_price * contracts * 100 pre otvorené nohy
-            entry_cost  = sum((t.get("entry_price") or 0) * (t.get("contracts") or 1) * 100
-                              for t in open_legs)
-            
-            # Priebežná finančná stopa (Cumulative P&L v rámci skupiny)
-            legs_sorted = sorted(legs, key=lambda x: (x.get("exit_date") or x.get("entry_date") or ""))
-            
-            # Formátovanie hlavičky
-            pnl_sign = "🟢" if real_pnl >= 0 else "🔴"
-            header = (
-                f"**{gid}** &nbsp;·&nbsp; "
-                f"{len(open_legs)} otvorené / {len(closed_legs)} uzavreté &nbsp;·&nbsp; "
-                f"Realizovaný P&L: {pnl_sign} **${real_pnl:+,.0f}**"
-            )
-            
-            with st.expander(header, expanded=(gid != "— (bez skupiny)")):
-                if gid != "— (bez skupiny)":
-                    # Finančná stopa (malý graf alebo metriky)
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Realizovaný zisk/strata (čistý)", f"${real_pnl:+,.0f}")
-                    m2.metric("Aktuálny capital", f"${entry_cost:,.0f}")
-                    m4.metric("Zaplatené komisie", f"${total_comm:,.2f}" if total_comm > 0 else "—")
-                    
-                    # Dátumová stopa
-                    all_dates = sorted([d for d in [t.get("entry_date") for t in legs] + [t.get("exit_date") for t in legs] if d])
-                    if all_dates:
-                        duration = (datetime.now().date() - datetime.fromisoformat(all_dates[0]).date()).days
-                        m3.metric("Vek stratégie", f"{duration} dní", help=f"Od {all_dates[0]}")
-
-                    # Malý P&L graf pre skupinu
-                    if closed_legs:
-                        import plotly.express as px
-                        cdf = pd.DataFrame([
-                            {"date": t["exit_date"], "pnl": db.compute_pnl(t)} 
-                            for t in sorted(closed_legs, key=lambda x: x["exit_date"])
-                        ])
-                        cdf["cum_pnl"] = cdf["pnl"].cumsum()
-                        fig_mini = px.line(cdf, x="date", y="cum_pnl", title="Vývoj P&L skupiny")
-                        fig_mini.update_layout(height=200, margin=dict(l=0,r=0,t=30,b=0), xaxis_title=None, yaxis_title=None)
-                        st.plotly_chart(fig_mini, use_container_width=True, config={'displayModeBar': False})
-
-                grows = []
-                for t in legs:
-                    pnl_v = db.compute_pnl(t)
-                    grows.append({
-                        "ID": t["id"],
-                        "Status": t.get("status", ""),
-                        "Ticker": t["ticker"],
-                        "Noha": t.get("leg_type", ""),
-                        "Typ": t.get("option_type", ""),
-                        "Strike": t.get("strike"),
-                        "Expiry": t.get("expiry", ""),
-                        "Kontr.": t.get("contracts", 1),
-                        "Entry $": t.get("entry_price"),
-                        "Exit $": t.get("exit_price"),
-                        "Komisia $": t.get("commission") or 0.0,
-                        "P&L čistý $": round(pnl_v) if pnl_v is not None else None,
-                        "Dátum": t.get("exit_date") or t.get("entry_date", ""),
-                        "Stratégia": t.get("strategy", ""),
-                    })
-                st.dataframe(
-                    pd.DataFrame(grows),
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "Strike":      st.column_config.NumberColumn(format="$%.2f"),
-                        "Entry $":     st.column_config.NumberColumn(format="$%.2f"),
-                        "Exit $":      st.column_config.NumberColumn(format="$%.2f"),
-                        "Komisia $":   st.column_config.NumberColumn(format="$%.2f"),
-                        "P&L čistý $": st.column_config.NumberColumn(format="$%d"),
-                    },
-                )
+        # ── 3. Rýchla zmena Group ID ────────────────────────────────────────
+        st.subheader("Rýchle priradenie skupiny")
+        existing_groups = [""] + db.get_group_names()
+        rc1, rc2, rc3 = st.columns([2, 3, 1])
+        with rc1:
+            bulk_ids_input = st.text_input("ID nôh (napr. 11,12)", placeholder="11,12,14", key="bulk_ids_v2")
+        with rc2:
+            bulk_group_input = st.selectbox("Skupina", existing_groups, key="bulk_grp_v2")
+        with rc3:
+            st.write("")
+            st.write("")
+            if st.button("Priradiť", type="primary", key="quick_group_btn_v2", use_container_width=True):
+                try:
+                    ids_list = [int(x.strip()) for x in bulk_ids_input.split(",") if x.strip()]
+                    if ids_list and bulk_group_input:
+                        db.bulk_set_group_id(ids_list, bulk_group_input.strip())
+                        st.success(f"Skupina **{bulk_group_input}** priradená nohám: {ids_list}")
+                        st.rerun()
+                except ValueError:
+                    st.error("Neplatné ID.")
 
 
 # ─── Tab: Uzavreté pozície ────────────────────────────────────────────────────
 with tab_closed:
-    st.subheader("Uzavreté pozície")
     closed_trades = db.get_closed_trades()
 
     if not closed_trades:
         st.info("Žiadne uzavreté obchody.")
     else:
-        df_closed = _build_df(closed_trades, show_pnl=True)
-        st.dataframe(df_closed, use_container_width=True, hide_index=True,
-                     column_config=_col_config(pnl=True))
-
         total_pnl = sum(db.compute_pnl(t) or 0 for t in closed_trades)
-        wins = sum(1 for t in closed_trades if (db.compute_pnl(t) or 0) > 0)
-        losses = len(closed_trades) - wins
-        wr = wins / len(closed_trades) * 100 if closed_trades else 0
+        wins_all = sum(1 for t in closed_trades if (db.compute_pnl(t) or 0) > 0)
+        wr_all = wins_all / len(closed_trades) * 100 if closed_trades else 0
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Celkový P&L", f"${total_pnl:+.2f}")
+        m2.metric("Uzavretých nôh", len(closed_trades))
+        m3.metric("Win Rate", f"{wr_all:.1f}%")
+        m4.metric("Wins / Losses", f"{wins_all} / {len(closed_trades)-wins_all}")
 
         st.divider()
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Celkový P&L", f"${total_pnl:.2f}", delta=f"{'▲' if total_pnl >= 0 else '▼'}")
-        m2.metric("Počet obchodov", len(closed_trades))
-        m3.metric("Win Rate", f"{wr:.1f}%")
-        m4.metric("Wins / Losses", f"{wins} / {losses}")
+
+        # Zoskup uzavreté podľa group_id
+        closed_grouped: dict[str, list] = {}
+        for t in closed_trades:
+            gid = (t.get("group_id") or "").strip() or "— bez skupiny —"
+            closed_grouped.setdefault(gid, []).append(t)
+
+        st.caption(f"Zobrazené podľa skupín ({len(closed_grouped)} skupín)")
+
+        for gid, legs in sorted(closed_grouped.items(), key=lambda x: -(sum(db.compute_pnl(t) or 0 for t in x[1]))):
+            group_pnl = sum(db.compute_pnl(t) or 0 for t in legs)
+            tickers = ", ".join(sorted({t["ticker"] for t in legs}))
+            pnl_icon = "🟢" if group_pnl >= 0 else "🔴"
+            header = f"{pnl_icon} **{gid}** &nbsp;·&nbsp; {tickers} &nbsp;·&nbsp; {len(legs)} nôh &nbsp;·&nbsp; P&L: **${group_pnl:+.2f}**"
+
+            with st.expander(header, expanded=False):
+                c_rows = []
+                for t in sorted(legs, key=lambda x: x.get("exit_date") or ""):
+                    pnl_v = db.compute_pnl(t)
+                    exp_raw = t.get("expiry","")
+                    exp_fmt = exp_raw
+                    if exp_raw:
+                        try:
+                            exp_fmt = datetime.strptime(exp_raw, "%Y%m%d").strftime("%d.%m.%Y")
+                        except Exception:
+                            pass
+                    c_rows.append({
+                        "ID": t["id"],
+                        "Noha": t.get("leg_type",""),
+                        "Typ": t.get("option_type",""),
+                        "Strike $": t.get("strike"),
+                        "Expiry": exp_fmt,
+                        "Kontr.": t.get("contracts",1),
+                        "Entry $": t.get("entry_price"),
+                        "Exit $": t.get("exit_price"),
+                        "Komisia $": t.get("commission") or 0.0,
+                        "P&L čistý $": round(pnl_v, 2) if pnl_v is not None else None,
+                        "Exit dátum": t.get("exit_date",""),
+                    })
+                df_g = pd.DataFrame(c_rows)
+                st.dataframe(
+                    df_g,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Strike $":    st.column_config.NumberColumn(format="$%.2f"),
+                        "Entry $":     st.column_config.NumberColumn(format="$%.2f"),
+                        "Exit $":      st.column_config.NumberColumn(format="$%.2f"),
+                        "Komisia $":   st.column_config.NumberColumn(format="$%.2f"),
+                        "P&L čistý $": st.column_config.NumberColumn(format="$%.2f"),
+                    },
+                )
+                st.caption(f"Celkový P&L skupiny: **${group_pnl:+.2f}**")
