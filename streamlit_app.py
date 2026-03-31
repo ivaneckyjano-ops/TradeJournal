@@ -175,7 +175,8 @@ trade_log = st.Page("pages/trade_log.py",  title="Trade Log",         icon=":mat
 groups    = st.Page("pages/groups.py",     title="Skupiny",           icon=":material/folder:")
 symbols   = st.Page("pages/symbols.py",    title="Symboly",           icon=":material/bookmarks:")
 notes     = st.Page("pages/notes.py",      title="Konzultácie",       icon=":material/chat_bubble:")
-modeler   = st.Page("pages/modeler.py",    title="Roll Simulátor",    icon=":material/model_training:")
+modeler   = st.Page("pages/modeler.py",        title="Roll Simulátor",    icon=":material/model_training:")
+spread_bld = st.Page("pages/spread_builder.py", title="Spread Builder",    icon=":material/construction:")
 calendar  = st.Page("pages/calendar.py",   title="Kalendár",          icon=":material/calendar_month:")
 help_page = st.Page("pages/help.py",       title="Pomocník",          icon=":material/help:")
 
@@ -183,7 +184,7 @@ pg = st.navigation(
     {
         "Prehľad":  [dashboard, portfolio, calendar],
         "Obchody":  [trade_log, groups, symbols],
-        "Analýza":  [notes, modeler],
+        "Analýza":  [notes, modeler, spread_bld],
         "Info":     [help_page],
     },
     position="sidebar",
