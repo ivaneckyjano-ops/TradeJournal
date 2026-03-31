@@ -1,10 +1,28 @@
 import streamlit as st
 import pandas as pd
+import threading
+import time
 
 from core import database as db
 from core import agent as ai_agent
+from core import ibkr
 
 db.init_db()
+
+
+def _run_fetch_job(stop_event: threading.Event):
+    """Beží v separátnom vlákne. Stiahne iba pozície s Greeks (čistá matematika)."""
+    job = ibkr.FETCH_JOB
+    try:
+        res = ibkr.fetch_positions(with_greeks=True)
+        if stop_event.is_set():
+            job["status"] = "cancelled"
+            return
+        job["positions"] = res
+        job["status"] = "done"
+    except Exception as exc:
+        job["error"] = str(exc)
+        job["status"] = "error"
 
 st.title("Správa skupín (Group ID)")
 st.caption("Vytvor skupiny tu — potom ich priradíš obchodom aj poznámkam z dropdownu.")
@@ -78,6 +96,149 @@ with tab_manage:
     groups = db.get_groups()
     all_trades = db.get_all_trades()
     all_notes = db.get_notes()
+    all_events = db.get_all_events()
+
+    # Pre-fetch IBKR positions to get Greeks without calling API in a loop
+    ibkr_positions = []
+    ibkr_orders = []
+    
+    # Zobrazí sa tlačidlo na stiahnutie Live Dát (Greeks, Orders), ak ich chce užívateľ hneď vidieť.
+    # Inak sa použijú cacheované dáta alebo sa stiahnu až pri stlačení 'Analyzovať' na konkrétnej skupine.
+    
+    # NOVÉ: Skúsime vytiahnuť dáta z pamäte (Dashboard auto-refresh)
+    def get_live_data():
+        pos = []
+        ords = []
+        if "live_positions" in st.session_state:
+            pos = st.session_state["live_positions"]
+        if "live_orders" in st.session_state:
+            ords = st.session_state["live_orders"]
+        return pos, ords
+
+    ibkr_positions, ibkr_orders = get_live_data()
+    
+    if ibkr.is_connected():
+        job = ibkr.FETCH_JOB
+        job_status = job["status"]
+
+        # ── Spracuj výsledok ak vlákno dobehlo ──────────────────────────────
+        if job_status == "done":
+            res = job["positions"]
+            res_ord = job["orders"]
+            if res and not res.get("error"):
+                ibkr_positions = res.get("positions", [])
+                st.session_state["live_positions"] = ibkr_positions
+            elif res and res.get("error"):
+                st.error(f"Chyba pozície: {res['error']}")
+            if res_ord and not res_ord.get("error"):
+                ibkr_orders = res_ord.get("orders", [])
+                st.session_state["live_orders"] = ibkr_orders
+            job["status"] = "idle"
+            _n_g = sum(1 for p in ibkr_positions if p.get("sec_type") == "OPT" and p.get("theta") is not None)
+            _t_o = sum(1 for p in ibkr_positions if p.get("sec_type") == "OPT")
+            st.success(f"Načítané: {len(ibkr_positions)} pozícií · Greeks: {_n_g}/{_t_o} opcií · {len(ibkr_orders)} objednávok")
+
+        elif job_status == "cancelled":
+            st.warning("Sťahovanie bolo zastavené.")
+            job["status"] = "idle"
+
+        elif job_status == "error":
+            st.error(f"Chyba pri sťahovaní: {job['error']}")
+            job["status"] = "idle"
+
+        # ── Tlačidlá ────────────────────────────────────────────────────────
+        col_btn, col_stop, col_status = st.columns([2, 1.5, 3])
+
+        is_running = (job_status == "running")
+
+        with col_btn:
+            do_refresh = st.button(
+                "Aktualizovať Greeks a TWS objednávky",
+                key="refresh_greeks_btn",
+                disabled=is_running,
+            )
+        with col_stop:
+            do_stop = st.button(
+                "⏹ Zastaviť",
+                key="stop_fetch_btn",
+                disabled=not is_running,
+                type="secondary",
+            )
+        with col_status:
+            _n_pos = len(ibkr_positions)
+            _n_with_greeks = sum(1 for p in ibkr_positions if p.get("sec_type") == "OPT" and p.get("theta") is not None)
+            _n_opts = sum(1 for p in ibkr_positions if p.get("sec_type") == "OPT")
+            _n_ords = len(ibkr_orders)
+            if is_running:
+                st.info("⏳ Sťahujem z TWS...")
+            elif _n_pos > 0:
+                st.caption(f"Cache: {_n_pos} pozícií · {_n_with_greeks}/{_n_opts} opcií má Greeks · {_n_ords} objednávok")
+            else:
+                st.caption("Cache: prázdna — klikni na tlačidlo pre načítanie")
+
+        # ── Spusti fetch ─────────────────────────────────────────────────────
+        if do_refresh and not is_running:
+            # Objednávky: hlavné vlákno s nest_asyncio + timeout na IB požiadavke
+            ib_obj = ibkr.get_ib()
+            if ib_obj:
+                ib_obj.RequestTimeout = 8   # max 8s čakania na TWS odpoveď
+            res_orders = ibkr.fetch_open_orders()
+            if ib_obj:
+                ib_obj.RequestTimeout = 0   # obnov default (bez limitu)
+            if not res_orders.get("error"):
+                ibkr_orders = res_orders.get("orders", [])
+                st.session_state["live_orders"] = ibkr_orders
+
+            # Greeks: background vlákno (čistý Black-Scholes výpočet)
+            stop_evt = threading.Event()
+            job.update({
+                "status": "running",
+                "positions": None,
+                "orders": None,
+                "error": None,
+                "stop_event": stop_evt,
+                "thread": None,
+            })
+            t = threading.Thread(target=_run_fetch_job, args=(stop_evt,), daemon=True)
+            job["thread"] = t
+            t.start()
+            st.rerun()
+
+        # ── Zastav vlákno ────────────────────────────────────────────────────
+        if do_stop:
+            ev = job.get("stop_event")
+            if ev:
+                ev.set()
+            job["status"] = "cancelled"
+            st.rerun()
+
+        # ── Automatický rerun kým vlákno beží (každú sekundu) ───────────────
+        if is_running:
+            time.sleep(1)
+            st.rerun()
+
+    def _match_greeks(t: dict) -> dict:
+        """Nájde Greeks v IBKR portfóliu pre danú nohu v databáze."""
+        if not ibkr_positions:
+            return {}
+        for p in ibkr_positions:
+            if p.get("sec_type") != "OPT":
+                continue
+            # Porovnanie podľa tickera, strike, expiry, option_type, leg_type
+            if (p.get("ticker") == t.get("ticker") and 
+                float(p.get("strike", 0)) == float(t.get("strike", 0) or 0) and 
+                p.get("option_type") == t.get("option_type") and 
+                p.get("leg_type") == t.get("leg_type")):
+                
+                # Zjednodušená kontrola expiry (DB: YYYYMMDD vs TWS: YYYYMMDD)
+                if str(p.get("expiry")).replace("-", "") == str(t.get("expiry")).replace("-", ""):
+                    return {
+                        "delta": p.get("delta"),
+                        "gamma": p.get("gamma"),
+                        "theta": p.get("theta"),
+                        "vega": p.get("vega"),
+                    }
+        return {}
 
     if not groups:
         st.info("Žiadne skupiny. Vytvor ich v záložke **Vytvoriť skupinu**.")
@@ -128,12 +289,50 @@ with tab_manage:
                     st.warning(f"Skupina **{gname}** zmazaná. Obchody a poznámky si zachovali Group ID text.")
                     st.rerun()
 
-                # Nohy v tejto skupine
-                legs = [t for t in all_trades if t.get("group_id") == gname]
+                # Nohy v tejto skupine – zobrazujeme len Open, Closed filtrujeme
+                all_legs = [t for t in all_trades if t.get("group_id") == gname]
+                legs = [t for t in all_legs if t.get("status") == "Open"]
+                closed_legs = [t for t in all_legs if t.get("status") != "Open"]
+                open_legs = legs
+                net_theta = 0.0
+                net_gamma = 0.0
+                has_greeks = False
+
+                # Uzavreté nohy so skupinou – možnosť odstrániť ich zo skupiny
+                if closed_legs:
+                    with st.expander(f"⚠️ {len(closed_legs)} uzavreté nohy priradené tejto skupine", expanded=False):
+                        st.caption("Tieto nohy sú uzavreté ale stále majú nastavenú skupinu. Môžeš ich zo skupiny odstrániť.")
+                        for _cl in closed_legs:
+                            _cl_lbl = (
+                                f"#{_cl['id']} {_cl.get('leg_type','')} "
+                                f"{_cl.get('option_type','')} ${float(_cl.get('strike',0)):.0f} "
+                                f"exp {_cl.get('expiry','')} – Closed"
+                            )
+                            if st.button(f"❌ Odstrániť zo skupiny: {_cl_lbl}",
+                                         key=f"rm_closed_{_cl['id']}"):
+                                db.update_trade(_cl["id"], group_id="")
+                                st.success(f"Noha #{_cl['id']} odstránená zo skupiny.")
+                                st.rerun()
+
                 if legs:
                     st.markdown(f"**Nohy ({len(legs)}):**")
                     rows = []
                     for t in legs:
+                        # Ak je otvorená, zistíme Greeks
+                        greeks = {}
+                        if t.get("status") == "Open":
+                            greeks = _match_greeks(t)
+                            t["_greeks"] = greeks # Uložíme do dict pre agenta
+                            
+                            c = float(t.get("contracts", 1))
+                            m = -1 if t.get("leg_type") == "Short" else 1
+                            
+                            if greeks.get("theta") is not None:
+                                net_theta += greeks["theta"] * c * m * 100
+                                has_greeks = True
+                            if greeks.get("gamma") is not None:
+                                net_gamma += greeks["gamma"] * c * m * 100
+
                         rows.append({
                             "ID": t["id"],
                             "Ticker": t["ticker"],
@@ -142,18 +341,69 @@ with tab_manage:
                             "Strike": t.get("strike"),
                             "Expiry": t.get("expiry", ""),
                             "Status": t.get("status", ""),
+                            "Theta (1x)": greeks.get("theta"),
+                            "Gamma (1x)": greeks.get("gamma"),
                         })
-                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True,
-                                 column_config={"Strike": st.column_config.NumberColumn(format="$%.2f")})
+                    
+                    df_legs = pd.DataFrame(rows)
+                    if not has_greeks:
+                        df_legs = df_legs.drop(columns=["Theta (1x)", "Gamma (1x)"], errors="ignore")
+                        
+                    st.dataframe(df_legs, use_container_width=True, hide_index=True,
+                                 column_config={
+                                     "Strike": st.column_config.NumberColumn(format="$%.2f"),
+                                     "Theta (1x)": st.column_config.NumberColumn(format="%.4f"),
+                                     "Gamma (1x)": st.column_config.NumberColumn(format="%.4f"),
+                                 })
+
+                    if has_greeks:
+                        c_t, c_g, _ = st.columns([1, 1, 2])
+                        c_t.metric("Net Theta (skupina)", f"${net_theta:+.2f} / deň")
+                        c_g.metric("Net Gamma (skupina)", f"{net_gamma:+.4f}")
+
+                # Nájdi otvorené objednávky patriace tejto skupine
+                group_orders = []
+                if ibkr_orders:
+                    for o in ibkr_orders:
+                        if o.get("ticker") == e_ticker:
+                            # Priradenie objednávky na opciu ku skupine
+                            if o.get("sec_type") == "OPT":
+                                for t in open_legs:
+                                    if (t.get("option_type") == o.get("option_type") and
+                                        float(t.get("strike", 0)) == o.get("strike") and
+                                        str(t.get("expiry")).replace("-", "") == str(o.get("expiry")).replace("-", "")):
+                                        group_orders.append(o)
+                                        break
+                            else:
+                                # Pre akcie len priradíme, ak sa zhoduje ticker (zjednodušený predpoklad pre Covered Call a pod)
+                                group_orders.append(o)
+
+                if group_orders:
+                    st.markdown("**Čakajúce TWS objednávky:**")
+                    o_rows = []
+                    for o in group_orders:
+                        desc = f"{o.get('option_type')} ${o.get('strike',0):.0f} ({o.get('expiry')})" if o.get("sec_type") == "OPT" else "Akcia"
+                        price_info = []
+                        if o.get("limit_price"): price_info.append(f"LMT: ${o['limit_price']}")
+                        if o.get("aux_price"): price_info.append(f"STP: ${o['aux_price']}")
+                        
+                        o_rows.append({
+                            "Akcia": f"{o.get('action')} {o.get('total_qty')}",
+                            "Kontrakt": desc,
+                            "Typ": o.get("order_type"),
+                            "Cena": " | ".join(price_info),
+                            "Status": o.get("status"),
+                        })
+                    st.dataframe(pd.DataFrame(o_rows), use_container_width=True, hide_index=True)
 
                 # ── AI Analýza na požiadanie (len otvorené nohy) ─────────────
-                open_legs = [t for t in legs if t.get("status") == "Open"]
                 st.divider()
                 if open_legs:
                     ai_col1, ai_col2 = st.columns([3, 1])
                     with ai_col1:
                         st.markdown("**🤖 AI Analýza pozície**")
-                        st.caption(f"Claude Sonnet · {len(open_legs)} otvorených nôh · výsledok sa uloží do Konzultácií")
+                        ibkr_badge = "🟢 IBKR live cena" if ibkr.is_connected() else "⚪ IBKR nepripojený – bez live ceny"
+                        st.caption(f"Claude Sonnet · {len(open_legs)} otvorených nôh · {ibkr_badge} · výsledok sa uloží do Konzultácií")
                     with ai_col2:
                         run_analysis = st.button(
                             "Analyzovať",
@@ -180,17 +430,53 @@ with tab_manage:
                     if run_analysis:
                         with st.spinner("Claude analyzuje pozíciu..."):
                             try:
+                                # Live cena z IBKR ak je pripojený
+                                live_price_info = ""
+                                ticker_name = g.get("ticker", "")
+                                if ticker_name and ibkr.is_connected():
+                                    with st.spinner(f"Načítavam live cenu {ticker_name}..."):
+                                        price_res = ibkr.fetch_underlying(ticker_name)
+                                    if price_res.get("price"):
+                                        live_price_info = f"Aktuálna live cena {ticker_name}: {price_res['price']:.2f} USD (zdroj: IBKR)"
+                                    elif price_res.get("error"):
+                                        live_price_info = f"Live cena nedostupná: {price_res['error']}"
+
+                                # Doplň live cenu do skupiny pre prompt
+                                group_with_price = dict(g)
+                                if live_price_info:
+                                    existing_desc = group_with_price.get("description") or ""
+                                    group_with_price["description"] = f"{existing_desc}\n{live_price_info}".strip()
+                                
+                                # Pridáme celkové greeks do dict, aby ich agent videl
+                                if has_greeks:
+                                    group_with_price["net_theta"] = net_theta
+                                    group_with_price["net_gamma"] = net_gamma
+
                                 group_notes = [
                                     n for n in all_notes
                                     if n.get("group_id") == gname
                                     and not n.get("title", "").startswith("🤖 AI Analýza:")
                                 ]
+                                
+                                # Vyhľadáme všetky udalosti/alerty pre túto skupinu alebo pre daný ticker
+                                group_events = [
+                                    e for e in all_events
+                                    if e.get("group_id") == gname or (e.get("ticker") and e.get("ticker") == ticker_name)
+                                ]
+
+                                # Načítanie otvorených objednávok z TWS pre túto skupinu
+                                open_orders_for_group = group_orders
+
+                                # Zmazať cache po analýze nie je nutné (lepšie držať cache kým user neklikne na "Aktualizovať Greeks...")
+
                                 analysis_text = ai_agent.analyze_group(
-                                    group=g,
+                                    group=group_with_price,
                                     trades=open_legs,
                                     compute_pnl=db.compute_pnl,
                                     question=custom_question,
                                     notes=group_notes,
+                                    events=group_events,
+                                    orders=open_orders_for_group,
                                 )
                                 from datetime import date as _date
                                 note_title = f"🤖 AI Analýza: {gname} ({_date.today().isoformat()})"

@@ -13,6 +13,7 @@ import asyncio
 import threading
 import time
 import math
+from datetime import date as _date
 
 import streamlit as st
 from typing import Optional
@@ -22,6 +23,87 @@ from datetime import datetime, date, timedelta
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7496
 DEFAULT_CLIENT_ID = 10
+
+# ─── Background fetch job state (perzistentný medzi Streamlit rerunmi) ────────
+# Uložené na úrovni modulu – modul sa pri rerun NEreimportuje, stav zostáva.
+FETCH_JOB: dict = {
+    "status": "idle",   # idle | running | done | cancelled | error
+    "positions": None,
+    "orders": None,
+    "error": None,
+    "stop_event": None,
+    "thread": None,
+}
+
+
+# ─── Black-Scholes Greeks (lokálny výpočet keď TWS nepošle Greeks) ────────────
+
+def _bs_price(S: float, K: float, T: float, iv: float, right: str, r: float = 0.045) -> float:
+    """Black-Scholes cena opcie."""
+    from scipy.stats import norm as _norm
+    if T <= 0 or iv <= 0:
+        return max(0.0, (S - K) if right == "C" else (K - S))
+    sqrtT = math.sqrt(T)
+    d1 = (math.log(S / K) + (r + 0.5 * iv * iv) * T) / (iv * sqrtT)
+    d2 = d1 - iv * sqrtT
+    if right == "C":
+        return S * _norm.cdf(d1) - K * math.exp(-r * T) * _norm.cdf(d2)
+    else:
+        return K * math.exp(-r * T) * _norm.cdf(-d2) - S * _norm.cdf(-d1)
+
+
+def _calc_iv(S: float, K: float, T: float, opt_price: float, right: str, r: float = 0.045) -> float | None:
+    """
+    Vypočíta implied volatility bisekčnou metódou.
+    Vráti IV ako desatinné číslo (napr. 0.35 = 35%) alebo None ak sa nepodarí.
+    """
+    if T <= 0 or opt_price <= 0 or S <= 0 or K <= 0:
+        return None
+    low, high = 0.001, 5.0
+    for _ in range(60):
+        mid = (low + high) / 2
+        price = _bs_price(S, K, T, mid, right, r)
+        if abs(price - opt_price) < 0.0001:
+            return mid
+        if price < opt_price:
+            low = mid
+        else:
+            high = mid
+    return mid if 0.01 < mid < 4.9 else None
+
+
+def _bs_greeks(S: float, K: float, T: float, iv: float, right: str, r: float = 0.045) -> dict:
+    """
+    Vypočíta delta, gamma, theta, vega z Black-Scholes.
+    S=spot, K=strike, T=roky do expirácie, iv=impl. vol (napr. 0.35),
+    right='C' alebo 'P'.
+    Theta je denná (vydelená 365). Vega je na 1% zmenu IV.
+    """
+    try:
+        from scipy.stats import norm as _norm
+        if T <= 0 or iv <= 0 or S <= 0 or K <= 0:
+            return {}
+        sqrtT = math.sqrt(T)
+        d1 = (math.log(S / K) + (r + 0.5 * iv * iv) * T) / (iv * sqrtT)
+        d2 = d1 - iv * sqrtT
+        nd1  = _norm.pdf(d1)
+        if right == 'C':
+            delta = _norm.cdf(d1)
+            theta = (-(S * nd1 * iv) / (2 * sqrtT) - r * K * math.exp(-r * T) * _norm.cdf(d2)) / 365
+        else:
+            delta = _norm.cdf(d1) - 1
+            theta = (-(S * nd1 * iv) / (2 * sqrtT) + r * K * math.exp(-r * T) * _norm.cdf(-d2)) / 365
+        gamma = nd1 / (S * iv * sqrtT)
+        vega  = S * nd1 * sqrtT / 100
+        return {
+            "delta": round(delta, 4),
+            "gamma": round(gamma, 6),
+            "theta": round(theta, 4),
+            "vega":  round(vega, 4),
+            "iv":    round(iv, 4),
+        }
+    except Exception:
+        return {}
 
 
 # ─── Event loop helper ────────────────────────────────────────────────────────
@@ -52,10 +134,24 @@ def _ib_ready():
     return IB, Stock, Option
 
 
-# ─── Session state helpers ────────────────────────────────────────────────────
+# ─── IB singleton + hlavný event loop (module-level) ────────────────────────
+# Module-level premenné sú dostupné aj z background vlákien (kde session_state
+# nie je k dispozícii).
+_IB_INSTANCE: object = None  # type: ignore[assignment]
+_MAIN_LOOP: asyncio.AbstractEventLoop | None = None  # loop hlavného vlákna pri connect()
+
 
 def get_ib():
-    return st.session_state.get("ib")
+    """Vráti IB inštanciu – z module-level cache alebo session_state."""
+    global _IB_INSTANCE
+    # Primárny zdroj: module-level (funguje aj v threadoch)
+    if _IB_INSTANCE is not None:
+        return _IB_INSTANCE
+    # Fallback: session_state (pre prípad priameho prístupu z hlavného vlákna)
+    ib = st.session_state.get("ib")
+    if ib is not None:
+        _IB_INSTANCE = ib  # synchronizuj
+    return ib
 
 
 def is_connected() -> bool:
@@ -90,6 +186,9 @@ def connect(
         try:
             ib = IB()
             ib.connect(host, port, clientId=cid, timeout=10, readonly=False)
+            global _IB_INSTANCE, _MAIN_LOOP
+            _IB_INSTANCE = ib
+            _MAIN_LOOP = asyncio.get_event_loop()  # zachytíme loop hlavného vlákna
             st.session_state["ib"] = ib
             return True, f"Pripojený na {host}:{port}  (clientId={cid})"
         except Exception as e:
@@ -100,9 +199,12 @@ def connect(
 
 
 def disconnect() -> None:
+    global _IB_INSTANCE, _MAIN_LOOP
     ib = get_ib()
     if ib and ib.isConnected():
         ib.disconnect()
+    _IB_INSTANCE = None
+    _MAIN_LOOP = None
     st.session_state.pop("ib", None)
 
 
@@ -119,17 +221,11 @@ def fetch_underlying(ticker: str, timeout: float = 10.0) -> dict:
 
     _, Stock, _ = _ib_ready()
 
-    # 1. Portfólio — okamžité
-    try:
-        for item in ib.portfolio():
-            if item.contract.symbol == ticker and item.contract.secType == "STK":
-                p = item.marketPrice
-                if p and not math.isnan(p) and p > 0:
-                    return {"price": float(p), "ticker": ticker, "error": None, "source": "portfolio"}
-    except Exception:
-        pass
-
-    # 2. reqTickers v separátnom vlákne (neblokuje Streamlit UI)
+    # 1. Portfólio — okamžité (ale len ak sa zdá byť aktuálne, tu sa často skrýva stará 'marketPrice')
+    # Ak nemáš STK, ale len OPT, nechceme brať cenu z portfólia lebo býva neaktuálna.
+    # Urobíme to tak, že najprv skúsime načítat streamovanú cenu.
+    
+    # 2. Streaming reqMktData — čerstvá cena v separátnom vlákne
     price_result: dict = {}
     done2 = threading.Event()
 
@@ -140,17 +236,49 @@ def fetch_underlying(ticker: str, timeout: float = 10.0) -> dict:
             import nest_asyncio
             nest_asyncio.apply(loop)
             from ib_insync import Stock as IBStock
+
             stock = IBStock(ticker, "SMART", "USD")
             ib.qualifyContracts(stock)
-            ib.reqMarketDataType(4)
-            tickers = ib.reqTickers(stock)
-            if tickers:
-                t_obj = tickers[0]
-                p = t_obj.marketPrice()
-                if p and not math.isnan(p) and p > 0:
-                    price_result["price"] = float(p)
-                elif t_obj.close and not math.isnan(t_obj.close) and t_obj.close > 0:
-                    price_result["price"] = float(t_obj.close)
+
+            def _valid(v) -> float | None:
+                try:
+                    f = float(v)
+                    return f if f and not math.isnan(f) and f > 0 else None
+                except Exception:
+                    return None
+
+            # Skúsi live (1) → delayed (3) → frozen live (2) → delayed frozen (4)
+            for mdt in (1, 3, 2, 4):
+                ib.reqMarketDataType(mdt)
+                # DÔLEŽITÉ: Niekedy stock stream nepríde, ak nedržíš akcie, ale chce to reqMktData priamo na smart.
+                # Snapshot request s False čaká na plný stream. 
+                tkr = ib.reqMktData(stock, "106", False, False)
+                deadline = time.time() + 3
+                found = None
+                while time.time() < deadline and not found:
+            # TWS posiela tickPrice eventy. 'last' a 'close' sa updatujú.
+                    if getattr(tkr, "last", None) and not math.isnan(tkr.last) and tkr.last > 0:
+                        found = float(tkr.last)
+                    elif getattr(tkr, "close", None) and not math.isnan(tkr.close) and tkr.close > 0:
+                        found = float(tkr.close)
+                    elif getattr(tkr, "bid", None) and getattr(tkr, "ask", None) and not math.isnan(tkr.bid) and not math.isnan(tkr.ask) and tkr.bid > 0 and tkr.ask > 0:
+                        found = float(round((tkr.bid + tkr.ask) / 2, 2))
+                    
+                    if not found:
+                        val = tkr.marketPrice()
+                        if val and not math.isnan(val) and val > 0:
+                            found = float(val)
+
+                    if not found:
+                        ib.sleep(0.1)
+                        
+                ib.cancelMktData(stock)
+                if found:
+                    price_result["price"] = found
+                    price_result["source"] = f"live-stream mdt={mdt}"
+                    break
+
+
         except Exception as e:
             price_result["error"] = str(e)
         finally:
@@ -160,10 +288,22 @@ def fetch_underlying(ticker: str, timeout: float = 10.0) -> dict:
     t2.start()
     finished2 = done2.wait(timeout=timeout)
 
+    # 3. Záchranné lano – ak reqMktData nenašiel nič, ale máme niečo v portfóliu
+    if not price_result.get("price"):
+        try:
+            for item in ib.portfolio():
+                if item.contract.symbol == ticker and item.contract.secType == "STK":
+                    p = item.marketPrice
+                    if p and not math.isnan(p) and p > 0:
+                        return {"price": float(p), "ticker": ticker, "error": None, "source": "portfolio fallback"}
+        except Exception:
+            pass
+
     if not finished2:
         return {"price": None, "ticker": ticker, "error": f"Timeout {timeout}s — cena nedostupná"}
     if price_result.get("price"):
-        return {"price": price_result["price"], "ticker": ticker, "error": None, "source": "mktdata"}
+        return {"price": price_result["price"], "ticker": ticker, "error": None,
+                "source": price_result.get("source", "mktdata")}
     return {"price": None, "ticker": ticker,
             "error": price_result.get("error", "Cena nedostupná — zadaj manuálne")}
 
@@ -308,44 +448,115 @@ def fetch_iv(ticker: str, expiry: str, strike: float, right: str = "C") -> dict:
         return {"iv": None, "und_price": None, "error": str(e)}
 
 
+def fetch_open_orders(use_cache: bool = False) -> dict:
+    """
+    Načíta aktívne objednávky z TWS (vrátane objednávok zadaných priamo v TWS).
+
+    use_cache=False (default, hlavné Streamlit vlákno):
+        Volá reqAllOpenOrders() priamo. Vyžaduje nest_asyncio.
+    use_cache=True (background vlákno):
+        Bezpečne plánuje reqAllOpenOrdersAsync() na IB event loope cez
+        run_coroutine_threadsafe – žiadny asyncio konflikt, dostane VŠETKY
+        objednávky vrátane TWS-zadaných.
+    """
+    global _MAIN_LOOP
+    ib = get_ib()
+    if not ib or not ib.isConnected():
+        return {"orders": [], "error": "Nie je pripojenie na IBKR"}
+
+    try:
+        if use_cache:
+            # Z background vlákna: naplánuj na hlavný event loop (kde beží IB spojenie)
+            if _MAIN_LOOP and _MAIN_LOOP.is_running():
+                future = asyncio.run_coroutine_threadsafe(
+                    ib.reqAllOpenOrdersAsync(), _MAIN_LOOP
+                )
+                all_trades = future.result(timeout=10)
+            else:
+                # Fallback: lokálna cache (len API-zadané objednávky)
+                all_trades = ib.openTrades()
+        else:
+            # Živé volanie z hlavného Streamlit vlákna – zachytíme loop pre background vlákna
+            _ib_ready()
+            try:
+                _MAIN_LOOP = asyncio.get_event_loop()
+            except Exception:
+                pass
+            all_trades = ib.reqAllOpenOrders()
+
+        orders = []
+        for trade in (all_trades or []):
+            if trade.orderStatus.status not in ("PendingSubmit", "PreSubmitted", "Submitted", "Inactive"):
+                continue
+            c = trade.contract
+            o = trade.order
+            if c.secType not in ("OPT", "STK"):
+                continue
+            base = {
+                "ticker":      c.symbol,
+                "sec_type":    c.secType,
+                "action":      o.action,
+                "total_qty":   o.totalQuantity,
+                "order_type":  o.orderType,
+                "limit_price": o.lmtPrice if o.orderType in ("LMT", "STP LMT") else None,
+                "aux_price":   o.auxPrice if o.orderType in ("STP", "STP LMT", "TRAIL") else None,
+                "status":      trade.orderStatus.status,
+            }
+            if c.secType == "OPT":
+                base.update({
+                    "option_type": "Call" if c.right == "C" else "Put",
+                    "strike":      float(c.strike),
+                    "expiry":      c.lastTradeDateOrContractMonth,
+                })
+            else:
+                base.update({"option_type": None, "strike": None, "expiry": None})
+            orders.append(base)
+
+        return {"orders": orders, "error": None}
+    except Exception as e:
+        return {"orders": [], "error": str(e)}
+
 # ─── Portfolio / Fills ────────────────────────────────────────────────────────
 
-def fetch_positions() -> dict:
-    """Načíta všetky aktuálne pozície z IBKR portfólia vrátane IV a grekov pre opcie."""
+def fetch_positions(with_greeks: bool = False) -> dict:
+    """
+    Načíta všetky aktuálne pozície z IBKR portfólia.
+
+    with_greeks=False (default): rýchly fetch iba pozícií, bez Greeks (~0s).
+        Vhodné pre DB sync (dashboard, auto-refresh).
+    with_greeks=True: navyše vypočíta IV + Greeks lokálne (~0.1s).
+        Používa ceny z portfólia + Black-Scholes (bisekcia pre IV).
+        Žiadne extra TWS API volania → žiadny deadlock.
+    """
     ib = get_ib()
     if not ib or not ib.isConnected():
         return {"positions": [], "error": "Nie je pripojenie na IBKR"}
 
-    _ib_ready()
-
     try:
-        ib.reqMarketDataType(4)
         raw = ib.portfolio()
+        if not raw:
+            return {"positions": [], "error": None}
 
-        # Požiadaj o market data pre všetky opčné kontrakty naraz
-        opt_tickers: dict = {}  # contract → ticker
+        # Cena podkladu z portfólia (pre výpočet Greeks)
+        under_price: float | None = None
         for item in raw:
-            c = item.contract
-            if c.secType == "OPT":
-                tkr = ib.reqMktData(c, "106", snapshot=False, regulatorySnapshot=False)
-                opt_tickers[id(c)] = (c, tkr)
-
-        # Počkaj na dáta (max 3 s) — TWS ich má hneď pre portfóliové pozície
-        if opt_tickers:
-            ib.sleep(3)
+            if item.contract.secType == "STK":
+                p = item.marketPrice
+                if p and not math.isnan(p) and p > 0:
+                    under_price = float(p)
+                    break
 
         positions = []
         for item in raw:
             c = item.contract
             if c.secType not in ("OPT", "STK"):
                 continue
-            pos_size   = item.position
-            leg_type   = "Short" if pos_size < 0 else "Long"
-            contracts  = int(abs(pos_size))
+            pos_size  = item.position
+            leg_type  = "Short" if pos_size < 0 else "Long"
             base = {
                 "sec_type":       c.secType,
                 "ticker":         c.symbol,
-                "contracts":      contracts,
+                "contracts":      int(abs(pos_size)),
                 "leg_type":       leg_type,
                 "avg_cost":       item.averageCost,
                 "market_price":   item.marketPrice,
@@ -365,37 +576,20 @@ def fetch_positions() -> dict:
                     "strike":      float(c.strike),
                     "expiry":      c.lastTradeDateOrContractMonth,
                 })
-                # Prečítaj modelGreeks z TWS (IV, delta, theta, vega, gamma)
-                _tkr_entry = opt_tickers.get(id(c))
-                if _tkr_entry:
-                    _, _tkr = _tkr_entry
-                    mg = getattr(_tkr, "modelGreeks", None)
-                    if mg:
-                        iv_raw = getattr(mg, "impliedVol", None)
-                        if iv_raw and 0 < iv_raw < 50:  # sanity check
-                            base["iv"]    = round(float(iv_raw), 4)
-                        _d = getattr(mg, "delta", None)
-                        _g = getattr(mg, "gamma", None)
-                        _t = getattr(mg, "theta", None)
-                        _v = getattr(mg, "vega",  None)
-                        if _d is not None and abs(_d) <= 1:
-                            base["delta"] = round(float(_d), 4)
-                        if _g is not None:
-                            base["gamma"] = round(float(_g), 6)
-                        if _t is not None:
-                            base["theta"] = round(float(_t), 4)
-                        if _v is not None:
-                            base["vega"]  = round(float(_v), 4)
+                if with_greeks and under_price:
+                    opt_price = item.marketPrice
+                    if opt_price and not math.isnan(opt_price) and opt_price > 0:
+                        exp_str = c.lastTradeDateOrContractMonth
+                        try:
+                            T = max(0.001, (_date(int(exp_str[:4]), int(exp_str[4:6]), int(exp_str[6:])) - _date.today()).days / 365.0)
+                        except Exception:
+                            T = 30 / 365.0
+                        iv = _calc_iv(under_price, float(c.strike), T, float(opt_price), c.right)
+                        if iv:
+                            base.update(_bs_greeks(under_price, float(c.strike), T, iv, c.right))
             else:
                 base.update({"option_type": None, "strike": None, "expiry": None})
             positions.append(base)
-
-        # Zruš market data subscriptions
-        for _, (c, _) in opt_tickers.items():
-            try:
-                ib.cancelMktData(c)
-            except Exception:
-                pass
 
         return {"positions": positions, "error": None}
     except Exception as e:

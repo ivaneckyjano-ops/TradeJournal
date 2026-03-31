@@ -50,20 +50,28 @@ def _format_leg(trade: dict, compute_pnl: Callable) -> str:
     pop = trade.get("pop_at_entry")
     leg_type = trade.get("leg_type", "")
     role = "PREDANÁ (prémium inkasované, chceme aby stratila hodnotu)" if leg_type == "Short" else "KÚPENÁ (prémium zaplatené, chceme aby získala hodnotu)"
+    
+    greeks_text = ""
+    if "_greeks" in trade and trade["_greeks"]:
+        g = trade["_greeks"]
+        if g.get("theta") is not None and g.get("gamma") is not None:
+            greeks_text = f" | Aktuálna Theta: {g['theta']:+.4f} | Aktuálna Gamma: {g['gamma']:+.4f}"
+
     return (
         f"  - {leg_type} {trade.get('option_type','')} "
         f"strike {trade.get('strike',0):.0f} USD | "
         f"expiry {trade.get('expiry','')} ({dte_str}) | "
         f"{trade.get('contracts',1)} kontrakt(y) | "
         f"entry {trade.get('entry_price',0):.2f} USD | "
-        f"rola: {role} | "
+        f"rola: {role}"
+        f"{greeks_text} | "
         f"IV pri vstupe: {iv if iv else 'N/A'} | "
         f"PoP pri vstupe: {f'{pop:.0f}%' if pop else 'N/A'}"
     )
 
 
 def build_prompt(group: dict, trades: list[dict], compute_pnl: Callable,
-                 question: str = "", notes: list[dict] = None) -> str:
+                 question: str = "", notes: list[dict] = None, events: list[dict] = None, orders: list[dict] = None) -> str:
     """Zostaví prompt pre Claude – len otvorené nohy, s voliteľnou otázkou a kontextom."""
     open_legs = [t for t in trades if t.get("status") == "Open"]
 
@@ -72,6 +80,14 @@ def build_prompt(group: dict, trades: list[dict], compute_pnl: Callable,
 
     open_text = "\n".join(_format_leg(t, compute_pnl) for t in open_legs)
     today_str = date.today().strftime("%d.%m.%Y")
+    
+    net_greeks_text = ""
+    if "net_theta" in group and "net_gamma" in group:
+        net_greeks_text = (
+            f"\n## Celkové metriky skupiny:\n"
+            f"- Net Theta: {group['net_theta']:+.2f} USD / deň\n"
+            f"- Net Gamma: {group['net_gamma']:+.4f}\n"
+        )
 
     # Poznámky / kontext obchodníka
     notes_text = ""
@@ -82,6 +98,15 @@ def build_prompt(group: dict, trades: list[dict], compute_pnl: Callable,
             entries.append(f"  [{ts}] {n.get('title','')}: {(n.get('content') or '')[:300]}")
         if entries:
             notes_text = "\n## Kontext a poznámky obchodníka:\n" + "\n".join(entries) + "\n"
+            
+    # Alerty a udalosti
+    events_text = ""
+    if events:
+        entries = []
+        for e in sorted(events, key=lambda x: x.get("date", ""))[:10]:
+            entries.append(f"  [{e.get('date', '')}] {e.get('type', '').upper()}: {e.get('title', '')} - {e.get('description') or ''}")
+        if entries:
+            events_text = "\n## Alerty a Udalosti z kalendára:\n" + "\n".join(entries) + "\n"
 
     custom_section = ""
     if question:
@@ -114,6 +139,29 @@ def build_prompt(group: dict, trades: list[dict], compute_pnl: Callable,
 ## Sledovať
 - (čo monitorovať)"""
 
+    # Otvorené objednávky v TWS
+    orders_text = ""
+    if orders:
+        entries = []
+        for o in orders:
+            price_info = []
+            if o.get("limit_price"):
+                price_info.append(f"Limit: {o['limit_price']} USD")
+            if o.get("aux_price"):
+                price_info.append(f"Stop: {o['aux_price']} USD")
+            p_str = " | ".join(price_info)
+            
+            desc = ""
+            if o.get("sec_type") == "OPT":
+                desc = f"Opcia: {o.get('option_type')} {o.get('strike',0):.0f} USD (exp: {o.get('expiry')})"
+            else:
+                desc = "Akcia"
+                
+            entries.append(f"  - {o.get('action')} {o.get('total_qty')}x {desc} | Typ: {o.get('order_type')} | {p_str}")
+            
+        if entries:
+            orders_text = "\n## Otvorené objednávky v TWS (čakajúce na vyplnenie):\n" + "\n".join(entries) + "\n"
+
     return f"""Si skúsený obchodník s opciami. Analyzuj nasledujúcu otvorenú pozíciu.
 
 DÔLEŽITÉ PRAVIDLÁ FORMÁTOVANIA:
@@ -130,7 +178,9 @@ DÔLEŽITÉ PRAVIDLÁ FORMÁTOVANIA:
 
 ## Otvorené nohy ({len(open_legs)}):
 {open_text}
-{notes_text}{custom_section}
+{net_greeks_text}
+{orders_text}
+{notes_text}{events_text}{custom_section}
 ---
 Odpovedaj PRESNE v tomto formáte:
 
@@ -143,6 +193,8 @@ def analyze_group(
     compute_pnl: Callable,
     question: str = "",
     notes: list[dict] = None,
+    events: list[dict] = None,
+    orders: list[dict] = None,
 ) -> str:
     """
     Spustí AI analýzu skupiny pozícií.
@@ -161,7 +213,7 @@ def analyze_group(
         Exception: ostatné API chyby
     """
     client = _load_client()
-    prompt = build_prompt(group, trades, compute_pnl, question=question, notes=notes)
+    prompt = build_prompt(group, trades, compute_pnl, question=question, notes=notes, events=events, orders=orders)
 
     message = client.messages.create(
         model=MODEL,

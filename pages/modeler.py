@@ -1168,6 +1168,471 @@ elif _ctx_trade and _ctx_trade.get("group_id"):
 
 st.divider()
 
+# ─── Multi-leg Roll (celá skupina) ─────────────────────────────────────────────
+with st.expander("🔄 Multi-leg Roll — roll celej skupiny naraz", expanded=False):
+    st.caption(
+        "Simuluj roll viacerých nôh skupiny súčasne. "
+        "Pre každú nohu nastav nové parametre (strike, expirácia, vstupná cena). "
+        "Zobrazí sa Net Theta / Delta pred a po, celkový kredit/debet a P&L diagram."
+    )
+
+    _all_groups = db.get_groups()
+    _open_trades_ml = db.get_open_trades()
+
+    if not _all_groups:
+        st.info("Žiadne skupiny. Vytvor skupiny v sekcii Skupiny.")
+    else:
+        _grp_opts = {g["name"]: g for g in _all_groups}
+        _sel_grp_id = st.selectbox(
+            "Vyber skupinu na roll",
+            list(_grp_opts.keys()),
+            key="mlroll_group_sel",
+        )
+        _ml_legs = [t for t in _open_trades_ml if (t.get("group_id") or "").strip() == _sel_grp_id.strip()]
+
+        if not _ml_legs:
+            st.warning(f"Skupina **{_sel_grp_id}** nemá žiadne otvorené nohy.")
+        else:
+            # ── Spoločné parametre ──────────────────────────────────────────
+            _ml_c1, _ml_c2, _ml_c3 = st.columns(3)
+            _ml_spot = _ml_c1.number_input(
+                "Spot ($)", min_value=1.0, step=0.5,
+                value=float(st.session_state.get("mod_spot", 200.0)),
+                key="mlroll_spot",
+            )
+            _ml_iv = _ml_c2.number_input(
+                "IV (0.30 = 30%)", min_value=0.01, max_value=5.0, step=0.01,
+                value=float(st.session_state.get("mod_iv", 0.30)),
+                key="mlroll_iv",
+            )
+            if _ml_c3.button("Načítať Spot z IBKR", key="mlroll_spot_ibkr",
+                              disabled=not ibkr.is_connected()):
+                with st.spinner("Načítavam..."):
+                    _ml_res = ibkr.fetch_underlying(_ml_legs[0]["ticker"], timeout=6.0)
+                if not _ml_res.get("error") and _ml_res.get("price"):
+                    st.session_state["mod_spot"] = _ml_res["price"]
+                    st.rerun()
+
+            st.markdown("---")
+            st.markdown("#### Parametre rollu pre každú nohu")
+            st.caption("Zaškrtni nohy ktoré chceš rolovať a nastav im nové parametre.")
+
+            # ── Roll parametre pre každú nohu ───────────────────────────────
+            _ml_roll_params = {}
+            for _leg in _ml_legs:
+                _lid = _leg["id"]
+                _leg_label = (
+                    f"{'Short' if _leg.get('leg_type')=='Short' else 'Long'} "
+                    f"{'Call' if _leg.get('option_type')=='Call' else 'Put'} "
+                    f"${float(_leg.get('strike',0)):.0f}  exp {_leg.get('expiry','')}  "
+                    f"({_dte_from_str(_leg.get('expiry',''))}d)"
+                )
+                _do_roll = st.checkbox(f"Rolovať: **{_leg_label}**", key=f"mlroll_chk_{_lid}", value=True)
+
+                if _do_roll:
+                    with st.container():
+                        _rc1, _rc2, _rc3, _rc4, _rc5 = st.columns([2, 2, 2, 2, 2])
+                        _cur_str = float(_leg.get("strike", 200.0))
+                        _cur_exp = _leg.get("expiry", "")
+                        try:
+                            _cur_exp_d = date(
+                                int(_cur_exp[:4]), int(_cur_exp[4:6]), int(_cur_exp[6:])
+                            )
+                            _def_new_exp = _cur_exp_d + timedelta(days=60)
+                        except Exception:
+                            _def_new_exp = date.today() + timedelta(days=60)
+
+                        _new_str = _rc1.number_input(
+                            f"Nový Strike #{_lid}", min_value=0.5, step=0.5,
+                            value=_cur_str, key=f"mlroll_str_{_lid}",
+                        )
+                        _new_exp = _rc2.date_input(
+                            f"Nová expirácia #{_lid}",
+                            value=_def_new_exp,
+                            min_value=date.today(),
+                            key=f"mlroll_exp_{_lid}",
+                            format="DD.MM.YYYY",
+                        )
+                        _new_right = _rc3.selectbox(
+                            f"C/P #{_lid}",
+                            ["C", "P"],
+                            index=0 if _leg.get("option_type", "Call") == "Call" else 1,
+                            key=f"mlroll_right_{_lid}",
+                        )
+                        _new_dte_v = max(1, (_new_exp - date.today()).days)
+                        _bs_est = bs_price(_ml_spot, _new_str, _new_dte_v, _ml_iv, _new_right) or 0.0
+                        _new_entry = _rc4.number_input(
+                            f"Vstupná cena #{_lid} ($)", min_value=0.01, step=0.05,
+                            value=round(max(0.01, _bs_est), 2),
+                            key=f"mlroll_entry_{_lid}",
+                            help=f"BS odhad: ${_bs_est:.2f}",
+                        )
+                        _new_iv = _rc5.number_input(
+                            f"IV #{_lid}", min_value=0.01, max_value=5.0, step=0.01,
+                            value=_ml_iv, key=f"mlroll_iv_{_lid}",
+                        )
+                        _rc2.caption(f"DTE: **{_new_dte_v}d**")
+
+                    _ml_roll_params[_lid] = {
+                        "strike": _new_str,
+                        "expiry_date": _new_exp,
+                        "dte": _new_dte_v,
+                        "right": _new_right,
+                        "entry": _new_entry,
+                        "iv": _new_iv,
+                        "leg_type": _leg.get("leg_type", "Short"),
+                        "contracts": int(_leg.get("contracts", 1)),
+                    }
+
+            st.markdown("---")
+
+            # ── Výpočet Before / After ──────────────────────────────────────
+            def _ml_greeks(strike, dte_v, iv, right, leg_type, contracts):
+                if dte_v <= 0 or _ml_spot <= 0 or iv <= 0:
+                    return {"delta": 0.0, "theta": 0.0, "vega": 0.0, "gamma": 0.0}
+                sign = -1 if leg_type == "Short" else 1
+                g = calc_greeks(_ml_spot, strike, dte_v, iv, right)
+                return {
+                    "delta": (g.get("delta") or 0) * sign * contracts * 100,
+                    "theta": (g.get("theta") or 0) * sign * contracts * 100,
+                    "vega":  (g.get("vega")  or 0) * sign * contracts * 100,
+                    "gamma": (g.get("gamma") or 0) * sign * contracts * 100,
+                }
+
+            rows_before, rows_after = [], []
+            tot_before = {"delta": 0.0, "theta": 0.0, "vega": 0.0}
+            tot_after  = {"delta": 0.0, "theta": 0.0, "vega": 0.0}
+            net_flow_total = 0.0
+
+            for _leg in _ml_legs:
+                _lid = _leg["id"]
+                _dte_b = _dte_from_str(_leg.get("expiry", ""))
+                _right_b = "C" if _leg.get("option_type", "Call") == "Call" else "P"
+                _sign_b = -1 if _leg.get("leg_type") == "Short" else 1
+                _contr_b = int(_leg.get("contracts", 1))
+                _entry_b = float(_leg.get("entry_price") or 0)
+
+                gb = _ml_greeks(
+                    float(_leg.get("strike", 0)), _dte_b, _ml_iv,
+                    _right_b, _leg.get("leg_type", "Long"), _contr_b,
+                )
+                _curr_p_b = bs_price(_ml_spot, float(_leg.get("strike", 0)), max(1, _dte_b), _ml_iv, _right_b) or 0.0
+
+                rows_before.append({
+                    "ID": _lid,
+                    "Noha": _leg.get("leg_type", ""),
+                    "Typ": _leg.get("option_type", ""),
+                    "Strike": float(_leg.get("strike", 0)),
+                    "DTE": _dte_b,
+                    "Theta $/deň": round(gb["theta"], 2),
+                    "Delta $": round(gb["delta"], 0),
+                    "Vega $": round(gb["vega"], 2),
+                    "Roluje sa": "✏️" if _lid in _ml_roll_params else "—",
+                })
+                for k in ("delta", "theta", "vega"):
+                    tot_before[k] += gb[k]
+
+                if _lid in _ml_roll_params:
+                    rp = _ml_roll_params[_lid]
+                    ga = _ml_greeks(
+                        rp["strike"], rp["dte"], rp["iv"],
+                        rp["right"], rp["leg_type"], rp["contracts"],
+                    )
+                    # Net flow: short → inkasujeme roll_entry, platíme cur_p
+                    #           long  → predáme cur_p, platíme roll_entry
+                    if rp["leg_type"] == "Short":
+                        nf = (rp["entry"] - _curr_p_b) * rp["contracts"] * 100
+                    else:
+                        nf = (_curr_p_b - rp["entry"]) * rp["contracts"] * 100
+                    net_flow_total += nf
+
+                    rows_after.append({
+                        "ID": f"→{_lid}",
+                        "Noha": rp["leg_type"],
+                        "Typ": "Call" if rp["right"] == "C" else "Put",
+                        "Strike": rp["strike"],
+                        "DTE": rp["dte"],
+                        "Theta $/deň": round(ga["theta"], 2),
+                        "Delta $": round(ga["delta"], 0),
+                        "Vega $": round(ga["vega"], 2),
+                        "Net flow": round(nf, 0),
+                    })
+                    for k in ("delta", "theta", "vega"):
+                        tot_after[k] += ga[k]
+                else:
+                    # Noha sa neroluuje – ostane rovnaká
+                    rows_after.append({
+                        "ID": _lid,
+                        "Noha": _leg.get("leg_type", ""),
+                        "Typ": _leg.get("option_type", ""),
+                        "Strike": float(_leg.get("strike", 0)),
+                        "DTE": _dte_b,
+                        "Theta $/deň": round(gb["theta"], 2),
+                        "Delta $": round(gb["delta"], 0),
+                        "Vega $": round(gb["vega"], 2),
+                        "Net flow": 0.0,
+                    })
+                    for k in ("delta", "theta", "vega"):
+                        tot_after[k] += gb[k]
+
+            # ── Súhrn pred / po ─────────────────────────────────────────────
+            _ms1, _ms2, _ms3 = st.columns(3)
+            _ms1.metric(
+                "Net Theta pred",
+                f"${tot_before['theta']:+.2f}/deň",
+            )
+            _ms2.metric(
+                "Net Theta po rolle",
+                f"${tot_after['theta']:+.2f}/deň",
+                delta=f"{tot_after['theta'] - tot_before['theta']:+.2f}",
+            )
+            _ms3.metric(
+                "Celkový net flow rollu",
+                f"${net_flow_total:+.0f}",
+                help="+ = kredit (inkasoval si viac ako zaplatil)  /  − = debet",
+            )
+
+            _md1, _md2 = st.columns(2)
+            _md1.metric(
+                "Delta pred",
+                f"${tot_before['delta']:+.0f}",
+            )
+            _md2.metric(
+                "Delta po rolle",
+                f"${tot_after['delta']:+.0f}",
+                delta=f"{tot_after['delta'] - tot_before['delta']:+.0f}",
+            )
+
+            # ── Tabuľky ─────────────────────────────────────────────────────
+            _tab_b, _tab_a = st.tabs(["Pred rollom", "Po rolle"])
+            _col_cfg = {
+                "Strike":       st.column_config.NumberColumn(format="$%.0f"),
+                "Theta $/deň":  st.column_config.NumberColumn(format="$%+.2f"),
+                "Delta $":      st.column_config.NumberColumn(format="$%+.0f"),
+                "Vega $":       st.column_config.NumberColumn(format="$%+.2f"),
+            }
+            with _tab_b:
+                _rows_b_df = rows_before + [{
+                    "ID": "—", "Noha": "SPOLU", "Typ": "", "Strike": None, "DTE": None,
+                    "Theta $/deň": round(tot_before["theta"], 2),
+                    "Delta $": round(tot_before["delta"], 0),
+                    "Vega $": round(tot_before["vega"], 2),
+                    "Roluje sa": "",
+                }]
+                st.dataframe(pd.DataFrame(_rows_b_df), use_container_width=True,
+                             hide_index=True, column_config=_col_cfg)
+            with _tab_a:
+                _rows_a_df = rows_after + [{
+                    "ID": "—", "Noha": "SPOLU", "Typ": "", "Strike": None, "DTE": None,
+                    "Theta $/deň": round(tot_after["theta"], 2),
+                    "Delta $": round(tot_after["delta"], 0),
+                    "Vega $": round(tot_after["vega"], 2),
+                    "Net flow": round(net_flow_total, 0),
+                }]
+                _col_cfg_a = dict(_col_cfg)
+                _col_cfg_a["Net flow"] = st.column_config.NumberColumn(format="$%+.0f")
+                st.dataframe(pd.DataFrame(_rows_a_df), use_container_width=True,
+                             hide_index=True, column_config=_col_cfg_a)
+
+            # ── P&L diagram kombinovanej pozície ────────────────────────────
+            if _ml_spot > 0:
+                st.markdown("---")
+                st.markdown("#### P&L diagram skupiny pri expirácii")
+
+                import numpy as _np2
+                import plotly.graph_objects as _go2
+
+                _pct_steps = [-15, -10, -7.5, -5, -2.5, 0, +2.5, +5, +7.5, +10, +15]
+                _spot_levels = [round(_ml_spot * (1 + p / 100), 2) for p in _pct_steps]
+
+                def _pnl_at_exp(leg_list, roll_params, spot_lvl):
+                    total = 0.0
+                    for _l in leg_list:
+                        _lid2 = _l["id"]
+                        _contr = int(_l.get("contracts", 1))
+                        if _lid2 in roll_params:
+                            rp2 = roll_params[_lid2]
+                            _s2, _r2, _e2 = rp2["strike"], rp2["right"], rp2["entry"]
+                            _lt2 = rp2["leg_type"]
+                        else:
+                            _s2 = float(_l.get("strike", 0))
+                            _r2 = "C" if _l.get("option_type", "Call") == "Call" else "P"
+                            _e2 = float(_l.get("entry_price") or 0)
+                            _lt2 = _l.get("leg_type", "Long")
+                        _intr = max(0.0, spot_lvl - _s2) if _r2 == "C" else max(0.0, _s2 - spot_lvl)
+                        if _lt2 == "Short":
+                            total += (_e2 - _intr) * _contr * 100
+                        else:
+                            total += (_intr - _e2) * _contr * 100
+                    return round(total, 0)
+
+                _pnl_before = [_pnl_at_exp(_ml_legs, {}, s) for s in _spot_levels]
+                _pnl_after  = [_pnl_at_exp(_ml_legs, _ml_roll_params, s) for s in _spot_levels]
+
+                _fig_ml = _go2.Figure()
+                _fig_ml.add_trace(_go2.Bar(
+                    x=[f"{p:+.1f}%" for p in _pct_steps],
+                    y=_pnl_before,
+                    name="Pred rollom",
+                    marker_color=["#2ecc71" if v >= 0 else "#e74c3c" for v in _pnl_before],
+                    opacity=0.55,
+                    hovertemplate="Zmena: %{x}<br>P&L pred: $%{y:+,.0f}<extra></extra>",
+                ))
+                _fig_ml.add_trace(_go2.Scatter(
+                    x=[f"{p:+.1f}%" for p in _pct_steps],
+                    y=_pnl_after,
+                    name="Po rolle",
+                    mode="lines+markers",
+                    line=dict(color="#f39c12", width=2, dash="dash"),
+                    marker=dict(size=7),
+                    hovertemplate="Zmena: %{x}<br>P&L po rolle: $%{y:+,.0f}<extra></extra>",
+                ))
+                _fig_ml.add_hline(y=0, line_color="gray", line_width=1)
+                _fig_ml.update_layout(
+                    height=340,
+                    xaxis_title="Zmena ceny podkladu pri expirácii short nohy",
+                    yaxis_title="P&L ($)",
+                    yaxis=dict(tickformat="$,.0f"),
+                    margin=dict(l=10, r=10, t=20, b=40),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                    barmode="overlay",
+                )
+                st.plotly_chart(_fig_ml, use_container_width=True)
+                st.caption(
+                    "Stĺpce = skupina pred rollom · Prerušovaná = skupina po rolle. "
+                    "P&L počítaný k expirácii shortest nohy."
+                )
+
+            # ── Roll odporúčanie pre skupinu ────────────────────────────────
+            if _ml_roll_params:
+                st.markdown("---")
+                st.markdown("#### Roll odporúčanie skupiny")
+
+                _d_theta = tot_after["theta"] - tot_before["theta"]
+                _d_delta = abs(tot_after["delta"]) - abs(tot_before["delta"])
+                _score_ml = 0
+                _pros_ml, _cons_ml = [], []
+
+                # Theta
+                if _d_theta > 0.5:
+                    _pros_ml.append(f"✅ Theta sa zlepší o **${_d_theta:+.2f}/deň**")
+                    _score_ml += 2
+                elif _d_theta < -1:
+                    _cons_ml.append(f"⚠️ Theta sa zhorší o **${_d_theta:+.2f}/deň**")
+                    _score_ml -= 1
+                else:
+                    _pros_ml.append(f"🟡 Theta zmena: **${_d_theta:+.2f}/deň** (malá)")
+
+                # Net flow
+                if net_flow_total > 0:
+                    _pros_ml.append(f"✅ Celkový kredit **${net_flow_total:+.0f}** za obe nohy")
+                    _score_ml += 2
+                elif net_flow_total < -100:
+                    _cons_ml.append(f"⛔ Celkový debet **${net_flow_total:+.0f}** — platíš za rozšírenie")
+                    _score_ml -= 1
+                else:
+                    _pros_ml.append(f"ℹ️ Roll takmer break-even (**${net_flow_total:+.0f}**)")
+
+                # Delta
+                if _d_delta < -10:
+                    _pros_ml.append(f"✅ Delta risk skupiny klesne o ${abs(_d_delta):.0f}")
+                    _score_ml += 1
+                elif _d_delta > 20:
+                    _cons_ml.append(f"⚠️ Delta risk skupiny vzrastie o ${_d_delta:.0f}")
+                    _score_ml -= 1
+
+                # IV
+                if _ml_iv > 0.35:
+                    _pros_ml.append(f"✅ IV = {_ml_iv*100:.1f}% — dobré prostredie pre predaj prémia")
+                    _score_ml += 1
+                elif _ml_iv < 0.20:
+                    _cons_ml.append(f"⚠️ IV = {_ml_iv*100:.1f}% — nízka volatilita, prémia lacné")
+                    _score_ml -= 1
+
+                if _score_ml >= 3:
+                    _vlbl = "✅ ROLL ODPORÚČANÝ"
+                    _vbg, _vc = "#d4edda", "#1a7a1a"
+                elif _score_ml <= -1:
+                    _vlbl = "⛔ ROLL NEODPORÚČANÝ"
+                    _vbg, _vc = "#f8d7da", "#721c24"
+                else:
+                    _vlbl = "🟡 NEUTRÁLNE"
+                    _vbg, _vc = "#fff3cd", "#856404"
+
+                st.markdown(
+                    f"<div style='background:{_vbg};border-radius:8px;padding:12px 18px;margin-bottom:12px;'>"
+                    f"<span style='font-size:1.2em;font-weight:bold;color:{_vc};'>{_vlbl}</span>"
+                    f"<span style='color:#555;font-size:0.9em;margin-left:12px;'>(skóre: {_score_ml:+d})</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+                _pc1, _pc2 = st.columns(2)
+                with _pc1:
+                    if _pros_ml:
+                        st.markdown("**Za roll:**")
+                        for _p in _pros_ml:
+                            st.markdown(f"- {_p}")
+                with _pc2:
+                    if _cons_ml:
+                        st.markdown("**Proti rollu:**")
+                        for _c in _cons_ml:
+                            st.markdown(f"- {_c}")
+
+                # Uložiť do denníka
+                if st.button("📝 Zapísať multi-leg roll do denníka",
+                             key="mlroll_save_btn", use_container_width=False):
+                    _ml_note_body = f"""## Multi-leg Roll analýza — {_sel_grp_id}
+**Dátum:** {date.today().strftime('%d.%m.%Y')}  ·  Spot: ${_ml_spot:.2f}  ·  IV: {_ml_iv*100:.1f}%
+
+### Parametre rollu
+| Noha | Aktuálny strike | Nový strike | Nová expir. | Vstupná cena | Net flow |
+|------|----------------|------------|------------|-------------|---------|
+"""
+                    for _l2 in _ml_legs:
+                        _l2id = _l2["id"]
+                        if _l2id in _ml_roll_params:
+                            rp3 = _ml_roll_params[_l2id]
+                            _contr3 = rp3["contracts"]
+                            _nf3 = (rp3["entry"] - (bs_price(_ml_spot, float(_l2.get("strike",0)), max(1,_dte_from_str(_l2.get("expiry",""))), _ml_iv, "C" if _l2.get("option_type","Call")=="Call" else "P") or 0)) * _contr3 * 100 if rp3["leg_type"]=="Short" else 0
+                            _ml_note_body += (
+                                f"| {_l2.get('leg_type','')} {_l2.get('option_type','')} | "
+                                f"${float(_l2.get('strike',0)):.0f} exp {_l2.get('expiry','')} | "
+                                f"${rp3['strike']:.0f} | {rp3['expiry_date'].strftime('%d.%m.%Y')} (DTE {rp3['dte']}d) | "
+                                f"${rp3['entry']:.2f} | ${net_flow_total:+.0f} |\n"
+                            )
+                        else:
+                            _ml_note_body += (
+                                f"| {_l2.get('leg_type','')} {_l2.get('option_type','')} | "
+                                f"${float(_l2.get('strike',0)):.0f} exp {_l2.get('expiry','')} | "
+                                f"*(bez zmeny)* | — | — | $0 |\n"
+                            )
+
+                    _ml_note_body += f"""
+### Kľúčové čísla
+| Metrika | Pred rollom | Po rolle | Zmena |
+|---------|------------|---------|-------|
+| Net Theta/deň | ${tot_before['theta']:+.2f} | ${tot_after['theta']:+.2f} | ${_d_theta:+.2f} |
+| Delta $ | ${tot_before['delta']:+.0f} | ${tot_after['delta']:+.0f} | ${_d_delta:+.0f} |
+| Net flow celkom | | ${net_flow_total:+.0f} | |
+
+### Verdict: {_vlbl}  (skóre: {_score_ml:+d})
+
+### Za roll
+{chr(10).join(f'- {p}' for p in _pros_ml) or '—'}
+
+### Proti rollu
+{chr(10).join(f'- {c}' for c in _cons_ml) or '—'}
+"""
+                    _ml_nid = db.add_note(
+                        title=f"Multi-leg Roll — {_sel_grp_id} [{date.today().strftime('%d.%m.%Y')}]",
+                        content=_ml_note_body,
+                        group_id=_sel_grp_id,
+                    )
+                    st.success(f"✅ Poznámka #{_ml_nid} uložená do denníka (skupina {_sel_grp_id})")
+
+
+st.divider()
+
 # ─── PoP kalkulačka (jednoduchá, bez pozície) ──────────────────────────────────
 with st.expander("PoP kalkulačka — rýchly výpočet pravdepodobnosti (bez pozície z IBKR)"):
     st.caption("Zadaj parametre ručne ak nechceš načítavať pozíciu z IBKR.")

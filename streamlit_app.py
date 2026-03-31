@@ -132,10 +132,14 @@ with st.sidebar:
 if auto_on:
     from core import ibkr, database as db
     db.init_db()
+
     if ibkr.is_connected():
+        # fetch_positions bez Greeks: len ib.portfolio() – synchrónna cache, rýchle
         _res = ibkr.fetch_positions()
         if not _res.get("error"):
-            _sync = ibkr.sync_positions_to_db(_res["positions"], db)
+            _fetched_positions = _res["positions"]
+            st.session_state["live_positions"] = _fetched_positions
+            _sync = ibkr.sync_positions_to_db(_fetched_positions, db)
             st.session_state["last_sync"] = datetime.now().strftime("%H:%M:%S")
             st.session_state["sync_count"] = st.session_state.get("sync_count", 0) + 1
             st.session_state["possibly_closed"] = _sync.get("possibly_closed", [])
@@ -148,6 +152,21 @@ if auto_on:
                     f"⚠️ {len(_sync['possibly_closed'])} pozícií chýba v IBKR — skontroluj Dashboard",
                     icon="⚠️"
                 )
+        # Objednávky z cache (openTrades) – bez sieťového volania, bezpečné
+        _live_orders = ibkr.get_ib().openTrades() if ibkr.get_ib() else []
+        st.session_state["live_orders"] = [
+            {"ticker": t.contract.symbol, "sec_type": t.contract.secType,
+             "action": t.order.action, "total_qty": t.order.totalQuantity,
+             "order_type": t.order.orderType, "status": t.orderStatus.status,
+             "limit_price": t.order.lmtPrice if t.order.orderType in ("LMT","STP LMT") else None,
+             "option_type": ("Call" if t.contract.right=="C" else "Put") if t.contract.secType=="OPT" else None,
+             "strike": float(t.contract.strike) if t.contract.secType=="OPT" else None,
+             "expiry": t.contract.lastTradeDateOrContractMonth if t.contract.secType=="OPT" else None,
+            }
+            for t in _live_orders
+            if t.orderStatus.status in ("PendingSubmit","PreSubmitted","Submitted")
+            and t.contract.secType in ("OPT","STK")
+        ]
 
 # ─── Navigácia ────────────────────────────────────────────────────────────────
 dashboard = st.Page("pages/dashboard.py",  title="Dashboard",         icon=":material/dashboard:",      default=True)
