@@ -97,10 +97,20 @@ def _migrate_symbols(conn: sqlite3.Connection) -> None:
         "earnings_date_3": "ALTER TABLE symbols ADD COLUMN earnings_date_3 TEXT",
         "earnings_date_4": "ALTER TABLE symbols ADD COLUMN earnings_date_4 TEXT",
         "ir_url":          "ALTER TABLE symbols ADD COLUMN ir_url TEXT",
+        "spot":            "ALTER TABLE symbols ADD COLUMN spot REAL DEFAULT 0",
+        "iv_pct":          "ALTER TABLE symbols ADD COLUMN iv_pct REAL DEFAULT 30",
     }
     for col, sql in migrations.items():
         if col not in existing:
             conn.execute(sql)
+
+    # Settings tabuľka pre jednoduchý key-value store (margin, atď.)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
     conn.commit()
 
 
@@ -199,15 +209,16 @@ def update_symbol(symbol_id: int, ticker: str, company_name: str, sector: str,
                   asset_type: str, description: str,
                   earnings_date: str = None, iv_rank: float = None,
                   earnings_date_2: str = None, earnings_date_3: str = None,
-                  earnings_date_4: str = None, ir_url: str = None) -> None:
+                  earnings_date_4: str = None, ir_url: str = None,
+                  spot: float = None, iv_pct: float = None) -> None:
     with get_connection() as conn:
         conn.execute(
             "UPDATE symbols SET ticker=?, company_name=?, sector=?, asset_type=?, "
             "description=?, earnings_date=?, earnings_date_2=?, earnings_date_3=?, "
-            "earnings_date_4=?, ir_url=?, iv_rank=? WHERE id=?",
+            "earnings_date_4=?, ir_url=?, iv_rank=?, spot=?, iv_pct=? WHERE id=?",
             (ticker.strip().upper(), company_name, sector, asset_type,
              description, earnings_date, earnings_date_2, earnings_date_3,
-             earnings_date_4, ir_url, iv_rank, symbol_id),
+             earnings_date_4, ir_url, iv_rank, spot, iv_pct, symbol_id),
         )
 
 
@@ -518,3 +529,22 @@ def compute_pnl(trade: dict) -> Optional[float]:
         gross = raw if trade.get("leg_type") == "Long" else -raw
         return gross - commission
     return None
+
+
+# ─── Settings (key-value store) ───────────────────────────────────────────────
+
+def get_setting(key: str, default: str = "") -> str:
+    """Načíta hodnotu nastavenia podľa kľúča."""
+    with get_connection() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    """Uloží alebo aktualizuje nastavenie."""
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value)),
+        )

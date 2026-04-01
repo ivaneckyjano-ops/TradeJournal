@@ -596,6 +596,194 @@ def fetch_positions(with_greeks: bool = False) -> dict:
         return {"positions": [], "error": str(e)}
 
 
+# ─── Spot fetch job (background, podobne ako FETCH_JOB) ──────────────────────
+SPOT_FETCH_JOB: dict = {
+    "status": "idle",   # idle | running | done | error
+    "result": None,     # dict {ticker: price}
+    "error":  None,
+}
+
+
+def fetch_spot_prices_bg(tickers: list[str]) -> None:
+    """
+    Spustí fetching spot cien v separátnom vlákne.
+    Výsledok sa uloží do SPOT_FETCH_JOB["result"].
+    Volá sa z UI – vlákno samo beží mimo Streamlit loop.
+    """
+    import threading
+
+    def _worker():
+        SPOT_FETCH_JOB["status"] = "running"
+        SPOT_FETCH_JOB["error"]  = None
+        SPOT_FETCH_JOB["result"] = None
+        try:
+            result = _fetch_spot_prices_sync(tickers)
+            SPOT_FETCH_JOB["result"] = result
+            SPOT_FETCH_JOB["status"] = "done"
+        except Exception as exc:
+            SPOT_FETCH_JOB["error"]  = str(exc)
+            SPOT_FETCH_JOB["status"] = "error"
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+
+
+def _fetch_spot_prices_sync(tickers: list[str], timeout: float = 10.0) -> dict[str, float]:
+    """
+    Interná implementácia – beží v background vlákne.
+    Používa reqMktData (snapshot) s manuálnym čakaním namiesto reqTickers
+    aby sa predišlo deadlocku v hlavnom Streamlit vlákne.
+    """
+    ib = _IB_INSTANCE
+    if not ib or not ib.isConnected():
+        return {}
+
+    try:
+        from ib_insync import Stock, util
+    except ImportError:
+        return {}
+
+    result: dict[str, float] = {}
+    contracts = [Stock(tk, "SMART", "USD") for tk in tickers]
+
+    # Prihlás sa na snapshot market data pre každý ticker
+    mkt_data_list = []
+    for c in contracts:
+        try:
+            md = ib.reqMktData(c, "", snapshot=True, regulatorySnapshot=False)
+            mkt_data_list.append((c.symbol, md))
+        except Exception:
+            pass
+
+    # Počkaj max timeout sekúnd na príchod dát
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        all_done = True
+        for sym, md in mkt_data_list:
+            if sym in result:
+                continue
+            price = None
+            try:
+                # Skús marketPrice(), potom last, potom close
+                mp = md.marketPrice()
+                if mp and not math.isnan(mp) and mp > 0:
+                    price = mp
+                elif md.last and not math.isnan(float(md.last)) and float(md.last) > 0:
+                    price = float(md.last)
+                elif md.close and not math.isnan(float(md.close)) and float(md.close) > 0:
+                    price = float(md.close)
+            except Exception:
+                pass
+            if price:
+                result[sym] = price
+            else:
+                all_done = False
+        if all_done:
+            break
+        time.sleep(0.5)
+
+    # Zruš market data subscriptions
+    for _, md in mkt_data_list:
+        try:
+            ib.cancelMktData(md.contract)
+        except Exception:
+            pass
+
+    return result
+
+
+# ─── Account fetch job (background thread, time.sleep – neblokuje UI) ────────
+ACCOUNT_FETCH_JOB: dict = {
+    "status": "idle",   # idle | running | done | error
+    "result": None,
+    "error":  None,
+}
+
+_ACCOUNT_KEYS_MAP = {
+    "AvailableFunds":  "available_funds",
+    "NetLiquidation":  "net_liquidation",
+    "BuyingPower":     "buying_power",
+    "MaintMarginReq":  "maintenance_margin",
+    "InitMarginReq":   "initial_margin",
+}
+
+
+def _parse_account_values(values) -> dict:
+    result = {}
+    for item in (values or []):
+        tag = getattr(item, "tag", None)
+        cur = getattr(item, "currency", "")
+        val = getattr(item, "value", None)
+        if tag in _ACCOUNT_KEYS_MAP and cur in ("USD", "BASE", ""):
+            try:
+                result[_ACCOUNT_KEYS_MAP[tag]] = float(val)
+            except (ValueError, TypeError):
+                pass
+    return result
+
+
+def fetch_account_summary_bg() -> None:
+    """
+    Spustí fetch account summary v background vlákne.
+    Používa time.sleep() (nie ib.sleep()) – neblokuje Streamlit UI.
+    reqAccountUpdates() z background vlákna queuje request na hlavný event loop.
+    """
+    import threading
+
+    def _worker():
+        ACCOUNT_FETCH_JOB["status"] = "running"
+        ACCOUNT_FETCH_JOB["error"]  = None
+        ACCOUNT_FETCH_JOB["result"] = None
+        ib = _IB_INSTANCE
+        if not ib or not ib.isConnected():
+            ACCOUNT_FETCH_JOB["error"]  = "IBKR nie je pripojené"
+            ACCOUNT_FETCH_JOB["status"] = "error"
+            return
+        try:
+            # Skús najprv priamo z cache (ak bola subscription aktívna skôr)
+            cached = _parse_account_values(ib.accountValues())
+            if cached:
+                ACCOUNT_FETCH_JOB["result"] = cached
+                ACCOUNT_FETCH_JOB["status"] = "done"
+                return
+
+            # Pošli reqAccountUpdates – event loop hlavného vlákna to spracuje
+            ib.reqAccountUpdates(True)
+
+            # Čakaj na dáta pomocou time.sleep (neblokuje Streamlit main thread)
+            deadline = time.time() + 8.0
+            result: dict = {}
+            while time.time() < deadline:
+                result = _parse_account_values(ib.accountValues())
+                if result:
+                    break
+                time.sleep(0.3)
+
+            ib.reqAccountUpdates(False)
+            ACCOUNT_FETCH_JOB["result"] = result
+            ACCOUNT_FETCH_JOB["status"] = "done" if result else "error"
+            if not result:
+                _all_vals = ib.accountValues()
+                ACCOUNT_FETCH_JOB["error"] = (
+                    f"Žiadne dáta po 8s. accountValues() vrátilo "
+                    f"{len(_all_vals)} položiek, "
+                    f"tagy: {[getattr(v,'tag','?') for v in _all_vals[:6]]}"
+                )
+        except Exception as exc:
+            ACCOUNT_FETCH_JOB["error"]  = str(exc)
+            ACCOUNT_FETCH_JOB["status"] = "error"
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def fetch_account_summary() -> dict:
+    """Synchrónna verzia – len pre kompatibilitu. Použi fetch_account_summary_bg()."""
+    ib = _IB_INSTANCE or get_ib()
+    if not ib:
+        return {}
+    return _parse_account_values(ib.accountValues())
+
+
 def _pos_key(ticker, strike, expiry, leg_type, option_type) -> str:
     """Unikátny kľúč pre porovnanie pozícií."""
     return f"{ticker}|{strike}|{expiry}|{leg_type}|{option_type}"
