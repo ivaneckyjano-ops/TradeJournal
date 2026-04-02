@@ -10,6 +10,7 @@ po zaistení event loop pomocou _ensure_event_loop().
 from __future__ import annotations
 
 import asyncio
+import socket
 import threading
 import time
 import math
@@ -36,75 +37,8 @@ FETCH_JOB: dict = {
 }
 
 
-# ─── Black-Scholes Greeks (lokálny výpočet keď TWS nepošle Greeks) ────────────
-
-def _bs_price(S: float, K: float, T: float, iv: float, right: str, r: float = 0.045) -> float:
-    """Black-Scholes cena opcie."""
-    from scipy.stats import norm as _norm
-    if T <= 0 or iv <= 0:
-        return max(0.0, (S - K) if right == "C" else (K - S))
-    sqrtT = math.sqrt(T)
-    d1 = (math.log(S / K) + (r + 0.5 * iv * iv) * T) / (iv * sqrtT)
-    d2 = d1 - iv * sqrtT
-    if right == "C":
-        return S * _norm.cdf(d1) - K * math.exp(-r * T) * _norm.cdf(d2)
-    else:
-        return K * math.exp(-r * T) * _norm.cdf(-d2) - S * _norm.cdf(-d1)
-
-
-def _calc_iv(S: float, K: float, T: float, opt_price: float, right: str, r: float = 0.045) -> float | None:
-    """
-    Vypočíta implied volatility bisekčnou metódou.
-    Vráti IV ako desatinné číslo (napr. 0.35 = 35%) alebo None ak sa nepodarí.
-    """
-    if T <= 0 or opt_price <= 0 or S <= 0 or K <= 0:
-        return None
-    low, high = 0.001, 5.0
-    for _ in range(60):
-        mid = (low + high) / 2
-        price = _bs_price(S, K, T, mid, right, r)
-        if abs(price - opt_price) < 0.0001:
-            return mid
-        if price < opt_price:
-            low = mid
-        else:
-            high = mid
-    return mid if 0.01 < mid < 4.9 else None
-
-
-def _bs_greeks(S: float, K: float, T: float, iv: float, right: str, r: float = 0.045) -> dict:
-    """
-    Vypočíta delta, gamma, theta, vega z Black-Scholes.
-    S=spot, K=strike, T=roky do expirácie, iv=impl. vol (napr. 0.35),
-    right='C' alebo 'P'.
-    Theta je denná (vydelená 365). Vega je na 1% zmenu IV.
-    """
-    try:
-        from scipy.stats import norm as _norm
-        if T <= 0 or iv <= 0 or S <= 0 or K <= 0:
-            return {}
-        sqrtT = math.sqrt(T)
-        d1 = (math.log(S / K) + (r + 0.5 * iv * iv) * T) / (iv * sqrtT)
-        d2 = d1 - iv * sqrtT
-        nd1  = _norm.pdf(d1)
-        if right == 'C':
-            delta = _norm.cdf(d1)
-            theta = (-(S * nd1 * iv) / (2 * sqrtT) - r * K * math.exp(-r * T) * _norm.cdf(d2)) / 365
-        else:
-            delta = _norm.cdf(d1) - 1
-            theta = (-(S * nd1 * iv) / (2 * sqrtT) + r * K * math.exp(-r * T) * _norm.cdf(-d2)) / 365
-        gamma = nd1 / (S * iv * sqrtT)
-        vega  = S * nd1 * sqrtT / 100
-        return {
-            "delta": round(delta, 4),
-            "gamma": round(gamma, 6),
-            "theta": round(theta, 4),
-            "vega":  round(vega, 4),
-            "iv":    round(iv, 4),
-        }
-    except Exception:
-        return {}
-
+# ─── Black-Scholes (delegované na core.greeks) ───────────────────────────────
+from core.greeks import bs_price as _bs_price, calc_iv as _calc_iv, bs_greeks as _bs_greeks
 
 # ─── Event loop helper ────────────────────────────────────────────────────────
 
@@ -141,25 +75,167 @@ _IB_INSTANCE: object = None  # type: ignore[assignment]
 _MAIN_LOOP: asyncio.AbstractEventLoop | None = None  # loop hlavného vlákna pri connect()
 
 
+async def _await_ib_open_orders(ib):
+    """
+    ib.reqAllOpenOrdersAsync() vracia asyncio.Future, nie coroutine.
+    run_coroutine_threadsafe vyžaduje coroutine → musíme obaliť do async def.
+    """
+    return await ib.reqAllOpenOrdersAsync()
+
+
+async def _await_ib_contract_details(ib, contract):
+    """Rovnaký dôvod ako pri open orders – Future musí byť awaitnutý v coroutine na ib._loop."""
+    return await ib.reqContractDetailsAsync(contract)
+
+
+def _ib_api_loop(ib) -> asyncio.AbstractEventLoop | None:
+    """Event loop kde beží IB socket (vždy ib._loop po connect)."""
+    return getattr(ib, "_loop", None) or _MAIN_LOOP
+
+
+# Cache conId → čitateľný popis (naplní sa pri connect cez _populate_contract_cache)
+_LEG_LABEL_CACHE: dict[int, str] = {}
+
+
+def clear_leg_label_cache() -> None:
+    _LEG_LABEL_CACHE.clear()
+
+
+def _populate_contract_cache(ib) -> None:
+    """
+    Naplní _LEG_LABEL_CACHE kontraktmi z IB.
+    Volaj HNEĎ po connect() kým async ešte funguje.
+    """
+    global _LEG_LABEL_CACHE
+    
+    # Zbieraj conId z portfolio, positions, fills
+    for item in (ib.portfolio() or []):
+        c = item.contract
+        if c.conId and c.localSymbol:
+            _LEG_LABEL_CACHE[c.conId] = _contract_label_from_details(c)
+    
+    for pos in (ib.positions() or []):
+        c = pos.contract
+        if c.conId and c.localSymbol:
+            _LEG_LABEL_CACHE[c.conId] = _contract_label_from_details(c)
+    
+    for fill in (ib.fills() or []):
+        c = fill.contract
+        if c.conId and c.localSymbol:
+            _LEG_LABEL_CACHE[c.conId] = _contract_label_from_details(c)
+    
+    # Zbieraj conId z otvorených objednávok (vrátane BAG combo legs)
+    try:
+        trades = ib.openTrades() or []
+        con_ids_to_resolve: set[int] = set()
+        
+        for trade in trades:
+            c = trade.contract
+            if c.secType == "BAG":
+                for leg in (getattr(c, "comboLegs", []) or []):
+                    if leg.conId and leg.conId not in _LEG_LABEL_CACHE:
+                        con_ids_to_resolve.add(leg.conId)
+        
+        # Resolve všetky naraz cez qualifyContracts
+        if con_ids_to_resolve:
+            from ib_insync import Contract
+            contracts = [Contract(conId=cid) for cid in con_ids_to_resolve]
+            try:
+                ib.qualifyContracts(*contracts)
+                for c in contracts:
+                    if c.conId and c.localSymbol:
+                        _LEG_LABEL_CACHE[c.conId] = _contract_label_from_details(c)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def enrich_open_orders_legs(orders: list[dict]) -> None:
+    """
+    Doplní BAG combo nohy čitateľnými popismi (strike, exp, C/P).
+    Volaj výhradne z hlavného Streamlit vlákna (rovnaké ako connect).
+    Upravuje orders in-place.
+    Používa ib.qualifyContracts() ktorý je spoľahlivejší než reqContractDetails.
+    """
+    ib = get_ib()
+    if not ib or not ib.isConnected() or not orders:
+        return
+    _ib_ready()
+    from ib_insync import Contract
+
+    # Zbieraj všetky conId z BAG objednávok, ktoré ešte nie sú v cache
+    needed_cids: set[int] = set()
+    for o in orders:
+        if o.get("sec_type") != "BAG":
+            continue
+        for lg in o.get("legs") or []:
+            cid = int(lg.get("con_id") or 0)
+            if cid and cid not in _LEG_LABEL_CACHE:
+                needed_cids.add(cid)
+
+    # Batch qualify všetkých nových conId naraz
+    if needed_cids:
+        contracts = [Contract(conId=cid) for cid in needed_cids]
+        try:
+            ib.qualifyContracts(*contracts)
+        except Exception:
+            pass  # niektoré môžu zlyhať, pokračuj s tým čo prišlo
+        for c in contracts:
+            if c.conId and c.localSymbol:
+                # Máme qualified kontrakt → extrahuj label
+                lab = _contract_label_from_details(c)
+                _LEG_LABEL_CACHE[c.conId] = lab
+            elif c.conId:
+                _LEG_LABEL_CACHE[c.conId] = str(c.conId)
+
+    # Doplň labels do orders
+    for o in orders:
+        if o.get("sec_type") != "BAG":
+            continue
+        legs = o.get("legs") or []
+        parts = []
+        for lg in legs:
+            cid = int(lg.get("con_id") or 0)
+            lab = _LEG_LABEL_CACHE.get(cid, str(cid))
+            sign = "+" if lg.get("action") == "BUY" else "-"
+            parts.append(f"{sign}{lg.get('ratio', 1)} {lab}")
+            lg["label"] = lab
+        o["legs_descr"] = ", ".join(parts)
+
+
 def get_ib():
     """Vráti IB inštanciu – z module-level cache alebo session_state."""
     global _IB_INSTANCE
-    # Primárny zdroj: module-level (funguje aj v threadoch)
     if _IB_INSTANCE is not None:
         return _IB_INSTANCE
-    # Fallback: session_state (pre prípad priameho prístupu z hlavného vlákna)
     ib = st.session_state.get("ib")
     if ib is not None:
-        _IB_INSTANCE = ib  # synchronizuj
+        _IB_INSTANCE = ib
     return ib
 
 
 def is_connected() -> bool:
     ib = get_ib()
-    return ib is not None and ib.isConnected()
+    if ib is None:
+        return False
+    try:
+        return ib.isConnected()
+    except Exception:
+        return False
 
 
 # ─── Connect / Disconnect ─────────────────────────────────────────────────────
+
+def _tcp_reachable(host: str, port: int, timeout: float = 3.0) -> tuple[bool, str]:
+    """Rýchla kontrola či TWS/Gateway počúva na host:port (pred ib.connect)."""
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            pass
+        return True, ""
+    except OSError as e:
+        return False, str(e)
+
 
 def connect(
     host: str = DEFAULT_HOST,
@@ -167,29 +243,63 @@ def connect(
     client_id: int = DEFAULT_CLIENT_ID,
 ) -> tuple[bool, str]:
     """
-    Pripoj sa na IBKR. Ak je clientId obsadený, automaticky skúsi ďalšie ID (až +5).
-    Vráti (úspech, správa).
+    Pripoj sa na IBKR. Vždy v hlavnom Streamlit vlákne (ib_insync to vyžaduje).
+    Najprv TCP test (3s) – ak TWS nepočúva, okamžitá chyba namiesto visenia.
     """
-    IB, _, _ = _ib_ready()
+    global _IB_INSTANCE, _MAIN_LOOP
 
-    old = get_ib()
+    ok_tcp, tcp_err = _tcp_reachable(host, port, timeout=3.0)
+    if not ok_tcp:
+        return (
+            False,
+            f"Na {host}:{port} sa nedá pripojiť (TCP). Spusti TWS alebo IB Gateway "
+            f"a skontroluj API port (TWS live 7496, paper 7497, Gateway 4001/4002). "
+            f"Detail: {tcp_err}",
+        )
+
+    old = _IB_INSTANCE or st.session_state.get("ib")
     if old:
         try:
             old.disconnect()
         except Exception:
             pass
+    _IB_INSTANCE = None
+    _MAIN_LOOP   = None
     st.session_state.pop("ib", None)
+
+    IB, _, _ = _ib_ready()
 
     last_err = ""
     for offset in range(6):
         cid = client_id + offset
         try:
             ib = IB()
-            ib.connect(host, port, clientId=cid, timeout=10, readonly=False)
-            global _IB_INSTANCE, _MAIN_LOOP
+            try:
+                ib.RequestTimeout = 8
+            except AttributeError:
+                pass
+            ib.connect(host, port, clientId=cid, timeout=8, readonly=False)
             _IB_INSTANCE = ib
-            _MAIN_LOOP = asyncio.get_event_loop()  # zachytíme loop hlavného vlákna
+            # ib._loop by mal byť nastavený po connect, ale nest_asyncio ho môže zničiť
+            # Explicitne nastavíme ak chýba
+            if not getattr(ib, "_loop", None):
+                from ib_insync import util
+                ib._loop = util.getLoop()
+            _MAIN_LOOP = ib._loop or asyncio.get_event_loop()
             st.session_state["ib"] = ib
+            try:
+                ib.reqAccountUpdates(True)
+            except Exception:
+                pass
+            try:
+                ib.reqAllOpenOrders()   # pre-populate cache objednávok
+            except Exception:
+                pass
+            # Naplň contract cache pre BAG combo legs (kým async funguje)
+            try:
+                _populate_contract_cache(ib)
+            except Exception:
+                pass
             return True, f"Pripojený na {host}:{port}  (clientId={cid})"
         except Exception as e:
             last_err = str(e)
@@ -201,10 +311,14 @@ def connect(
 def disconnect() -> None:
     global _IB_INSTANCE, _MAIN_LOOP
     ib = get_ib()
-    if ib and ib.isConnected():
-        ib.disconnect()
+    if ib:
+        try:
+            ib.disconnect()
+        except Exception:
+            pass
     _IB_INSTANCE = None
-    _MAIN_LOOP = None
+    _MAIN_LOOP   = None
+    clear_leg_label_cache()
     st.session_state.pop("ib", None)
 
 
@@ -448,6 +562,24 @@ def fetch_iv(ticker: str, expiry: str, strike: float, right: str = "C") -> dict:
         return {"iv": None, "und_price": None, "error": str(e)}
 
 
+def _contract_label_from_details(ct) -> str:
+    if ct.secType in ("OPT", "FOP"):
+        exp = ct.lastTradeDateOrContractMonth or ""
+        if len(exp) == 8:
+            try:
+                from datetime import datetime as _dt
+                d = _dt.strptime(exp, "%Y%m%d")
+                exp = d.strftime("%b'%y")
+            except Exception:
+                pass
+        right = "C" if ct.right in ("C", "CALL") else "P"
+        return f"{exp} {ct.strike:.0f} {right}"
+    if ct.secType == "FUT":
+        exp = ct.lastTradeDateOrContractMonth or ""
+        return f"{ct.symbol} {exp} FUT"
+    return ct.localSymbol or ct.symbol or str(getattr(ct, "conId", ""))
+
+
 def fetch_open_orders(use_cache: bool = False) -> dict:
     """
     Načíta aktívne objednávky z TWS (vrátane objednávok zadaných priamo v TWS).
@@ -466,32 +598,47 @@ def fetch_open_orders(use_cache: bool = False) -> dict:
 
     try:
         if use_cache:
-            # Z background vlákna: naplánuj na hlavný event loop (kde beží IB spojenie)
-            if _MAIN_LOOP and _MAIN_LOOP.is_running():
+            # Z background vlákna: na ib._loop musí ísť skutočný coroutine
+            loop = _ib_api_loop(ib)
+            if loop and loop.is_running():
                 future = asyncio.run_coroutine_threadsafe(
-                    ib.reqAllOpenOrdersAsync(), _MAIN_LOOP
+                    _await_ib_open_orders(ib), loop
                 )
-                all_trades = future.result(timeout=10)
+                all_trades = future.result(timeout=15)
             else:
-                # Fallback: lokálna cache (len API-zadané objednávky)
                 all_trades = ib.openTrades()
         else:
-            # Živé volanie z hlavného Streamlit vlákna – zachytíme loop pre background vlákna
+            # Živé volanie z hlavného Streamlit vlákna
             _ib_ready()
             try:
                 _MAIN_LOOP = asyncio.get_event_loop()
             except Exception:
                 pass
-            all_trades = ib.reqAllOpenOrders()
+            # Najprv skús openTrades (cache), potom reqAllOpenOrders
+            all_trades = ib.openTrades()
+            if not all_trades:
+                try:
+                    all_trades = ib.reqAllOpenOrders()
+                except Exception as e:
+                    return {"orders": [], "error": f"reqAllOpenOrders failed: {type(e).__name__}: {e}", "total_raw": 0, "_openTrades_count": 0}
 
+        # DEBUG
+        _debug_statuses = []
+        for t in (all_trades or []):
+            _debug_statuses.append(f"{t.contract.symbol}:{t.orderStatus.status}")
+
+        ACTIVE_STATUSES = {
+            "PendingSubmit", "PendingCancel", "PreSubmitted",
+            "Submitted", "Inactive",
+        }
         orders = []
+        skipped = []
         for trade in (all_trades or []):
-            if trade.orderStatus.status not in ("PendingSubmit", "PreSubmitted", "Submitted", "Inactive"):
+            status = trade.orderStatus.status
+            if status not in ACTIVE_STATUSES:
                 continue
             c = trade.contract
             o = trade.order
-            if c.secType not in ("OPT", "STK"):
-                continue
             base = {
                 "ticker":      c.symbol,
                 "sec_type":    c.secType,
@@ -500,19 +647,93 @@ def fetch_open_orders(use_cache: bool = False) -> dict:
                 "order_type":  o.orderType,
                 "limit_price": o.lmtPrice if o.orderType in ("LMT", "STP LMT") else None,
                 "aux_price":   o.auxPrice if o.orderType in ("STP", "STP LMT", "TRAIL") else None,
-                "status":      trade.orderStatus.status,
+                "status":      status,
+                "filled_qty":  o.filledQuantity if hasattr(o, "filledQuantity") else trade.orderStatus.filled,
+                "remaining":   trade.orderStatus.remaining,
             }
-            if c.secType == "OPT":
+            if c.secType in ("OPT", "FOP"):
                 base.update({
                     "option_type": "Call" if c.right == "C" else "Put",
                     "strike":      float(c.strike),
                     "expiry":      c.lastTradeDateOrContractMonth,
+                    "legs_descr":  None,
+                    "legs":        [],
+                })
+            elif c.secType == "BAG":
+                raw_legs = getattr(c, "comboLegs", []) or []
+                legs_list = []
+                legs_parts = []
+                
+                for leg in raw_legs:
+                    # Použij module-level cache (naplnenú pri connect)
+                    lab = _LEG_LABEL_CACHE.get(leg.conId, str(leg.conId))
+                    
+                    sign = "+" if leg.action == "BUY" else "-"
+                    legs_parts.append(f"{sign}{leg.ratio} {lab}")
+                    legs_list.append({
+                        "con_id":   leg.conId,
+                        "ratio":    leg.ratio,
+                        "action":   leg.action,
+                        "exchange": getattr(leg, "exchange", ""),
+                        "label":    lab,
+                    })
+
+                legs_descr = ", ".join(legs_parts) if legs_parts else (getattr(c, "comboLegsDescrip", "") or None)
+
+                base.update({
+                    "option_type": None,
+                    "strike":      None,
+                    "expiry":      None,
+                    "legs_descr":  legs_descr,
+                    "legs":        legs_list,
                 })
             else:
-                base.update({"option_type": None, "strike": None, "expiry": None})
+                base.update({
+                    "option_type": None,
+                    "strike":      None,
+                    "expiry":      None,
+                    "legs_descr":  None,
+                    "legs":        [],
+                })
+
+            # ── Podmienky objednávky (PriceCondition, TimeCondition, …) ──────
+            conditions_list = []
+            for cond in (getattr(o, "conditions", None) or []):
+                ctype = type(cond).__name__
+                cdict: dict = {"type": ctype}
+                # PriceCondition
+                if hasattr(cond, "price"):
+                    cdict["price"]   = cond.price
+                    cdict["isMore"]  = cond.isMore   # True = price > X
+                    cdict["conId"]   = getattr(cond, "conId", None)
+                    cdict["exch"]    = getattr(cond, "exch", None)
+                # PercentChangeCondition / VolumeCondition
+                if hasattr(cond, "changePercent"):
+                    cdict["changePercent"] = cond.changePercent
+                    cdict["isMore"]        = cond.isMore
+                if hasattr(cond, "volume"):
+                    cdict["volume"]  = cond.volume
+                    cdict["isMore"]  = cond.isMore
+                # TimeCondition
+                if hasattr(cond, "time"):
+                    cdict["time"]    = cond.time
+                    cdict["isMore"]  = cond.isMore
+                # MarginCondition
+                if hasattr(cond, "percent"):
+                    cdict["percent"] = cond.percent
+                    cdict["isMore"]  = cond.isMore
+                # ExecutionCondition
+                if hasattr(cond, "symbol"):
+                    cdict["symbol"]  = getattr(cond, "symbol", None)
+                    cdict["secType"] = getattr(cond, "secType", None)
+                # AND/OR spájanie podmienok
+                cdict["conjunction"] = getattr(cond, "conjunctionConnection", "a")
+                conditions_list.append(cdict)
+
+            base["conditions"] = conditions_list
             orders.append(base)
 
-        return {"orders": orders, "error": None}
+        return {"orders": orders, "error": None, "total_raw": len(all_trades or []), "_debug_statuses": _debug_statuses, "_src": "openTrades" if not use_cache else "cache"}
     except Exception as e:
         return {"orders": [], "error": str(e)}
 
@@ -692,6 +913,15 @@ def _fetch_spot_prices_sync(tickers: list[str], timeout: float = 10.0) -> dict[s
     return result
 
 
+# ─── Dashboard fetch job (background thread) ─────────────────────────────────
+DASHBOARD_FETCH_JOB: dict = {
+    "status":    "idle",   # idle | running | done | error
+    "positions": None,
+    "orders":    None,
+    "account":   None,
+    "error":     None,
+}
+
 # ─── Account fetch job (background thread, time.sleep – neblokuje UI) ────────
 ACCOUNT_FETCH_JOB: dict = {
     "status": "idle",   # idle | running | done | error
@@ -709,16 +939,42 @@ _ACCOUNT_KEYS_MAP = {
 
 
 def _parse_account_values(values) -> dict:
-    result = {}
+    """
+    Parsuje account values z IBKR do slovníka.
+    Priorita meny: BASE > USD > EUR > ostatné (prvý nájdený).
+    Funguje pre EUR aj USD účty.
+    """
+    # Zbierame všetky varianty pre každý tag
+    candidates: dict[str, list[tuple[str, float]]] = {}
     for item in (values or []):
         tag = getattr(item, "tag", None)
-        cur = getattr(item, "currency", "")
+        cur = getattr(item, "currency", "") or ""
         val = getattr(item, "value", None)
-        if tag in _ACCOUNT_KEYS_MAP and cur in ("USD", "BASE", ""):
-            try:
-                result[_ACCOUNT_KEYS_MAP[tag]] = float(val)
-            except (ValueError, TypeError):
-                pass
+        if tag not in _ACCOUNT_KEYS_MAP:
+            continue
+        try:
+            candidates.setdefault(tag, []).append((cur, float(val)))
+        except (ValueError, TypeError):
+            pass
+
+    result = {}
+    priority = ("BASE", "USD", "EUR")
+    detected_currency = "USD"
+    for tag, entries in candidates.items():
+        chosen_val = None
+        chosen_cur = None
+        for pref in priority:
+            match = next(((c, v) for c, v in entries if c == pref), None)
+            if match is not None:
+                chosen_cur, chosen_val = match
+                break
+        if chosen_val is None and entries:
+            chosen_cur, chosen_val = entries[0]
+        if chosen_val is not None:
+            result[_ACCOUNT_KEYS_MAP[tag]] = chosen_val
+            if chosen_cur and chosen_cur not in ("BASE", ""):
+                detected_currency = chosen_cur
+    result["_currency"] = detected_currency
     return result
 
 

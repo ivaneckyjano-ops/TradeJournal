@@ -2,17 +2,14 @@
 Portfolio Agent – prehľad a AI analýza celého portfólia call diagonalov.
 Pokrýva: AMZN, AAPL, GOOGL, MSFT, TSLA, NVDA, META
 """
-import math
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-from datetime import date, datetime
-from typing import Optional
 
 from core import database as db
 from core import agent as ai_agent
 from core import ibkr
-from core.ibkr import _bs_greeks  # noqa: WPS450 – použitie internej BS funkcie
+from core import portfolio_data as pdata
 
 db.init_db()
 
@@ -27,180 +24,12 @@ DELTA_BW_MAX     = 150
 LOW_IV_RANK      = 25
 DEFAULT_IV       = 0.30   # fallback IV keď nemáme iné dáta
 
-# ── Pomocné funkcie ──────────────────────────────────────────────────────────
-
-def _calc_dte(expiry_str: Optional[str]) -> Optional[int]:
-    if not expiry_str:
-        return None
-    try:
-        return (datetime.strptime(expiry_str, "%Y-%m-%d").date() - date.today()).days
-    except ValueError:
-        return None
-
-
-def _right(option_type: str) -> str:
-    return "C" if str(option_type).upper().startswith("C") else "P"
-
-
-def _normalize_expiry(exp: str) -> str:
-    """Prevedie YYYYMMDD → YYYY-MM-DD. Ak je už YYYY-MM-DD, vráti bez zmeny."""
-    exp = str(exp).strip()
-    if len(exp) == 8 and "-" not in exp:
-        return f"{exp[:4]}-{exp[4:6]}-{exp[6:]}"
-    return exp
-
-
-def _greek_for_trade(
-    trade: dict,
-    positions_cache: list,
-    manual_spots: dict,
-    manual_ivs: dict,
-) -> tuple[dict, str]:
-    """
-    Vráti (greeks_dict, source) kde source je 'live' alebo 'bs'.
-    Priorita: IBKR cache → Black-Scholes (manual spot + IV) → nuly.
-
-    IBKR cache (fetch_positions) ukladá:
-      ticker="AMZN", strike=float, expiry="YYYYMMDD",
-      option_type="Call"/"Put", delta/theta/gamma/vega na vrchnej úrovni.
-    """
-    ticker = trade.get("ticker", "")
-    strike = float(trade.get("strike", 0))
-    expiry = _normalize_expiry(trade.get("expiry", ""))
-    opt    = trade.get("option_type", "")
-
-    # 1) Pokus o live dáta z IBKR cache
-    for p in positions_cache:
-        if p.get("sec_type") != "OPT":
-            continue
-        exp_cache = _normalize_expiry(p.get("expiry", ""))
-        opt_cache = p.get("option_type", "")  # "Call" alebo "Put"
-        if (p.get("ticker") == ticker and
-                abs(float(p.get("strike") or -1) - strike) < 0.01 and
-                exp_cache == expiry and
-                opt_cache == opt):
-            # Greeks sú priamo na vrchnej úrovni pozície
-            g = {
-                "delta": p.get("delta"),
-                "theta": p.get("theta"),
-                "gamma": p.get("gamma"),
-                "vega":  p.get("vega"),
-                "iv":    p.get("iv"),
-            }
-            if any(v is not None and v != 0 for v in g.values()):
-                return g, "live"
-
-    # 2) Black-Scholes fallback
-    spot = manual_spots.get(ticker, 0)
-    iv   = manual_ivs.get(ticker, DEFAULT_IV)
-    dte  = _calc_dte(expiry)
-    if spot > 0 and strike > 0 and dte and dte > 0:
-        T = dte / 365.0
-        g = _bs_greeks(spot, strike, T, iv, _right(opt))
-        if g:
-            return g, "bs"
-
-    return {}, "none"
-
-
-def _build_group_data(
-    groups: list,
-    all_trades: list,
-    pos_cache: list,
-    manual_spots: dict,
-    manual_ivs: dict,
-) -> list:
-    """Obohacuje skupiny o Greeks, otvorené nohy, DTE a net metriky."""
-    enriched = []
-    for g in groups:
-        ticker = g.get("ticker", "")
-        g_name = g.get("name", "")
-        legs   = [t for t in all_trades
-                  if t.get("group_id") == g_name and t.get("status") == "Open"]
-        if not legs:
-            continue
-
-        open_legs = []
-        net_theta = net_delta = net_gamma = net_vega = 0.0
-        any_live  = False
-        any_bs    = False
-
-        for leg in legs:
-            greeks, src = _greek_for_trade(leg, pos_cache, manual_spots, manual_ivs)
-            dte_val = _calc_dte(leg.get("expiry"))
-            mult    = int(leg.get("contracts", 1)) * 100
-            sign    = -1 if leg.get("leg_type") == "Short" else 1
-
-            theta = (greeks.get("theta", 0) or 0)
-            delta = (greeks.get("delta", 0) or 0)
-            gamma = (greeks.get("gamma", 0) or 0)
-            vega  = (greeks.get("vega",  0) or 0)
-
-            if src == "live":
-                any_live = True
-            elif src == "bs":
-                any_bs = True
-
-            leg_expiry = leg.get("expiry", "")
-            leg_out = {
-                "leg_type":    leg.get("leg_type", ""),
-                "option_type": leg.get("option_type", ""),
-                "strike":      float(leg.get("strike", 0)),
-                "expiry":      leg_expiry,
-                "dte":         dte_val,
-                "contracts":   int(leg.get("contracts", 1)),
-                "entry_price": float(leg.get("entry_price", 0)),
-                "source":      src,
-                "greeks": {
-                    "theta": theta * mult * sign,
-                    "delta": delta * mult * sign,
-                    "gamma": gamma * mult * sign,
-                    "vega":  vega  * mult * sign,
-                },
-            }
-            open_legs.append(leg_out)
-            net_theta += leg_out["greeks"]["theta"]
-            net_delta += leg_out["greeks"]["delta"]
-            net_gamma += leg_out["greeks"]["gamma"]
-            net_vega  += leg_out["greeks"]["vega"]
-
-        data_source = "live" if any_live else ("bs" if any_bs else "none")
-        enriched.append({
-            **g,
-            "open_legs":   open_legs,
-            "net_theta":   net_theta,
-            "net_delta":   net_delta,
-            "net_gamma":   net_gamma,
-            "net_vega":    net_vega,
-            "ticker":      ticker,
-            "data_source": data_source,
-        })
-    return enriched
-
-
-def _build_alerts(group_data: list, iv_ranks: dict) -> list:
-    alerts = []
-    for g in group_data:
-        name   = g["name"]
-        ticker = g.get("ticker", "")
-        for leg in g["open_legs"]:
-            if (leg["leg_type"] == "Short"
-                    and leg["dte"] is not None
-                    and leg["dte"] < SHORT_DTE_ALERT):
-                alerts.append(
-                    f"⏰ **{name}** – Short {leg['option_type']} ${leg['strike']:.0f} "
-                    f"exp {leg['expiry']} má len **{leg['dte']} DTE** – čas na roll!"
-                )
-        if g["net_theta"] < MIN_THETA_GROUP and g["data_source"] != "none":
-            alerts.append(
-                f"📉 **{name}** – Net Theta ${g['net_theta']:+.2f}/deň je záporná."
-            )
-        if ticker in iv_ranks and 0 < iv_ranks[ticker] < LOW_IV_RANK:
-            alerts.append(
-                f"☁️ **{ticker}** – IV Rank {iv_ranks[ticker]}% < {LOW_IV_RANK}% "
-                "– nevhodné prostredie pre nový diagonal (radšej doma ako zmoknúť)."
-            )
-    return alerts
+# ── Pomocné funkcie – delegované na core.portfolio_data ──────────────────────
+_calc_dte        = pdata.calc_dte
+_normalize_expiry = pdata.normalize_expiry
+_greek_for_trade  = pdata.greek_for_trade
+_build_group_data = pdata.build_group_data
+_build_alerts     = pdata.build_alerts
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -216,6 +45,26 @@ with st.sidebar:
         "SPY ref. cena (Beta-weighted Delta)",
         min_value=100.0, max_value=2000.0, value=560.0, step=1.0,
     )
+
+    st.markdown("---")
+
+    # ── Výber Claude modelu ─────────────────────────────────────────────────
+    st.markdown("**🤖 Claude model**")
+    _model_options = list(ai_agent.AVAILABLE_MODELS.keys())
+    _model_labels  = [ai_agent.AVAILABLE_MODELS[m]["label"] for m in _model_options]
+    _saved_model   = st.session_state.get("selected_claude_model", "claude-sonnet-4-6")
+    _saved_idx     = _model_options.index(_saved_model) if _saved_model in _model_options else 1
+    _model_sel_idx = st.radio(
+        "Model pre analýzu",
+        options=range(len(_model_options)),
+        format_func=lambda i: _model_labels[i],
+        index=_saved_idx,
+        label_visibility="collapsed",
+    )
+    _selected_model = _model_options[_model_sel_idx]
+    st.session_state["selected_claude_model"] = _selected_model
+    _model_info = ai_agent.AVAILABLE_MODELS[_selected_model]
+    st.caption(f"Max tokens: {_model_info['max_tokens']}")
 
     st.markdown("---")
 
@@ -829,7 +678,14 @@ if _do_analyze:
         with st.spinner("Agent analyzuje portfólio..."):
             try:
                 _strat  = st.session_state.get("strategy_params", {})
-                _acct_s = st.session_state.get("account_summary", {})
+                # Live margin z TWS (ak je dostupný), inak manuálne zadaný
+                _tws_acct = ibkr.DASHBOARD_FETCH_JOB.get("account") or {}
+                _acct_s   = _tws_acct if _tws_acct else st.session_state.get("account_summary", {})
+                # Otvorené objednávky z TWS (s BAG nohami a podmienkami)
+                _tws_orders = ibkr.DASHBOARD_FETCH_JOB.get("orders")
+                if _tws_orders is None and ibkr.is_connected():
+                    _ord_res    = ibkr.fetch_open_orders(use_cache=False)
+                    _tws_orders = _ord_res.get("orders", [])
                 portfolio_payload = {
                     "groups":                   group_data,
                     "total_theta":              total_theta,
@@ -842,8 +698,13 @@ if _do_analyze:
                     "iv_ranks":                 iv_ranks,
                     "account":                  _acct_s,
                     "strategy_params":          _strat,
+                    "open_orders":              _tws_orders or [],
                 }
-                result = ai_agent.analyze_portfolio(portfolio_payload, question=q_portfolio)
+                result = ai_agent.analyze_portfolio(
+                    portfolio_payload,
+                    question=q_portfolio,
+                    model=st.session_state.get("selected_claude_model"),
+                )
                 # Nová analýza = nový chat (resetuj históriu)
                 _new_hist = [{"role": "assistant", "content": result}]
                 st.session_state["portfolio_chat"] = _new_hist
@@ -877,7 +738,10 @@ if chat_history:
 
         with st.spinner("Agent odpovedá..."):
             try:
-                reply = ai_agent.chat_portfolio(chat_history)
+                reply = ai_agent.chat_portfolio(
+                    chat_history,
+                    model=st.session_state.get("selected_claude_model"),
+                )
                 chat_history.append({"role": "assistant", "content": reply})
                 st.session_state["portfolio_chat"] = chat_history
                 _save_chat(chat_history)

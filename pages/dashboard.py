@@ -35,17 +35,24 @@ with st.expander("IBKR Pripojenie", expanded=not ibkr.is_connected()):
     c1, c2 = st.columns(2)
     with c1:
         if st.button("Pripojiť", type="primary", use_container_width=True):
-            ok, msg = ibkr.connect(host, int(port), int(client_id))
+            with st.spinner("Pripájam..."):
+                ok, msg = ibkr.connect(host, int(port), int(client_id))
             if ok:
+                st.session_state.pop("ib_last_err", None)
                 st.success(msg)
                 st.rerun()
             else:
+                st.session_state["ib_last_err"] = msg
                 st.error(msg)
     with c2:
         if st.button("Odpojiť", use_container_width=True):
             ibkr.disconnect()
+            st.session_state.pop("ib_last_err", None)
             st.info("Odpojený.")
             st.rerun()
+
+    if st.session_state.get("ib_last_err"):
+        st.caption(f"Posledná chyba: `{st.session_state['ib_last_err']}`")
 
 if ibkr.is_connected():
     st.success("IBKR: Pripojený")

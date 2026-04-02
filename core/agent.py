@@ -9,7 +9,13 @@ from typing import Optional, Callable
 
 MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 900
-MAX_TOKENS_PORTFOLIO = 1800
+MAX_TOKENS_PORTFOLIO = 2400
+
+AVAILABLE_MODELS: dict[str, dict] = {
+    "claude-haiku-4-5":   {"label": "⚡ Haiku 4.5  – rýchly, lacný",         "max_tokens": 1200},
+    "claude-sonnet-4-6":  {"label": "🎯 Sonnet 4.6 – vyvážený (odporúčaný)", "max_tokens": 2400},
+    "claude-opus-4-5":    {"label": "🧠 Opus 4.5   – najpresnejší, pomalší", "max_tokens": 3200},
+}
 
 # Beta hodnoty voči SPY (aproximácia, 2024-2025)
 TICKER_BETA = {
@@ -65,7 +71,7 @@ def _calc_dte(expiry_str: Optional[str]) -> Optional[int]:
         return None
 
 
-def _format_leg(trade: dict, compute_pnl: Callable) -> str:
+def _format_leg(trade: dict, compute_pnl: Callable = None) -> str:
     dte = _calc_dte(trade.get("expiry"))
     dte_str = f"{dte} dní do exp." if dte is not None else "DTE neznámy"
     iv = trade.get("iv_at_entry")
@@ -92,7 +98,7 @@ def _format_leg(trade: dict, compute_pnl: Callable) -> str:
     )
 
 
-def build_prompt(group: dict, trades: list[dict], compute_pnl: Callable,
+def build_prompt(group: dict, trades: list[dict], compute_pnl: Callable = None,
                  question: str = "", notes: list[dict] = None, events: list[dict] = None, orders: list[dict] = None) -> str:
     """Zostaví prompt pre Claude – len otvorené nohy, s voliteľnou otázkou a kontextom."""
     open_legs = [t for t in trades if t.get("status") == "Open"]
@@ -166,21 +172,73 @@ def build_prompt(group: dict, trades: list[dict], compute_pnl: Callable,
     if orders:
         entries = []
         for o in orders:
+            sec  = o.get("sec_type", "")
             price_info = []
             if o.get("limit_price"):
                 price_info.append(f"Limit: {o['limit_price']} USD")
             if o.get("aux_price"):
                 price_info.append(f"Stop: {o['aux_price']} USD")
-            p_str = " | ".join(price_info)
-            
-            desc = ""
-            if o.get("sec_type") == "OPT":
-                desc = f"Opcia: {o.get('option_type')} {o.get('strike',0):.0f} USD (exp: {o.get('expiry')})"
-            else:
+            p_str = " | ".join(price_info) if price_info else "MKT"
+
+            if sec in ("OPT", "FOP"):
+                desc = f"Opcia {o.get('option_type')} Strike {o.get('strike',0):.0f} USD exp {o.get('expiry')}"
+            elif sec == "BAG":
+                legs_descr = o.get("legs_descr") or ""
+                if not legs_descr:
+                    legs = o.get("legs") or []
+                    parts = []
+                    for lg in legs:
+                        sign = "+" if lg.get("action") == "BUY" else "-"
+                        parts.append(f"{sign}{lg.get('ratio',1)} conId={lg.get('con_id')}")
+                    legs_descr = ", ".join(parts) or "neznáme nohy"
+                desc = f"Combo/Spread nohy: {legs_descr}"
+            elif sec == "STK":
                 desc = "Akcia"
-                
-            entries.append(f"  - {o.get('action')} {o.get('total_qty')}x {desc} | Typ: {o.get('order_type')} | {p_str}")
-            
+            elif sec == "FUT":
+                desc = "Futures"
+            else:
+                desc = sec or "?"
+
+            # Podmienky objednávky
+            cond_parts = []
+            for cond in (o.get("conditions") or []):
+                ctype = cond.get("type", "?")
+                conj  = "A" if cond.get("conjunction", "a") == "a" else "ALEBO"
+                if ctype == "PriceCondition":
+                    direction = ">" if cond.get("isMore") else "<"
+                    cond_parts.append(
+                        f"Cena {direction} {cond.get('price')} USD"
+                        + (f" (conId={cond.get('conId')})" if cond.get("conId") else "")
+                    )
+                elif ctype == "TimeCondition":
+                    direction = "po" if cond.get("isMore") else "pred"
+                    cond_parts.append(f"Čas {direction} {cond.get('time')}")
+                elif ctype == "MarginCondition":
+                    direction = ">" if cond.get("isMore") else "<"
+                    cond_parts.append(f"Margin cushion {direction} {cond.get('percent')}%")
+                elif ctype == "PercentChangeCondition":
+                    direction = "+" if cond.get("isMore") else "-"
+                    cond_parts.append(f"Zmena {direction}{cond.get('changePercent')}%")
+                elif ctype == "ExecutionCondition":
+                    cond_parts.append(f"Po vyplnení {cond.get('symbol')} {cond.get('secType')}")
+                elif ctype == "VolumeCondition":
+                    direction = ">" if cond.get("isMore") else "<"
+                    cond_parts.append(f"Objem {direction} {cond.get('volume')}")
+                else:
+                    cond_parts.append(ctype)
+                if len(cond_parts) > 1:
+                    cond_parts[-1] = f"{conj} {cond_parts[-1]}"
+
+            cond_str = ""
+            if cond_parts:
+                cond_str = f" ⟦Podmienka: {'; '.join(cond_parts)}⟧"
+
+            entries.append(
+                f"  - {o.get('action')} {o.get('total_qty')}x {desc}"
+                f" | Typ: {o.get('order_type')} {p_str}"
+                f" | Stav: {o.get('status')}{cond_str}"
+            )
+
         if entries:
             orders_text = "\n## Otvorené objednávky v TWS (čakajúce na vyplnenie):\n" + "\n".join(entries) + "\n"
 
@@ -231,16 +289,18 @@ def build_portfolio_prompt(
       - spot_prices: dict {ticker: price}
       - iv_data: dict {ticker: iv_value}
       - iv_ranks: dict {ticker: rank} (manuálne zadané)
+      - open_orders: list otvorených objednávok z TWS (vrátane BAG combo nôh a podmienok)
     """
-    today_str = date.today().strftime("%d.%m.%Y")
-    groups    = portfolio_data.get("groups", [])
-    spots     = portfolio_data.get("spot_prices", {})
-    ivs       = portfolio_data.get("iv_data", {})
-    iv_ranks  = portfolio_data.get("iv_ranks", {})
-    alerts    = portfolio_data.get("alerts", [])
-    no_pos    = portfolio_data.get("tickers_without_position", [])
-    acct      = portfolio_data.get("account", {})
-    strat     = portfolio_data.get("strategy_params", {})
+    today_str    = date.today().strftime("%d.%m.%Y")
+    groups       = portfolio_data.get("groups", [])
+    spots        = portfolio_data.get("spot_prices", {})
+    ivs          = portfolio_data.get("iv_data", {})
+    iv_ranks     = portfolio_data.get("iv_ranks", {})
+    alerts       = portfolio_data.get("alerts", [])
+    no_pos       = portfolio_data.get("tickers_without_position", [])
+    acct         = portfolio_data.get("account", {})
+    strat        = portfolio_data.get("strategy_params", {})
+    open_orders  = portfolio_data.get("open_orders", [])
 
     # Sekcia: otvorené skupiny
     groups_text = ""
@@ -329,14 +389,48 @@ def build_portfolio_prompt(
             "DÔLEŽITÉ: Navrhuj len spready ktoré zmestia do týchto limitov!\n"
         )
 
-    return f"""Si skúsený portfóliový manažér pre opčné stratégie. Analyzuj portfólio call diagonalov.
+    # Sekcia: otvorené objednávky z TWS
+    orders_text = ""
+    if open_orders:
+        entries = []
+        for o in open_orders:
+            sec = o.get("sec_type", "")
+            p_str = f"Limit: {o['limit_price']} USD" if o.get("limit_price") else "MKT"
+            if sec in ("OPT", "FOP"):
+                desc = f"Opcia {o.get('option_type')} {o.get('strike', 0):.0f} USD exp {o.get('expiry')}"
+            elif sec == "BAG":
+                desc = f"Combo: {o.get('legs_descr') or 'neznáme nohy'}"
+            elif sec == "STK":
+                desc = "Akcia"
+            else:
+                desc = sec or "?"
+            cond_parts = []
+            for cond in (o.get("conditions") or []):
+                ctype = cond.get("type", "")
+                if ctype == "PriceCondition":
+                    direction = ">" if cond.get("isMore") else "<"
+                    cond_parts.append(f"Cena {direction} {cond.get('price')} USD")
+                elif ctype == "TimeCondition":
+                    cond_parts.append(f"Čas {'po' if cond.get('isMore') else 'pred'} {cond.get('time')}")
+                elif ctype == "MarginCondition":
+                    cond_parts.append(f"Margin {'>' if cond.get('isMore') else '<'} {cond.get('percent')}%")
+            cond_str = f" ⟦{'; '.join(cond_parts)}⟧" if cond_parts else ""
+            entries.append(
+                f"  - {o.get('ticker')} {o.get('action')} {o.get('total_qty')}x {desc}"
+                f" | {p_str} | Stav: {o.get('status')}{cond_str}"
+            )
+        orders_text = "\n## Otvorené objednávky v TWS:\n" + "\n".join(entries) + "\n"
+
+    return f"""Si skúsený portfóliový manažér pre opčné stratégie (call diagonaly). Vykonaj komplexnú analýzu portfólia vrátane ochranných pozícií.
 
 DÔLEŽITÉ PRAVIDLÁ:
 - Píš v slovenčine
-- Ceny píš ako "190 USD", NIKDY nepoužívaj LaTeX
-- Buď konkrétny a číselný
+- Ceny píš ako "190 USD", NIKDY nepoužívaj LaTeX ani matematické symboly
+- Buď konkrétny a číselný – vždy uveď strike, expiry, odhadovanú cenu
 - Štýl obchodníka: mesačné call diagonaly, Short ~30 DTE delta 0.25-0.35, Long ~90 DTE delta 0.50-0.65, cieľ Net Theta ≥ +$10/deň
 - VŽDY zohľadni voľný margin a limity obchodníka pri návrhoch
+- Ber do úvahy otvorené objednávky – neopakuj čo je už zadané do TWS
+- Pri ochrane: posudzuj každú skupinu samostatne aj portfólio ako celok
 
 ## Dátum analýzy: {today_str}
 
@@ -345,45 +439,67 @@ DÔLEŽITÉ PRAVIDLÁ:
 {metrics_text}
 {account_text}
 {params_text}
+{orders_text}
 {alerts_text}
 {no_pos_text}
 {custom_section}
 ---
-Odpovedaj PRESNE v tomto formáte (max 400 slov):
+Odpovedaj PRESNE v tomto formáte (max 550 slov):
 
 ## Celkový stav portfólia
-(2-3 vety – kde stojíš, hlavné riziká)
+(2-3 vety – súhrn expozície, Theta, Delta, hlavné riziká)
 
-## Skupiny vyžadujúce akciu
+## Analýza ochrany portfólia
+Pre každú skupinu vyhodnoť:
+- Aktuálna ochrana: (áno/čiastočná/žiadna – čím je chránená)
+- Riziko bez ochrany: (konkrétny scenár – čo sa stane ak podklad klesne/vzrastie o X%)
+- Odporúčanie: (nič nerob / pridaj hedge / uprav stop)
+
+Celkové portfólio:
+- Net Delta expozícia: (či je portfólio príliš directional)
+- Ochrana voči poklesu trhu: (či je Beta-weighted delta v norme)
+
+## Návrhy ochranných opatrení
+Pre každý návrh uveď PRESNE:
+TICKER | Typ hedgu (napr. Put spread, Collar, Stop-loss podmienka) | Strike(y) | Expiry | Odh. cena | Podmienka vstupu (ak relevantná, napr. "ak AMZN klesne pod 180 USD") | Dôvod
+
+## Skupiny vyžadujúce inú akciu (roll, úprava, uzavretie)
 - (skupina: konkrétna akcia s číslami)
 
 ## Nové spready na zváženie
 Pre každý navrhovaný spread uveď PRESNE:
-TICKER | Short Call $STRIKE exp DÁTUM (DTE) delta ~0.XX @ ~$CENA | Long Call $STRIKE exp DÁTUM (DTE) delta ~0.XX @ ~$CENA | Net debet ~$XXX | Theta ~+$X.XX/deň | Dôvod: ...
+TICKER | Short Call $STRIKE exp DÁTUM (DTE) delta ~0.XX | Long Call $STRIKE exp DÁTUM (DTE) delta ~0.XX | Net debet ~$XXX | Theta ~+$X.XX/deň | Podmienka vstupu (ak relevantná) | Dôvod
 
-## Riziko portfólia
-- (korelácie, koncentrácia, celkový delta risk)
-
-## Prioritné akcie (zoradené)
+## Prioritné akcie (zoradené podľa naliehavosti)
 1. ...
 2. ...
 3. ...
 """
 
 
-def analyze_portfolio(portfolio_data: dict, question: str = "") -> str:
+def _resolve_model(model: str | None) -> tuple[str, int]:
+    """Vráti (model_id, max_tokens) pre daný model. Fallback na globálny MODEL."""
+    m = model or MODEL
+    info = AVAILABLE_MODELS.get(m)
+    if info:
+        return m, info["max_tokens"]
+    return m, MAX_TOKENS_PORTFOLIO
+
+
+def analyze_portfolio(portfolio_data: dict, question: str = "", model: str | None = None) -> str:
     """Spustí AI portfoliovú analýzu."""
     client  = _load_client()
     prompt  = build_portfolio_prompt(portfolio_data, question=question)
+    m, max_tok = _resolve_model(model)
     message = client.messages.create(
-        model=MODEL,
-        max_tokens=MAX_TOKENS_PORTFOLIO,
+        model=m,
+        max_tokens=max_tok,
         messages=[{"role": "user", "content": prompt}],
     )
     return message.content[0].text
 
 
-def chat_portfolio(history: list[dict]) -> str:
+def chat_portfolio(history: list[dict], model: str | None = None) -> str:
     """
     Pokračuje v konverzácii s agentom – zachováva celý kontext.
 
@@ -393,14 +509,12 @@ def chat_portfolio(history: list[dict]) -> str:
     prvú assistant správu (analýzu) vložíme ako systémový kontext.
     """
     client = _load_client()
+    m, max_tok = _resolve_model(model)
 
-    # Prvá správa je analýza od asistenta – preformátujeme pre API
-    # Claude Messages API: musí začínať "user", striedať sa user/assistant
     api_messages = []
     for i, msg in enumerate(history):
         role    = msg["role"]
         content = msg["content"]
-        # Ak je prvá správa assistant (analýza), zaobalíme ju ako "user" kontext
         if i == 0 and role == "assistant":
             api_messages.append({
                 "role": "user",
@@ -419,8 +533,8 @@ def chat_portfolio(history: list[dict]) -> str:
             api_messages.append({"role": role, "content": content})
 
     message = client.messages.create(
-        model=MODEL,
-        max_tokens=MAX_TOKENS_PORTFOLIO,
+        model=m,
+        max_tokens=max_tok,
         system=(
             "Si skúsený portfóliový manažér pre opčné stratégie (call diagonaly). "
             "Píš v slovenčine. Buď konkrétny a číselný. "
@@ -434,11 +548,12 @@ def chat_portfolio(history: list[dict]) -> str:
 def analyze_group(
     group: dict,
     trades: list[dict],
-    compute_pnl: Callable,
+    compute_pnl: Callable = None,
     question: str = "",
     notes: list[dict] = None,
     events: list[dict] = None,
     orders: list[dict] = None,
+    model: str | None = None,
 ) -> str:
     """
     Spustí AI analýzu skupiny pozícií.
@@ -447,6 +562,7 @@ def analyze_group(
         group: slovník skupiny (name, ticker, strategy, description)
         trades: zoznam nôh (trade dict) patriacich do skupiny
         compute_pnl: funkcia compute_pnl z core.database
+        model: voliteľný model (None = globálny MODEL)
 
     Returns:
         Markdown text s analýzou od Claude
@@ -458,9 +574,10 @@ def analyze_group(
     """
     client = _load_client()
     prompt = build_prompt(group, trades, compute_pnl, question=question, notes=notes, events=events, orders=orders)
+    m, _ = _resolve_model(model)
 
     message = client.messages.create(
-        model=MODEL,
+        model=m,
         max_tokens=MAX_TOKENS,
         messages=[{"role": "user", "content": prompt}],
     )

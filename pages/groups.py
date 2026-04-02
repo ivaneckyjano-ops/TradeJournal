@@ -6,6 +6,7 @@ import time
 from core import database as db
 from core import agent as ai_agent
 from core import ibkr
+from core.portfolio_data import match_greeks
 
 db.init_db()
 
@@ -26,6 +27,22 @@ def _run_fetch_job(stop_event: threading.Event):
 
 st.title("Správa skupín (Group ID)")
 st.caption("Vytvor skupiny tu — potom ich priradíš obchodom aj poznámkam z dropdownu.")
+
+# ── Model selector v sidebari (zdieľaný s Portfolio Agent) ──────────────────
+with st.sidebar:
+    st.markdown("**🤖 Claude model pre analýzu**")
+    _model_options = list(ai_agent.AVAILABLE_MODELS.keys())
+    _model_labels  = [ai_agent.AVAILABLE_MODELS[m]["label"] for m in _model_options]
+    _saved_model   = st.session_state.get("selected_claude_model", "claude-sonnet-4-6")
+    _saved_idx     = _model_options.index(_saved_model) if _saved_model in _model_options else 1
+    _model_sel_idx = st.radio(
+        "Model",
+        options=range(len(_model_options)),
+        format_func=lambda i: _model_labels[i],
+        index=_saved_idx,
+        label_visibility="collapsed",
+    )
+    st.session_state["selected_claude_model"] = _model_options[_model_sel_idx]
 
 tab_create, tab_manage, tab_assign = st.tabs([
     "Vytvoriť skupinu", "Prehľad a úprava", "Priradiť obchodom"
@@ -218,27 +235,7 @@ with tab_manage:
             st.rerun()
 
     def _match_greeks(t: dict) -> dict:
-        """Nájde Greeks v IBKR portfóliu pre danú nohu v databáze."""
-        if not ibkr_positions:
-            return {}
-        for p in ibkr_positions:
-            if p.get("sec_type") != "OPT":
-                continue
-            # Porovnanie podľa tickera, strike, expiry, option_type, leg_type
-            if (p.get("ticker") == t.get("ticker") and 
-                float(p.get("strike", 0)) == float(t.get("strike", 0) or 0) and 
-                p.get("option_type") == t.get("option_type") and 
-                p.get("leg_type") == t.get("leg_type")):
-                
-                # Zjednodušená kontrola expiry (DB: YYYYMMDD vs TWS: YYYYMMDD)
-                if str(p.get("expiry")).replace("-", "") == str(t.get("expiry")).replace("-", ""):
-                    return {
-                        "delta": p.get("delta"),
-                        "gamma": p.get("gamma"),
-                        "theta": p.get("theta"),
-                        "vega": p.get("vega"),
-                    }
-        return {}
+        return match_greeks(t, ibkr_positions)
 
     if not groups:
         st.info("Žiadne skupiny. Vytvor ich v záložke **Vytvoriť skupinu**.")
@@ -477,6 +474,7 @@ with tab_manage:
                                     notes=group_notes,
                                     events=group_events,
                                     orders=open_orders_for_group,
+                                    model=st.session_state.get("selected_claude_model"),
                                 )
                                 from datetime import date as _date
                                 note_title = f"🤖 AI Analýza: {gname} ({_date.today().isoformat()})"

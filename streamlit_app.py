@@ -178,6 +178,7 @@ notes     = st.Page("pages/notes.py",      title="Konzultácie",       icon=":ma
 modeler        = st.Page("pages/modeler.py",          title="Roll Simulátor",      icon=":material/model_training:")
 spread_bld     = st.Page("pages/spread_builder.py",   title="Spread Builder",      icon=":material/construction:")
 portfolio_agent= st.Page("pages/portfolio_agent.py",  title="Portfolio Agent",     icon=":material/smart_toy:")
+portfolio_dash = st.Page("pages/portfolio_dashboard.py", title="TWS Dashboard",    icon=":material/monitor_heart:")
 calendar       = st.Page("pages/calendar.py",         title="Kalendár",            icon=":material/calendar_month:")
 help_page      = st.Page("pages/help.py",             title="Pomocník",            icon=":material/help:")
 
@@ -185,7 +186,7 @@ pg = st.navigation(
     {
         "Prehľad":  [dashboard, portfolio, calendar],
         "Obchody":  [trade_log, groups, symbols],
-        "Analýza":  [notes, modeler, spread_bld, portfolio_agent],
+        "Analýza":  [notes, modeler, spread_bld, portfolio_agent, portfolio_dash],
         "Info":     [help_page],
     },
     position="sidebar",
