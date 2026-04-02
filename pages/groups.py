@@ -494,7 +494,128 @@ with tab_manage:
                             except Exception as e:
                                 st.error(f"Chyba pri volaní AI: {e}")
                 else:
-                    st.caption("🤖 AI Analýza nie je dostupná – skupina nemá otvorené nohy.")
+                    # ── Plánovaná analýza (pre skupiny bez otvorených nôh) ────
+                    st.divider()
+                    st.markdown("**🤖 AI Analýza – plánovaná pozícia**")
+                    st.caption("Skupina nemá otvorené nohy – agent analyzuje plánovaný vstup (popis skupiny + TWS objednávky).")
+
+                    plan_col1, plan_col2 = st.columns([3, 1])
+                    with plan_col1:
+                        plan_question = st.text_input(
+                            "Otázka / zámer (voliteľné)",
+                            placeholder="napr. Je teraz vhodný čas otvoriť AMZN diagonal?",
+                            key=f"plan_question_{g['id']}",
+                            label_visibility="collapsed",
+                        )
+                    with plan_col2:
+                        run_plan_analysis = st.button(
+                            "Analyzovať plán",
+                            key=f"plan_analyze_{g['id']}",
+                            type="secondary",
+                            use_container_width=True,
+                        )
+
+                    # Zobraz poslednú uloženú plánovanú analýzu
+                    plan_notes = [
+                        n for n in all_notes
+                        if n.get("group_id") == gname and n.get("title", "").startswith("📋 Plán:")
+                    ]
+                    if plan_notes:
+                        with st.expander(f"Posledná plánovaná analýza ({plan_notes[0].get('created_at','')[:10]})", expanded=False):
+                            st.markdown(plan_notes[0].get("content", ""))
+
+                    if run_plan_analysis:
+                        with st.spinner("Claude analyzuje plánovaný vstup..."):
+                            try:
+                                ticker_name = g.get("ticker", "")
+                                live_price_info = ""
+                                if ticker_name and ibkr.is_connected():
+                                    price_res = ibkr.fetch_underlying(ticker_name)
+                                    if price_res.get("price"):
+                                        live_price_info = f"Aktuálna live cena {ticker_name}: {price_res['price']:.2f} USD"
+
+                                # Prompt pre plánovaný vstup
+                                from datetime import date as _date
+                                plan_desc = g.get("description") or "(nevyplnené)"
+                                if live_price_info:
+                                    plan_desc = f"{plan_desc}\n{live_price_info}"
+
+                                orders_text_plan = ""
+                                if group_orders:
+                                    lines = []
+                                    for o in group_orders:
+                                        sec = o.get("sec_type", "")
+                                        if sec in ("OPT", "FOP"):
+                                            detail = f"{o.get('option_type')} ${o.get('strike',0):.0f} exp {o.get('expiry')}"
+                                        elif sec == "BAG":
+                                            detail = f"Combo: {o.get('legs_descr') or '?'}"
+                                        else:
+                                            detail = sec
+                                        conds = "; ".join(
+                                            f"Cena {'>' if c.get('isMore') else '<'} {c.get('price')} USD"
+                                            for c in (o.get("conditions") or [])
+                                            if c.get("type") == "PriceCondition"
+                                        )
+                                        cond_str = f" ⟦{conds}⟧" if conds else ""
+                                        lines.append(
+                                            f"  - {o.get('action')} {o.get('total_qty')}x {detail}"
+                                            f" | {o.get('order_type')} | {o.get('status')}{cond_str}"
+                                        )
+                                    orders_text_plan = "\n## Plánované objednávky v TWS:\n" + "\n".join(lines)
+
+                                q_extra = f"\n## Otázka obchodníka:\n{plan_question}" if plan_question else ""
+                                model_id = st.session_state.get("selected_claude_model") or "claude-sonnet-4-6"
+
+                                from core.agent import _load_client, AVAILABLE_MODELS, MODEL as DEFAULT_MODEL
+                                client = _load_client()
+                                m_info = AVAILABLE_MODELS.get(model_id, {})
+                                max_tok = m_info.get("max_tokens", 1200)
+
+                                prompt = f"""Si skúsený obchodník s opciami. Vyhodnoť plánovaný vstup do pozície.
+
+PRAVIDLÁ:
+- Píš v slovenčine
+- Ceny píš ako "190 USD", bez LaTeX
+- Buď konkrétny – uveď strike, expiry, odhadovanú cenu, podmienky vstupu
+- Max 300 slov
+
+## Plánovaná pozícia
+- Ticker: {g.get('ticker', '?')}
+- Stratégia: {g.get('strategy', '?')}
+- Zámer / tézis: {plan_desc}
+- Dátum: {_date.today().strftime('%d.%m.%Y')}
+{orders_text_plan}
+{q_extra}
+---
+Odpovedaj v tomto formáte:
+
+## Hodnotenie vstupu
+(2-3 vety – vhodnosť teraz, sentiment, IV kontext)
+
+## Konkrétny návrh spreadu
+TICKER | Short noha | Long noha | Net debet ~$XXX | Theta ~+$X/deň | Podmienka vstupu
+
+## Riziká a podmienky
+- (čo sledovať, kedy nevstupovať, stop-loss úroveň)
+
+## Záver
+(vstúpiť / počkať / upraviť plán)
+"""
+                                msg = client.messages.create(
+                                    model=model_id,
+                                    max_tokens=max_tok,
+                                    messages=[{"role": "user", "content": prompt}],
+                                )
+                                plan_text = msg.content[0].text
+
+                                note_title = f"📋 Plán: {gname} ({_date.today().isoformat()})"
+                                db.add_note(title=note_title, content=plan_text, group_id=gname)
+                                st.success("Analýza uložená do Konzultácií!")
+                                with st.container(border=True):
+                                    st.markdown(plan_text)
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Chyba: {e}")
 
 
 # ─── Tab: Priradiť obchodom ───────────────────────────────────────────────────

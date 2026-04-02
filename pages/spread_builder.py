@@ -7,6 +7,7 @@ from datetime import date, timedelta
 from core.probability import calc_greeks, bs_price, calc_iv_from_price, calc_sd_lines
 from core import database as db
 from core import ibkr
+from core import agent as ai_agent
 
 db.init_db()
 
@@ -495,3 +496,146 @@ if st.button("📝 Uložiť snapshot do denníka", type="primary", key="sb_save_
         group_id=_gid,
     )
     st.success(f"✅ Poznámka #{_nid} uložená do denníka{' (skupina ' + _gid + ')' if _gid else ''}.")
+
+st.divider()
+
+# ─── AI Analýza spreadu ────────────────────────────────────────────────────────
+st.markdown("### 🤖 AI Analýza spreadu")
+
+if not legs:
+    st.caption("Pridaj aspoň jednu nohu aby bola dostupná AI analýza.")
+else:
+    _ticker    = st.session_state.get("sb_ticker", "?")
+    _model_opt = list(ai_agent.AVAILABLE_MODELS.keys())
+    _model_lbl = [ai_agent.AVAILABLE_MODELS[m]["label"] for m in _model_opt]
+    _saved_m   = st.session_state.get("selected_claude_model", "claude-sonnet-4-6")
+    _saved_idx = _model_opt.index(_saved_m) if _saved_m in _model_opt else 1
+
+    ai_c1, ai_c2, ai_c3 = st.columns([3, 2, 1])
+    with ai_c1:
+        _ai_question = st.text_input(
+            "Otázka (voliteľné)",
+            placeholder="napr. Je teraz vhodný čas? Aká podmienka vstupu?",
+            key="sb_ai_question",
+            label_visibility="collapsed",
+        )
+    with ai_c2:
+        _sel_idx = st.selectbox(
+            "Model",
+            options=range(len(_model_opt)),
+            format_func=lambda i: _model_lbl[i],
+            index=_saved_idx,
+            key="sb_model_sel",
+            label_visibility="collapsed",
+        )
+        _selected_model = _model_opt[_sel_idx]
+        st.session_state["selected_claude_model"] = _selected_model
+    with ai_c3:
+        _run_ai = st.button("Analyzovať", type="primary", key="sb_ai_btn", use_container_width=True)
+
+    if _run_ai:
+        with st.spinner("Claude analyzuje spread..."):
+            try:
+                # Zostav popis nôh pre prompt
+                _legs_lines = []
+                for l in legs:
+                    _g = _leg_greeks(l, _spot)
+                    _ls  = "Long" if l["leg_type"] == "Long" else "Short"
+                    _cp  = "Call" if l["right"] == "C" else "Put"
+                    _dte_v = _dte(l["expiry"])
+                    _legs_lines.append(
+                        f"  {_ls} {l.get('contracts',1)}× {_cp} ${l['strike']:.0f} exp {l['expiry']} (DTE {_dte_v})"
+                        f" | Entry ${l['entry_price']:.2f}"
+                        f" | Delta ${_g['delta']:+.0f} | Theta ${_g['theta']:+.2f}/deň"
+                    )
+
+                # Otvorené objednávky z TWS pre tento ticker
+                _tws_ord_lines = []
+                _tws_orders = ibkr.DASHBOARD_FETCH_JOB.get("orders") or []
+                for o in _tws_orders:
+                    if o.get("ticker", "").upper() == _ticker.upper():
+                        sec = o.get("sec_type", "")
+                        if sec in ("OPT", "FOP"):
+                            detail = f"{o.get('option_type')} ${o.get('strike',0):.0f} exp {o.get('expiry')}"
+                        elif sec == "BAG":
+                            detail = f"Combo: {o.get('legs_descr') or '?'}"
+                        else:
+                            detail = sec
+                        conds = "; ".join(
+                            f"Cena {'>' if c.get('isMore') else '<'} {c.get('price')} USD"
+                            for c in (o.get("conditions") or [])
+                            if c.get("type") == "PriceCondition"
+                        )
+                        cond_s = f" ⟦{conds}⟧" if conds else ""
+                        _tws_ord_lines.append(
+                            f"  - {o.get('action')} {o.get('total_qty')}× {detail}"
+                            f" | {o.get('order_type')} | {o.get('status')}{cond_s}"
+                        )
+                tws_text = ("\n## Súvisiace objednávky v TWS:\n" + "\n".join(_tws_ord_lines)) if _tws_ord_lines else ""
+                q_text   = f"\n## Otázka obchodníka:\n{_ai_question}" if _ai_question else ""
+
+                _be_str  = "  /  ".join(f"${b:.2f}" for b in _be_points) if _be_points else "—"
+                mp_str   = f"${_max_profit:+,.0f}" if _max_profit < 50000 else "Neohraničený"
+                ml_str   = f"${_max_loss:+,.0f}" if _max_loss > -50000 else "Neohraničená"
+
+                prompt = f"""Si skúsený obchodník s opciami. Analyzuj nasledujúci spread.
+
+PRAVIDLÁ:
+- Píš v slovenčine, ceny ako "190 USD", bez LaTeX
+- Buď konkrétny a číselný, max 350 slov
+
+## Spread: {_ticker}
+- Dátum: {date.today().strftime('%d.%m.%Y')}
+- Spot: ${_spot:.2f} | IV: {_iv_val*100:.1f}%
+
+## Nohy:
+{chr(10).join(_legs_lines)}
+
+## Výsledky spreadu:
+- Čistý kredit/debet: ${_net_flow:+,.0f}
+- Max profit: {mp_str}
+- Max loss: {ml_str}
+- Breakeven: {_be_str}
+- Net Delta: ${tot['delta']:+.0f} | Net Theta: ${tot['theta']:+.2f}/deň | Net Vega: ${tot['vega']:+.2f}
+{tws_text}
+{q_text}
+---
+Odpovedaj v tomto formáte:
+
+## Hodnotenie spreadu
+(silné stránky, slabiny, vhodnosť pre súčasné trhové podmienky)
+
+## Riziká a podmienky vstupu
+- Podmienka vstupu: (napr. len ak IV > 30%, alebo spot > X USD)
+- Stop-loss úroveň: (konkrétna cena alebo % pohyb)
+- Čo sledovať: (kľúčové úrovne a udalosti)
+
+## Návrh úpravy (ak relevantný)
+(alternatívny strike/expiry alebo iný typ spreadu pre lepší pomer rizika)
+
+## Záver
+(vstúpiť teraz / počkať / zamietnuť)
+"""
+                client    = ai_agent._load_client()
+                m_info    = ai_agent.AVAILABLE_MODELS.get(_selected_model, {})
+                max_tok   = m_info.get("max_tokens", 1200)
+                msg       = client.messages.create(
+                    model=_selected_model,
+                    max_tokens=max_tok,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                _ai_result = msg.content[0].text
+
+                # Uložiť do denníka
+                _gid2 = _snap_group if _snap_group != "—" else None
+                db.add_note(
+                    title=f"🤖 AI Spread: {_ticker} [{date.today().strftime('%d.%m.%Y')}]",
+                    content=_ai_result,
+                    group_id=_gid2,
+                )
+                st.success("Analýza uložená do Konzultácií!")
+                with st.container(border=True):
+                    st.markdown(_ai_result)
+
+            except Exception as e:
+                st.error(f"Chyba: {e}")
