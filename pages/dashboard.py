@@ -4,10 +4,13 @@ from datetime import date, datetime
 
 from core import database as db
 from core import ibkr
+from core.page_context import set_tradejournal_page
+from core.portfolio_data import normalize_expiry
 from core.probability import calc_sd_lines
 from core.charts import sd_lines_chart, pnl_timeline_chart
 
 db.init_db()
+set_tradejournal_page("dashboard")
 
 # Nastav správne defaulty pre IBKR pripojenie ak ešte nie sú nastavené
 if "ib_port" not in st.session_state:
@@ -253,11 +256,12 @@ else:
             db_open  = db.get_open_trades()
 
             def _pos_key(ticker, strike, expiry, opt_type, leg_type):
-                """Normalizovaný kľúč pre porovnanie."""
+                """Normalizovaný kľúč pre porovnanie (exp vždy YYYYMMDD)."""
+                exp_c = normalize_expiry(str(expiry or "")).replace("-", "")
                 return (
                     str(ticker).upper(),
-                    f"{float(strike):.2f}",
-                    str(expiry).replace("-", ""),
+                    f"{float(strike or 0):.2f}",
+                    exp_c,
                     str(opt_type).capitalize(),
                     str(leg_type).capitalize(),
                 )
@@ -277,9 +281,9 @@ else:
                 db_p  = db_keys.get(k)
 
                 if tws_p and db_p:
-                    tws_c = int(abs(tws_p.get("contracts", 1)))
-                    db_c  = int(db_p.get("contracts", 1))
-                    if tws_c == db_c:
+                    tws_c = float(abs(tws_p.get("contracts", 1)))
+                    db_c  = float(db_p.get("contracts", 1))
+                    if abs(tws_c - db_c) < 1e-6:
                         status = "✅ OK"
                     else:
                         status = f"⚠️ Kontrakt: TWS={tws_c} / Denník={db_c}"
@@ -304,7 +308,7 @@ else:
                         "Typ": k[3],
                         "Strike": float(k[1]),
                         "Expiry": k[2],
-                        "Kontr. TWS": int(abs(tws_p.get("contracts", 1))),
+                        "Kontr. TWS": float(abs(tws_p.get("contracts", 1))),
                         "Kontr. Denník": "—",
                         "Group": "—",
                     })
@@ -318,7 +322,7 @@ else:
                         "Strike": float(k[1]),
                         "Expiry": k[2],
                         "Kontr. TWS": "—",
-                        "Kontr. Denník": int(db_p.get("contracts", 1)),
+                        "Kontr. Denník": float(db_p.get("contracts", 1)),
                         "Group": db_p.get("group_id") or "—",
                     })
 

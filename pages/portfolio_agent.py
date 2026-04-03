@@ -10,8 +10,10 @@ from core import database as db
 from core import agent as ai_agent
 from core import ibkr
 from core import portfolio_data as pdata
+from core.page_context import set_tradejournal_page
 
 db.init_db()
+set_tradejournal_page("portfolio_agent")
 
 # ── Konštanty ────────────────────────────────────────────────────────────────
 WATCHED          = ai_agent.WATCHED_TICKERS

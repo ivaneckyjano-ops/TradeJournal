@@ -1,5 +1,6 @@
-import sqlite3
+import json
 import os
+import sqlite3
 from datetime import datetime
 from typing import Optional
 
@@ -87,6 +88,8 @@ def init_db() -> None:
     # Migrácia: pridaj nové stĺpce do existujúcich DB
     _migrate_symbols(get_connection())
     _migrate_trades(get_connection())
+    _migrate_group_apr_snapshots(get_connection())
+    _migrate_spread_builder(get_connection())
 
 
 def _migrate_symbols(conn: sqlite3.Connection) -> None:
@@ -125,6 +128,97 @@ def _migrate_trades(conn: sqlite3.Connection) -> None:
             conn.execute(sql)
     conn.commit()
     conn.close()
+
+
+def _migrate_group_apr_snapshots(conn: sqlite3.Connection) -> None:
+    """História APR skupín z Portfolio Dashboard (po každom Načítať z TWS)."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS group_apr_snapshots (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id      TEXT NOT NULL,
+            captured_at   TEXT NOT NULL,
+            basis_kind    TEXT NOT NULL,
+            apr_pct       REAL NOT NULL,
+            pnl_total     REAL NOT NULL,
+            basis_value   REAL NOT NULL,
+            days          INTEGER NOT NULL,
+            unreal_ib     REAL NOT NULL
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_gas_group_time ON group_apr_snapshots (group_id, captured_at)"
+    )
+    conn.commit()
+    conn.close()
+
+
+MAX_GROUP_APR_SNAPSHOTS = 400
+
+# Virtuálny group_id pre históriu Portfólio APTR (Θ) na dashboarde — nekoliduje s Trade Log group_id.
+PORTFOLIO_APTR_SNAPSHOT_GROUP_ID = "__portfolio_aptr__"
+
+
+def append_group_apr_snapshot(
+    group_id: str,
+    captured_at: str,
+    basis_kind: str,
+    apr_pct: float,
+    pnl_total: float,
+    basis_value: float,
+    days: int,
+    unreal_ib: float,
+) -> None:
+    """Uloží jeden bod histórie APR; staršie záznamy nad limit zmaže."""
+    gid = (group_id or "").strip()
+    if not gid:
+        return
+    bk = basis_kind if basis_kind in ("maint", "premium", "theta") else "maint"
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO group_apr_snapshots "
+            "(group_id, captured_at, basis_kind, apr_pct, pnl_total, basis_value, days, unreal_ib) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (gid, captured_at, bk, apr_pct, pnl_total, basis_value, int(days), unreal_ib),
+        )
+        n = conn.execute(
+            "SELECT COUNT(*) AS c FROM group_apr_snapshots WHERE group_id=?",
+            (gid,),
+        ).fetchone()["c"]
+        if n > MAX_GROUP_APR_SNAPSHOTS:
+            excess = n - MAX_GROUP_APR_SNAPSHOTS
+            conn.execute(
+                "DELETE FROM group_apr_snapshots WHERE id IN "
+                "(SELECT id FROM group_apr_snapshots WHERE group_id=? ORDER BY captured_at ASC LIMIT ?)",
+                (gid, excess),
+            )
+        conn.commit()
+
+
+def get_group_apr_snapshots(
+    group_id: str,
+    limit: int = 120,
+    basis_kind: Optional[str] = None,
+) -> list[dict]:
+    """Posledných ``limit`` snímok skupiny, od najstaršej (vhodné pre graf). Ak je ``basis_kind``, filtruje (napr. ``theta``)."""
+    gid = (group_id or "").strip()
+    if not gid:
+        return []
+    lim = max(1, min(int(limit), 2000))
+    with get_connection() as conn:
+        if basis_kind:
+            rows = conn.execute(
+                "SELECT * FROM group_apr_snapshots WHERE group_id=? AND basis_kind=? "
+                "ORDER BY captured_at DESC LIMIT ?",
+                (gid, basis_kind, lim),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM group_apr_snapshots WHERE group_id=? ORDER BY captured_at DESC LIMIT ?",
+                (gid, lim),
+            ).fetchall()
+    out = [dict(r) for r in rows]
+    out.reverse()
+    return out
 
 
 # ─── GROUPS ────────────────────────────────────────────────────────────────────
@@ -548,3 +642,235 @@ def set_setting(key: str, value: str) -> None:
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, str(value)),
         )
+
+
+# ─── Udržiavacia marža po skupine (spread) — ručne pre TWS Dashboard / APR ───
+
+GROUP_MAINT_MARGIN_KEY = "group_maintenance_margin"
+
+
+def get_group_maint_margins() -> dict[str, float]:
+    """Slovník ``group_id`` → udržiavacia marža (USD), len kladné hodnoty (kľúče ``strip``)."""
+    import json
+    raw = get_setting(GROUP_MAINT_MARGIN_KEY, "{}")
+    try:
+        d = json.loads(raw)
+        return {
+            str(k).strip(): float(v)
+            for k, v in d.items()
+            if float(v) > 0
+        }
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {}
+
+
+MAX_SPREAD_BUILDER_SNAPSHOTS = 400
+
+
+def _migrate_spread_builder(conn: sqlite3.Connection) -> None:
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS spread_builder_ideas (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            name          TEXT NOT NULL,
+            ticker        TEXT,
+            spot          REAL NOT NULL,
+            global_iv     REAL NOT NULL,
+            maint_margin  REAL NOT NULL DEFAULT 0,
+            legs_json     TEXT NOT NULL,
+            notes         TEXT,
+            created_at    TEXT DEFAULT (datetime('now')),
+            updated_at    TEXT DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS spread_builder_snapshots (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            idea_id       INTEGER NOT NULL,
+            captured_at   TEXT NOT NULL,
+            aptr_pct      REAL NOT NULL,
+            theta_per_day REAL NOT NULL,
+            capital_basis REAL NOT NULL,
+            spot          REAL,
+            global_iv     REAL,
+            FOREIGN KEY (idea_id) REFERENCES spread_builder_ideas(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_sb_snap_idea_time
+        ON spread_builder_snapshots (idea_id, captured_at);
+    """)
+    _sb_cols = {row[1] for row in conn.execute("PRAGMA table_info(spread_builder_ideas)").fetchall()}
+    if "variant_of_id" not in _sb_cols:
+        conn.execute(
+            "ALTER TABLE spread_builder_ideas ADD COLUMN variant_of_id INTEGER "
+            "REFERENCES spread_builder_ideas(id) ON DELETE SET NULL"
+        )
+    conn.commit()
+    conn.close()
+
+
+def list_spread_builder_ideas() -> list[dict]:
+    """Zoznam nápadov; každý riadok má ``leg_count`` a ``snapshot_count`` (bez ``legs_json`` v návrate)."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT i.id, i.name, i.ticker, i.spot, i.global_iv, i.maint_margin,
+                   i.created_at, i.updated_at, i.legs_json, i.variant_of_id,
+                   (SELECT COUNT(*) FROM spread_builder_snapshots s WHERE s.idea_id = i.id) AS snapshot_count
+            FROM spread_builder_ideas i
+            ORDER BY i.updated_at DESC
+            """
+        ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        d = dict(r)
+        lj = d.pop("legs_json", "[]")
+        try:
+            d["leg_count"] = len(json.loads(lj)) if lj else 0
+        except (json.JSONDecodeError, TypeError, ValueError):
+            d["leg_count"] = 0
+        out.append(d)
+    return out
+
+
+def get_spread_builder_idea(idea_id: int) -> Optional[dict]:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM spread_builder_ideas WHERE id=?",
+            (int(idea_id),),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def insert_spread_builder_idea(
+    name: str,
+    ticker: str,
+    spot: float,
+    global_iv: float,
+    maint_margin: float,
+    legs: list,
+    notes: str = "",
+    variant_of_id: Optional[int] = None,
+) -> int:
+    import json
+    nm = (name or "").strip() or "Bez názvu"
+    vpid = int(variant_of_id) if variant_of_id is not None else None
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO spread_builder_ideas "
+            "(name, ticker, spot, global_iv, maint_margin, legs_json, notes, updated_at, variant_of_id) "
+            "VALUES (?,?,?,?,?,?,?, datetime('now'), ?)",
+            (
+                nm,
+                (ticker or "").strip().upper() or None,
+                float(spot),
+                float(global_iv),
+                float(maint_margin),
+                json.dumps(legs, ensure_ascii=False),
+                notes or "",
+                vpid,
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def update_spread_builder_idea(
+    idea_id: int,
+    name: str,
+    ticker: str,
+    spot: float,
+    global_iv: float,
+    maint_margin: float,
+    legs: list,
+    notes: str = "",
+) -> None:
+    import json
+    nm = (name or "").strip() or "Bez názvu"
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE spread_builder_ideas SET name=?, ticker=?, spot=?, global_iv=?, maint_margin=?, "
+            "legs_json=?, notes=?, updated_at=datetime('now') WHERE id=?",
+            (
+                nm,
+                (ticker or "").strip().upper() or None,
+                float(spot),
+                float(global_iv),
+                float(maint_margin),
+                json.dumps(legs, ensure_ascii=False),
+                notes or "",
+                int(idea_id),
+            ),
+        )
+        conn.commit()
+
+
+def delete_spread_builder_idea(idea_id: int) -> None:
+    with get_connection() as conn:
+        conn.execute("DELETE FROM spread_builder_ideas WHERE id=?", (int(idea_id),))
+        conn.commit()
+
+
+def append_spread_builder_snapshot(
+    idea_id: int,
+    captured_at: str,
+    aptr_pct: float,
+    theta_per_day: float,
+    capital_basis: float,
+    spot: float,
+    global_iv: float,
+) -> None:
+    iid = int(idea_id)
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO spread_builder_snapshots "
+            "(idea_id, captured_at, aptr_pct, theta_per_day, capital_basis, spot, global_iv) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (iid, captured_at, aptr_pct, theta_per_day, capital_basis, spot, global_iv),
+        )
+        n = conn.execute(
+            "SELECT COUNT(*) AS c FROM spread_builder_snapshots WHERE idea_id=?",
+            (iid,),
+        ).fetchone()["c"]
+        if n > MAX_SPREAD_BUILDER_SNAPSHOTS:
+            excess = n - MAX_SPREAD_BUILDER_SNAPSHOTS
+            conn.execute(
+                "DELETE FROM spread_builder_snapshots WHERE id IN "
+                "(SELECT id FROM spread_builder_snapshots WHERE idea_id=? ORDER BY captured_at ASC LIMIT ?)",
+                (iid, excess),
+            )
+        conn.commit()
+
+
+def get_spread_builder_snapshots(idea_id: int, limit: int = 120) -> list[dict]:
+    iid = int(idea_id)
+    lim = max(1, min(int(limit), 2000))
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM spread_builder_snapshots WHERE idea_id=? ORDER BY captured_at DESC LIMIT ?",
+            (iid, lim),
+        ).fetchall()
+    out = [dict(r) for r in rows]
+    out.reverse()
+    return out
+
+
+def set_group_maint_margins(margins: dict[str, float]) -> None:
+    """
+    Zlúči marže do uloženého slovníka: aktualizuje len odovzdané ``group_id``,
+    ostatné skupiny v DB ponechá. Kľúč s hodnotou ≤ 0 z uloženia odoberie.
+    """
+    import json
+    raw = get_setting(GROUP_MAINT_MARGIN_KEY, "{}")
+    try:
+        existing = {
+            str(k).strip(): round(float(v), 2)
+            for k, v in json.loads(raw).items()
+            if float(v) > 0
+        }
+    except (json.JSONDecodeError, TypeError, ValueError):
+        existing = {}
+    for k, v in margins.items():
+        ks = str(k).strip()
+        fv = float(v)
+        if fv > 0:
+            existing[ks] = round(fv, 2)
+        else:
+            existing.pop(ks, None)
+    set_setting(GROUP_MAINT_MARGIN_KEY, json.dumps(existing, ensure_ascii=False))

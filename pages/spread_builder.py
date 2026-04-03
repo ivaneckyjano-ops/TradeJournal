@@ -1,18 +1,47 @@
+import json
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from core.probability import calc_greeks, bs_price, calc_iv_from_price, calc_sd_lines
 from core import database as db
 from core import ibkr
 from core import agent as ai_agent
+from core.page_context import set_tradejournal_page
+from core.portfolio_data import compute_spread_model_theta_aptr_pct
 
 db.init_db()
+set_tradejournal_page("spread_builder")
 
 st.title("Spread Builder")
-st.caption("Poskladaj opčný spread z ľubovoľných nôh a okamžite vidíš P&L, Greeks, max profit/loss a breakeveny.")
+st.caption(
+    "Poskladaj opčný spread z ľubovoľných nôh a okamžite vidíš P&L, Greeks, max profit/loss a breakeveny. "
+    "**APTR (Θ)** = rovnaká logika ako na TWS dashboarde: Θ×365 / (net debet + marža), Theta z BS modelu."
+)
+
+
+def _sb_plot_aptr_trend(series: pd.Series, *, chart_key: str, height: int = 200) -> None:
+    s = series.dropna()
+    if len(s) < 2:
+        return
+    x_axis = s.index
+    if hasattr(x_axis, "tz") and getattr(x_axis, "tz", None) is not None:
+        try:
+            x_axis = x_axis.tz_convert("UTC").tz_localize(None)
+        except (TypeError, ValueError):
+            x_axis = s.index
+    fig = go.Figure(data=[go.Scatter(x=x_axis, y=s.values, mode="lines", connectgaps=True)])
+    fig.update_layout(
+        height=height,
+        margin=dict(l=8, r=8, t=8, b=36),
+        showlegend=False,
+        xaxis=dict(showgrid=True, title=None),
+        yaxis=dict(showgrid=True, title=None),
+    )
+    st.plotly_chart(fig, use_container_width=True, key=chart_key)
+
 
 # ─── Session state init ────────────────────────────────────────────────────────
 if "sb_legs" not in st.session_state:
@@ -21,6 +50,60 @@ if "sb_spot" not in st.session_state:
     st.session_state["sb_spot"] = 200.0
 if "sb_iv" not in st.session_state:
     st.session_state["sb_iv"] = 0.30
+if "sb_active_idea_id" not in st.session_state:
+    st.session_state["sb_active_idea_id"] = None
+if "sb_maint_margin" not in st.session_state:
+    st.session_state["sb_maint_margin"] = 0.0
+
+
+def _sync_sb_market_widgets(*, ticker: str, spot: float, iv: float) -> None:
+    """Nastaví ticker/spot/IV vrátane *inp* kľúčov — volať len PRED vykreslením príslušných widgetov."""
+    st.session_state["sb_ticker"] = ticker
+    st.session_state["sb_spot"] = float(spot)
+    st.session_state["sb_iv"] = float(iv)
+    st.session_state["sb_ticker_inp"] = ticker
+    st.session_state["sb_spot_inp"] = float(spot)
+    st.session_state["sb_iv_inp"] = float(iv)
+
+
+def _queue_sb_new_draft() -> None:
+    """Po kliknutí len zaradí patch — samotná zmena prebehne na začiatku ďalšieho behu (pred widgetmi)."""
+    st.session_state["_sb_pending_patch"] = {"op": "new_draft"}
+
+
+def _apply_sb_pending_patch() -> None:
+    """Aplikuje zmeny z tlačidiel skôr, než sa vytvoria widgety s kľúčmi sb_*_inp (Streamlit to inak zakáže)."""
+    patch = st.session_state.pop("_sb_pending_patch", None)
+    if not patch:
+        return
+    op = patch.get("op")
+    if op == "new_draft":
+        st.session_state["sb_active_idea_id"] = None
+        st.session_state["sb_legs"] = []
+        st.session_state["sb_maint_margin"] = 0.0
+        _sync_sb_market_widgets(ticker="AMZN", spot=200.0, iv=0.30)
+        st.session_state["sb_save_name_input"] = ""
+        st.session_state["sb_idea_notes_area"] = ""
+        if "sb_pick_idea_lbl" in st.session_state:
+            del st.session_state["sb_pick_idea_lbl"]
+        if "sb_del_confirm" in st.session_state:
+            st.session_state["sb_del_confirm"] = False
+    elif op == "load":
+        _sync_sb_market_widgets(
+            ticker=str(patch["ticker"]),
+            spot=float(patch["spot"]),
+            iv=float(patch["iv"]),
+        )
+        st.session_state["sb_legs"] = patch["legs"]
+        st.session_state["sb_maint_margin"] = float(patch["maint_margin"])
+        st.session_state["sb_active_idea_id"] = int(patch["idea_id"])
+        st.session_state["sb_save_name_input"] = patch.get("name") or ""
+        st.session_state["sb_idea_notes_area"] = patch.get("notes") or ""
+    elif op == "spot":
+        _tk = (st.session_state.get("sb_ticker") or "AMZN").upper()
+        _iv = float(st.session_state.get("sb_iv", 0.30))
+        _sync_sb_market_widgets(ticker=_tk, spot=float(patch["spot"]), iv=_iv)
+
 
 # ─── Pomocné funkcie ───────────────────────────────────────────────────────────
 
@@ -78,6 +161,8 @@ def _pnl_at_dte(leg: dict, spot_val: float, dte_v: int) -> float:
         return (theo - entry) * n * 100
 
 
+_apply_sb_pending_patch()
+
 # ─── Panel: Spot + globálne IV ─────────────────────────────────────────────────
 with st.container():
     hc1, hc2, hc3 = st.columns([2, 2, 2])
@@ -103,10 +188,227 @@ with st.container():
             with st.spinner(f"Načítavam spot pre {_ticker_input}..."):
                 _res = ibkr.fetch_underlying(_ticker_input, timeout=6.0)
             if not _res.get("error") and _res.get("price"):
-                st.session_state["sb_spot"] = _res["price"]
+                st.session_state["_sb_pending_patch"] = {"op": "spot", "spot": float(_res["price"])}
                 st.rerun()
             else:
                 st.warning(_res.get("error", "Spot nenájdený"))
+
+# ─── Zoznam uložených nápadov ─────────────────────────────────────────────────
+_ideas_list = db.list_spread_builder_ideas()
+_hl, _hr = st.columns([4, 1])
+with _hl:
+    st.subheader("📋 Zoznam nápadov")
+with _hr:
+    if st.button(
+        "➕ Pridať nový nápad",
+        type="primary",
+        key="sb_btn_new_napad",
+        use_container_width=True,
+        help="Vyčistí editor: žiadne nohy, nový názov — uložením vznikne nový záznam v tabuľke.",
+    ):
+        _queue_sb_new_draft()
+        st.rerun()
+
+if st.session_state.get("sb_active_idea_id"):
+    st.info(
+        f"Upravuješ uložený nápad #{st.session_state['sb_active_idea_id']}. "
+        "Prepísať ho môžeš tlačidlom „Uložiť do aktuálneho nápadu“; "
+        "ak chceš pôvod nechať a skúšať úpravy, použi „Uložiť ako nový variant“. "
+        "Čistý draft: „Pridať nový nápad“."
+    )
+else:
+    st.success(
+        "Nový nápad — ešte nie je v databáze. Poskladaj nohy, doplň názov a v expandéri ulož "
+        "(prvýkrát vznikne nový riadok; variant vždy nový riadok)."
+    )
+
+if _ideas_list:
+    _list_df = pd.DataFrame(
+        [
+            {
+                "ID": r["id"],
+                "Názov": r["name"],
+                "Ticker": r.get("ticker") or "—",
+                "Spot ($)": r["spot"],
+                "IV %": round(float(r["global_iv"]) * 100, 1),
+                "Marža ($)": r["maint_margin"],
+                "Nohy": int(r.get("leg_count", 0)),
+                "Bodov trendu": int(r.get("snapshot_count", 0)),
+                "Variant z": (
+                    f"#{int(r['variant_of_id'])}"
+                    if r.get("variant_of_id") is not None
+                    else "—"
+                ),
+                "Upravené": r.get("updated_at") or "",
+            }
+            for r in _ideas_list
+        ]
+    )
+    st.dataframe(
+        _list_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Spot ($)": st.column_config.NumberColumn(format="%.2f"),
+            "Marža ($)": st.column_config.NumberColumn(format="%.0f"),
+        },
+    )
+    st.caption(
+        "Načítanie = vybraný riadok do editora. Uložiť môžeš ako prepis aktívneho záznamu alebo ako nový variant (pôvodný riadok ostane)."
+    )
+else:
+    st.caption("Zatiaľ žiadne riadky v tabuľke — po prvom **Uložiť** sa nápad objaví tu.")
+
+# ─── Uložené nápady (DB) ───────────────────────────────────────────────────────
+with st.expander("📂 Uložené nápady — vyber, načítaj, ulož, trend APTR, vymaž", expanded=False):
+    _opt_labels = {"—": 0}
+    for _row in _ideas_list:
+        _vf = _row.get("variant_of_id")
+        _vs = f" ← #{int(_vf)}" if _vf is not None else ""
+        _opt_labels[f"{_row['name']} (#{_row['id']}){_vs}"] = int(_row["id"])
+    _lbl_keys = list(_opt_labels.keys())
+    _default_lbl = "—"
+    if st.session_state.get("sb_active_idea_id"):
+        for _lk, _vid in _opt_labels.items():
+            if _vid == st.session_state["sb_active_idea_id"]:
+                _default_lbl = _lk
+                break
+    try:
+        _idx_pick = _lbl_keys.index(_default_lbl) if _default_lbl in _lbl_keys else 0
+    except ValueError:
+        _idx_pick = 0
+    _sel_lbl = st.selectbox(
+        "Vyber nápad",
+        options=_lbl_keys,
+        index=_idx_pick,
+        key="sb_pick_idea_lbl",
+    )
+    _picked_id = int(_opt_labels[_sel_lbl])
+
+    _b1, _b2, _b3, _b4 = st.columns(4)
+    with _b1:
+        if st.button("📥 Načítať", key="sb_load_idea", disabled=_picked_id == 0):
+            _idea = db.get_spread_builder_idea(_picked_id)
+            if _idea:
+                try:
+                    _loaded_legs = json.loads(_idea["legs_json"] or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    st.session_state["sb_legs"] = []
+                    st.error("Nohy v databáze sú poškodené — skús iný nápad alebo ulož znova.")
+                else:
+                    st.session_state["_sb_pending_patch"] = {
+                        "op": "load",
+                        "legs": _loaded_legs,
+                        "ticker": (_idea.get("ticker") or "AMZN").upper(),
+                        "spot": float(_idea["spot"]),
+                        "iv": float(_idea["global_iv"]),
+                        "maint_margin": float(_idea.get("maint_margin") or 0),
+                        "idea_id": _picked_id,
+                        "name": _idea.get("name") or "",
+                        "notes": _idea.get("notes") or "",
+                    }
+                    st.rerun()
+            else:
+                st.warning("Nápad sa v databáze nenašiel.")
+    with _b2:
+        if st.button("🆕 Pridať nový nápad (rovnako ako hore)", key="sb_new_draft"):
+            _queue_sb_new_draft()
+            st.rerun()
+    with _b3:
+        _sb_del_confirm = st.checkbox("Potvrdiť vymazanie", key="sb_del_confirm")
+    with _b4:
+        if st.button(
+            "🗑 Vymazať nápad",
+            key="sb_del_idea",
+            disabled=_picked_id == 0 or not _sb_del_confirm,
+        ):
+            db.delete_spread_builder_idea(_picked_id)
+            if st.session_state.get("sb_active_idea_id") == _picked_id:
+                st.session_state["sb_active_idea_id"] = None
+            st.success("Nápad vymazaný.")
+            st.rerun()
+
+    _save_name = st.text_input(
+        "Názov pri uložení",
+        key="sb_save_name_input",
+        placeholder="napr. AMZN PMCC skúška",
+    )
+    _idea_notes = st.text_area(
+        "Poznámka k nápadu (uloží sa do DB)",
+        key="sb_idea_notes_area",
+        height=68,
+    )
+
+    def _sb_payload_for_save() -> tuple[str, str, float, float, float, list, str] | None:
+        if not st.session_state["sb_legs"]:
+            return None
+        _sn = (_save_name or "").strip() or "Bez názvu"
+        _tk = st.session_state.get("sb_ticker", "AMZN")
+        _sp = float(st.session_state["sb_spot"])
+        _ivs = float(st.session_state["sb_iv"])
+        _mm = float(st.session_state.get("sb_maint_margin", 0) or 0)
+        _legs_copy = json.loads(json.dumps(st.session_state["sb_legs"]))
+        return _sn, _tk, _sp, _ivs, _mm, _legs_copy, _idea_notes
+
+    _sb_save = st.columns(2)
+    with _sb_save[0]:
+        if st.button(
+            "💾 Uložiť do aktuálneho nápadu",
+            type="primary",
+            key="sb_save_idea_db",
+            help="Ak máš načítaný nápad z DB, prepíše ten istý riadok. Ak nie, vytvorí prvý nový záznam.",
+        ):
+            _pl = _sb_payload_for_save()
+            if _pl is None:
+                st.warning("Najprv pridaj aspoň jednu nohu spreadu.")
+            else:
+                _sn, _tk, _sp, _ivs, _mm, _legs_copy, _notes = _pl
+                _aid = st.session_state.get("sb_active_idea_id")
+                if _aid:
+                    db.update_spread_builder_idea(
+                        int(_aid), _sn, _tk, _sp, _ivs, _mm, _legs_copy, _notes
+                    )
+                    st.success(f"Aktualizované (#{_aid}).")
+                else:
+                    _new_id = db.insert_spread_builder_idea(
+                        _sn, _tk, _sp, _ivs, _mm, _legs_copy, _notes
+                    )
+                    st.session_state["sb_active_idea_id"] = _new_id
+                    st.success(f"Uložené ako nový nápad #{_new_id}.")
+                st.rerun()
+    with _sb_save[1]:
+        if st.button(
+            "📑 Uložiť ako nový variant",
+            key="sb_save_idea_variant",
+            help="Vždy nový riadok v tabuľke. Pôvodný nápad ostane nezmenený. Ak máš aktívny nápad, nový riadok sa k nemu prepojí (stĺpec Variant z).",
+        ):
+            _pl = _sb_payload_for_save()
+            if _pl is None:
+                st.warning("Najprv pridaj aspoň jednu nohu spreadu.")
+            else:
+                _sn, _tk, _sp, _ivs, _mm, _legs_copy, _notes = _pl
+                _parent = st.session_state.get("sb_active_idea_id")
+                _new_id = db.insert_spread_builder_idea(
+                    _sn,
+                    _tk,
+                    _sp,
+                    _ivs,
+                    _mm,
+                    _legs_copy,
+                    _notes,
+                    variant_of_id=int(_parent) if _parent else None,
+                )
+                st.session_state["sb_active_idea_id"] = _new_id
+                if _parent:
+                    st.success(f"Nový variant #{_new_id} (odvodený od #{_parent}). Zmeň názov vyššie, ak chceš varianty rozlíšiť.")
+                else:
+                    st.success(f"Uložené ako nový nápad #{_new_id} (bez nadriadeného — najprv načítaj pôvod, ak chceš väzbu variantu).")
+                st.rerun()
+
+    if st.session_state.get("sb_active_idea_id"):
+        st.caption(f"Aktívny nápad v DB: **#{st.session_state['sb_active_idea_id']}** — body trendu viažu na tento záznam.")
+    else:
+        st.caption("Bez aktívneho ID v DB sa trend neukladá — ulož nápad aspoň raz.")
 
 st.divider()
 
@@ -247,6 +549,69 @@ _net_flow = sum(
 _flow_lbl = "Čistý kredit" if _net_flow >= 0 else "Čistý debet"
 st.metric(_flow_lbl, f"${abs(_net_flow):,.0f}",
           help="Suma prijatého prémia mínus zaplatené prémium za celý spread")
+
+st.markdown("#### APTR z Theta (model — rovnako ako TWS Dashboard)")
+st.number_input(
+    "Modelová udržiavacia marža ($) — pridá sa k net debetu do bázy APTR",
+    min_value=0.0,
+    step=50.0,
+    key="sb_maint_margin",
+    help="Náklad = vstupný net debet z prémií + táto marža. Zadaj orientačnú udržiavaciu maržu z TWS (Margin Impact).",
+)
+_maint_sb = float(st.session_state.get("sb_maint_margin", 0) or 0)
+_net_debit_mod = -float(_net_flow)
+_aptr_mod = compute_spread_model_theta_aptr_pct(_net_debit_mod, float(tot["theta"]), _maint_sb)
+if _aptr_mod is not None:
+    st.metric(
+        "APTR (Θ)",
+        f"{_aptr_mod['yield_pct']:+.1f} %",
+        help="(Net Theta $/deň z BS × 365 / (net debet prémií + marža)) × 100",
+    )
+    st.caption(
+        f"Net debet z prémií: {_aptr_mod['net_debit_usd']:,.0f} USD + marža: {_aptr_mod['maintenance_margin_usd']:,.0f} USD "
+        f"= báza {_aptr_mod['capital_basis_usd']:,.0f} USD · Theta (BS): {tot['theta']:+.2f} USD/deň"
+    )
+else:
+    st.caption(
+        "APTR teraz nie je: súčet net debetu a marže musí byť väčší ako 0. Pri čistom kredite zväčši maržu, aby bola báza kladná."
+    )
+
+_sb_aid = st.session_state.get("sb_active_idea_id")
+if _sb_aid:
+    st.markdown("##### Trend APTR (uložený nápad)")
+    _t1, _t2 = st.columns(2)
+    with _t1:
+        if st.button(
+            "📌 Pridať dnešný bod do trendu",
+            key="sb_add_aptr_point",
+            disabled=_aptr_mod is None,
+            help="Uloží aktuálny APTR, Θ a bázu pod aktívny nápad v DB.",
+        ):
+            db.append_spread_builder_snapshot(
+                int(_sb_aid),
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                float(_aptr_mod["yield_pct"]),
+                float(tot["theta"]),
+                float(_aptr_mod["capital_basis_usd"]),
+                float(_spot),
+                float(_iv_val),
+            )
+            st.success("Bod pridaný.")
+            st.rerun()
+    with _t2:
+        st.caption("Po pár dňoch znovu načítaj nápad, skontroluj BS/spot a pridaj ďalší bod.")
+    _sb_hist = db.get_spread_builder_snapshots(int(_sb_aid), limit=120)
+    if len(_sb_hist) >= 2:
+        _sdf = pd.DataFrame(_sb_hist)
+        _sdf["Čas"] = pd.to_datetime(_sdf["captured_at"], utc=True)
+        _sdf = _sdf.sort_values("Čas")
+        _sline = _sdf.set_index("Čas")["aptr_pct"].rename("APTR Θ %")
+        st.caption("Vývoj **APTR (Θ)** pre tento nápad (body = tlačidlo vyššie).")
+        _sb_plot_aptr_trend(_sline, chart_key=f"sb_aptr_trend_{_sb_aid}", height=220)
+    elif len(_sb_hist) == 1:
+        st.caption("Máš jeden bod — po ďalšom **Pridať dnešný bod** sa zobrazí graf.")
+else:
+    st.caption("Pre **trend APTR** najprv **ulož nápad** do databázy (expandér *Uložené nápady*).")
 
 st.divider()
 
@@ -410,7 +775,9 @@ else:
 # Risk/Reward
 if _max_loss < 0 and _max_profit > 0:
     _rr = _max_profit / abs(_max_loss)
-    st.caption(f"**Risk/Reward: {_rr:.2f}×** — za každé $1 rizika potenciálny zisk ${_rr:.2f}")
+    st.caption(
+        f"Risk/Reward pomer: {_rr:.2f}× — na každú 1 USD rizika pripadá približne {_rr:.2f} USD potenciálneho zisku."
+    )
 
 st.divider()
 
@@ -486,6 +853,7 @@ if st.button("📝 Uložiť snapshot do denníka", type="primary", key="sb_save_
 | Max profit | {"${:+,.0f}".format(_max_profit) if _max_profit < 50000 else "Neohraničený"} |
 | Max loss | {"${:+,.0f}".format(_max_loss) if _max_loss > -50000 else "Neohraničená"} |
 | Breakeven | {_be_str} |
+{f"| APTR (Θ) | {_aptr_mod['yield_pct']:+.1f} % · náklad ${_aptr_mod['capital_basis_usd']:,.0f} (net debet + marža) |" if _aptr_mod is not None else "| APTR (Θ) | — (báza ≤ 0 alebo uprav maržu) |"}
 
 {("**Poznámka:** " + _snap_note) if _snap_note else ""}
 """

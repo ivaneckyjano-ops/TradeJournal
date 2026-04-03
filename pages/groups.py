@@ -6,9 +6,11 @@ import time
 from core import database as db
 from core import agent as ai_agent
 from core import ibkr
+from core.page_context import set_tradejournal_page
 from core.portfolio_data import match_greeks
 
 db.init_db()
+set_tradejournal_page("groups")
 
 
 def _run_fetch_job(stop_event: threading.Event):

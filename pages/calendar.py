@@ -4,8 +4,10 @@ from datetime import date, datetime, timedelta
 import calendar
 
 from core import database as db
+from core.page_context import set_tradejournal_page
 
 db.init_db()
+set_tradejournal_page("calendar")
 
 # ─── Konštanty ─────────────────────────────────────────────────────────────────
 EVENT_TYPES = ["earnings", "expiry", "roll", "wb_analysis", "alert", "reminder", "event", "note"]

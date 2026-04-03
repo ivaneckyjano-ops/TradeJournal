@@ -6,6 +6,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import streamlit as st
 
+from core.page_context import TWS_DASHBOARD_PAGE
+
 st.set_page_config(
     page_title="TradeJournal",
     page_icon="📈",
@@ -101,6 +103,10 @@ if "sync_count" not in st.session_state:
 
 auto_on = st.session_state.get("auto_refresh_on", False)
 
+# Počas predchádzajúceho behu nastavila aktuálna stránka túto hodnotu.
+# Na TWS Dash je veľký dataframe — globálny st_autorefresh + sync spôsobovali NotFoundError removeChild.
+_tj_skip_global = st.session_state.get("tj_active_page") == TWS_DASHBOARD_PAGE
+
 with st.sidebar:
     st.markdown("### ⟳ Auto-refresh")
     st.toggle(
@@ -117,19 +123,25 @@ with st.sidebar:
         key="auto_refresh_interval",
     )
     if auto_on:
-        _count = st_autorefresh(
-            interval=st.session_state["auto_refresh_interval"] * 1000,
-            key="global_auto_refresh",
-        )
-        last_sync = st.session_state.get("last_sync")
-        sync_cnt  = st.session_state.get("sync_count", 0)
-        st.caption(
-            f"Synchro #{sync_cnt} &nbsp;·&nbsp; "
-            + (f"posledná: **{last_sync}**" if last_sync else "čaká na prvú...")
-        )
+        if not _tj_skip_global:
+            st_autorefresh(
+                interval=st.session_state["auto_refresh_interval"] * 1000,
+                key="global_auto_refresh",
+            )
+            last_sync = st.session_state.get("last_sync")
+            sync_cnt = st.session_state.get("sync_count", 0)
+            st.caption(
+                f"Synchro #{sync_cnt} &nbsp;·&nbsp; "
+                + (f"posledná: **{last_sync}**" if last_sync else "čaká na prvú...")
+            )
+        else:
+            st.caption(
+                "Na **TWS Dashboard** je globálna synchronizácia vypnutá (stabilita prehliadača). "
+                "Obnov dáta tlačidlom na stránke."
+            )
 
 # ─── Globálna auto-synchronizácia (funguje na každej stránke) ─────────────────
-if auto_on:
+if auto_on and not _tj_skip_global:
     from core import ibkr, database as db
     db.init_db()
 

@@ -1,5 +1,9 @@
 import streamlit as st
 
+from core.page_context import set_tradejournal_page
+
+set_tradejournal_page("help")
+
 st.title("Pomocník — Návod na použitie")
 
 st.markdown("""

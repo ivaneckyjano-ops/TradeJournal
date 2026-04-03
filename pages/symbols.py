@@ -3,8 +3,10 @@ import pandas as pd
 from datetime import date
 
 from core import database as db
+from core.page_context import set_tradejournal_page
 
 db.init_db()
+set_tradejournal_page("symbols")
 
 SECTORS = [
     "—", "Technology", "Consumer Discretionary", "Consumer Staples",

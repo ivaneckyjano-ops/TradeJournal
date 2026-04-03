@@ -14,8 +14,10 @@ from core.probability import (
 from core.charts import bell_curve_chart, sd_lines_chart
 from core import database as db
 from core import ibkr
+from core.page_context import set_tradejournal_page
 
 db.init_db()
+set_tradejournal_page("modeler")
 
 
 # ─── Pomocné funkcie pre skupinový kontext ────────────────────────────────────

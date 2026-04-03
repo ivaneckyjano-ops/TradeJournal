@@ -2,8 +2,10 @@ import streamlit as st
 from datetime import datetime, date
 
 from core import database as db
+from core.page_context import set_tradejournal_page
 
 db.init_db()
+set_tradejournal_page("notes")
 
 st.title("Konzultácie a Poznámky")
 

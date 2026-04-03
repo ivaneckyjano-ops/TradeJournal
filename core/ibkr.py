@@ -739,15 +739,87 @@ def fetch_open_orders(use_cache: bool = False) -> dict:
 
 # ─── Portfolio / Fills ────────────────────────────────────────────────────────
 
-def fetch_positions(with_greeks: bool = False) -> dict:
+def _price_from_mkt_data(md) -> tuple[float | None, str]:
+    """
+    Cena čo najbližšie stĺpcu „Last“ v TWS (nie iba portfolio mark).
+    Poradie: last → marketPrice() → mid bid/ask → close.
+    """
+    if md is None:
+        return None, ""
+    try:
+        last = getattr(md, "last", None)
+        if last is not None and not math.isnan(float(last)) and float(last) > 0:
+            return float(last), "last"
+        mp = md.marketPrice()
+        if mp and not math.isnan(mp) and mp > 0:
+            return float(mp), "mark"
+        bid, ask = getattr(md, "bid", None), getattr(md, "ask", None)
+        if (bid is not None and ask is not None
+                and not math.isnan(float(bid)) and not math.isnan(float(ask))
+                and float(bid) > 0 and float(ask) > 0):
+            return float(round((float(bid) + float(ask)) / 2, 4)), "mid"
+        cl = getattr(md, "close", None)
+        if cl is not None and not math.isnan(float(cl)) and float(cl) > 0:
+            return float(cl), "close"
+    except Exception:
+        pass
+    return None, ""
+
+
+def _snapshot_enrich_position_prices(ib, positions: list[dict], snap_rows: list[tuple[int, object]]) -> None:
+    """
+    snap_rows: (index do positions, Contract z portfolio).
+    reqMktData snapshot – zarovnanie k Last v TWS; krátky limit aby UI neviselo.
+    """
+    if not snap_rows:
+        return
+    mkt_rows: list[tuple[int, object, object | None]] = []
+    for pidx, c in snap_rows:
+        md = None
+        try:
+            ib.qualifyContracts(c)
+            md = ib.reqMktData(c, "", snapshot=True, regulatorySnapshot=False)
+        except Exception:
+            pass
+        mkt_rows.append((pidx, c, md))
+
+    # Krátky spoločný limit (predtým až ~12 s pri viacerých pozíciách)
+    deadline = time.time() + min(4.0, 1.0 + 0.35 * len(mkt_rows))
+    done: set[int] = set()
+    while time.time() < deadline and len(done) < len(mkt_rows):
+        for pidx, c, md in mkt_rows:
+            if md is None or pidx in done:
+                if md is None:
+                    done.add(pidx)
+                continue
+            px, src = _price_from_mkt_data(md)
+            if px:
+                positions[pidx]["market_price"] = px
+                positions[pidx]["price_source"] = src
+                done.add(pidx)
+        if len(done) == len(mkt_rows):
+            break
+        try:
+            ib.sleep(0.08)
+        except Exception:
+            time.sleep(0.08)
+
+    for _pidx, c, md in mkt_rows:
+        if md is not None:
+            try:
+                ib.cancelMktData(c)
+            except Exception:
+                pass
+
+
+def fetch_positions(with_greeks: bool = False, use_mkt_snapshot: bool = False) -> dict:
     """
     Načíta všetky aktuálne pozície z IBKR portfólia.
 
-    with_greeks=False (default): rýchly fetch iba pozícií, bez Greeks (~0s).
-        Vhodné pre DB sync (dashboard, auto-refresh).
-    with_greeks=True: navyše vypočíta IV + Greeks lokálne (~0.1s).
-        Používa ceny z portfólia + Black-Scholes (bisekcia pre IV).
-        Žiadne extra TWS API volania → žiadny deadlock.
+    use_mkt_snapshot=False (default): ib.portfolio() – rýchle (vhodné pre auto-sync).
+    use_mkt_snapshot=True: krátky reqMktData snapshot – ceny bližšie stĺpcu „Last“ v TWS.
+
+    with_greeks=True: IV + Greeks z BS (market_price po prípadnom snapshot).
     """
     ib = get_ib()
     if not ib or not ib.isConnected():
@@ -758,33 +830,30 @@ def fetch_positions(with_greeks: bool = False) -> dict:
         if not raw:
             return {"positions": [], "error": None}
 
-        # Cena podkladu z portfólia (pre výpočet Greeks)
-        under_price: float | None = None
-        for item in raw:
-            if item.contract.secType == "STK":
-                p = item.marketPrice
-                if p and not math.isnan(p) and p > 0:
-                    under_price = float(p)
-                    break
+        positions: list[dict] = []
+        snap_rows: list[tuple[int, object]] = []
 
-        positions = []
         for item in raw:
             c = item.contract
             if c.secType not in ("OPT", "STK"):
                 continue
-            pos_size  = item.position
+            pos_size  = float(item.position)
             leg_type  = "Short" if pos_size < 0 else "Long"
+            mp0 = item.marketPrice
+            if mp0 is not None and (math.isnan(float(mp0)) or float(mp0) <= 0):
+                mp0 = None
             base = {
                 "sec_type":       c.secType,
                 "ticker":         c.symbol,
-                "contracts":      int(abs(pos_size)),
+                "contracts":      abs(pos_size),
                 "leg_type":       leg_type,
                 "avg_cost":       item.averageCost,
-                "market_price":   item.marketPrice,
+                "market_price":   float(mp0) if mp0 is not None else None,
                 "market_value":   item.marketValue,
                 "unrealized_pnl": item.unrealizedPNL,
                 "realized_pnl":   item.realizedPNL,
                 "account":        item.account,
+                "price_source":   "portfolio_mark",
                 "iv":             None,
                 "delta":          None,
                 "gamma":          None,
@@ -797,20 +866,44 @@ def fetch_positions(with_greeks: bool = False) -> dict:
                     "strike":      float(c.strike),
                     "expiry":      c.lastTradeDateOrContractMonth,
                 })
-                if with_greeks and under_price:
-                    opt_price = item.marketPrice
-                    if opt_price and not math.isnan(opt_price) and opt_price > 0:
-                        exp_str = c.lastTradeDateOrContractMonth
-                        try:
-                            T = max(0.001, (_date(int(exp_str[:4]), int(exp_str[4:6]), int(exp_str[6:])) - _date.today()).days / 365.0)
-                        except Exception:
-                            T = 30 / 365.0
-                        iv = _calc_iv(under_price, float(c.strike), T, float(opt_price), c.right)
-                        if iv:
-                            base.update(_bs_greeks(under_price, float(c.strike), T, iv, c.right))
             else:
                 base.update({"option_type": None, "strike": None, "expiry": None})
+
+            pidx = len(positions)
             positions.append(base)
+            snap_rows.append((pidx, c))
+
+        if use_mkt_snapshot and snap_rows:
+            try:
+                _snapshot_enrich_position_prices(ib, positions, snap_rows)
+            except Exception:
+                pass
+
+        # Podklad pre Greeks: prvý STK (po snapshot)
+        under_price: float | None = None
+        for p in positions:
+            if p.get("sec_type") == "STK":
+                mp = p.get("market_price")
+                if mp is not None and not math.isnan(float(mp)) and float(mp) > 0:
+                    under_price = float(mp)
+                    break
+
+        if with_greeks and under_price:
+            for p in positions:
+                if p.get("sec_type") != "OPT":
+                    continue
+                opt_price = p.get("market_price")
+                if opt_price is None or math.isnan(float(opt_price)) or float(opt_price) <= 0:
+                    continue
+                exp_str = p.get("expiry") or ""
+                try:
+                    T = max(0.001, (_date(int(exp_str[:4]), int(exp_str[4:6]), int(exp_str[6:])) - _date.today()).days / 365.0)
+                except Exception:
+                    T = 30 / 365.0
+                right = "C" if p.get("option_type") == "Call" else "P"
+                iv = _calc_iv(under_price, float(p["strike"]), T, float(opt_price), right)
+                if iv:
+                    p.update(_bs_greeks(under_price, float(p["strike"]), T, iv, right))
 
         return {"positions": positions, "error": None}
     except Exception as e:
@@ -913,9 +1006,9 @@ def _fetch_spot_prices_sync(tickers: list[str], timeout: float = 10.0) -> dict[s
     return result
 
 
-# ─── Dashboard fetch job (background thread) ─────────────────────────────────
+# ─── Dashboard fetch job (TWS Portfolio stránka; načítanie je sync pod spinnerom) ─
 DASHBOARD_FETCH_JOB: dict = {
-    "status":    "idle",   # idle | running | done | error
+    "status":    "idle",   # idle | done | error (running sa už nepoužíva)
     "positions": None,
     "orders":    None,
     "account":   None,
@@ -1041,8 +1134,11 @@ def fetch_account_summary() -> dict:
 
 
 def _pos_key(ticker, strike, expiry, leg_type, option_type) -> str:
-    """Unikátny kľúč pre porovnanie pozícií."""
-    return f"{ticker}|{strike}|{expiry}|{leg_type}|{option_type}"
+    """Unikátny kľúč pre porovnanie pozícií (exp vždy YYYYMMDD – rovnako ako v denníku)."""
+    from core.portfolio_data import normalize_expiry
+    e = normalize_expiry(str(expiry or "")).replace("-", "")
+    sk = round(float(strike or 0), 4)
+    return f"{ticker}|{sk}|{e}|{leg_type}|{option_type}"
 
 
 def sync_positions_to_db(positions: list[dict], db_module) -> dict:
@@ -1079,8 +1175,11 @@ def sync_positions_to_db(positions: list[dict], db_module) -> dict:
             t = db_map[k]
             changes = {}
             # Aktualizuj počet kontraktov
-            if pos["contracts"] != t.get("contracts"):
-                changes["contracts"] = pos["contracts"]
+            ib_c = float(pos["contracts"])
+            db_c = float(t.get("contracts") or 1)
+            if abs(ib_c - db_c) > 1e-6:
+                # Opčné kontrakty sú vždy celé čísla v DB (INTEGER)
+                changes["contracts"] = int(round(ib_c))
             # Aktualizuj priemerné náklady (entry price)
             new_ep = round(pos["avg_cost"] / 100, 4) if pos.get("avg_cost") else None
             old_ep = t.get("entry_price") or 0.0
@@ -1100,7 +1199,7 @@ def sync_positions_to_db(positions: list[dict], db_module) -> dict:
                 option_type=pos["option_type"],
                 strike=pos["strike"],
                 expiry=pos["expiry"],
-                contracts=pos["contracts"],
+                contracts=int(round(float(pos["contracts"]))),
                 entry_price=round(pos["avg_cost"] / 100, 4) if pos.get("avg_cost") else 0.0,
                 entry_date=datetime.today().strftime("%Y-%m-%d"),
                 group_id=None, iv_at_entry=None, pop_at_entry=None,

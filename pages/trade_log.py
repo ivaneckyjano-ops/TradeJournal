@@ -4,9 +4,11 @@ from datetime import date, datetime
 
 from core import database as db
 from core import ibkr
+from core.page_context import set_tradejournal_page
 from core.probability import pop_short_call, pop_short_put, pop_long_call, pop_long_put, pop_diagonal
 
 db.init_db()
+set_tradejournal_page("trade_log")
 
 
 # ─── Helper funkcie ───────────────────────────────────────────────────────────
