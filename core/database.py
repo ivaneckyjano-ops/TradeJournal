@@ -90,6 +90,7 @@ def init_db() -> None:
     _migrate_trades(get_connection())
     _migrate_group_apr_snapshots(get_connection())
     _migrate_spread_builder(get_connection())
+    _migrate_portfolio_greek_history(get_connection())
 
 
 def _migrate_symbols(conn: sqlite3.Connection) -> None:
@@ -703,6 +704,84 @@ def _migrate_spread_builder(conn: sqlite3.Connection) -> None:
         )
     conn.commit()
     conn.close()
+
+
+def _migrate_portfolio_greek_history(conn: sqlite3.Connection) -> None:
+    """História APR z Thety + Greky z Portfolio (jeden záznam na deň a scope)."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS portfolio_greek_history (
+            ticker_scope   TEXT NOT NULL DEFAULT '',
+            snapshot_date  TEXT NOT NULL,
+            apr_theta_pct  REAL,
+            theta_usd      REAL,
+            delta_usd      REAL,
+            vega_usd       REAL,
+            saved_at       TEXT NOT NULL,
+            PRIMARY KEY (ticker_scope, snapshot_date)
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pgh_scope_date ON portfolio_greek_history (ticker_scope, snapshot_date)"
+    )
+    conn.commit()
+    conn.close()
+
+
+def upsert_portfolio_greek_history(
+    ticker_scope: str,
+    snapshot_date: str,
+    apr_theta_pct: Optional[float],
+    theta_usd: Optional[float],
+    delta_usd: Optional[float],
+    vega_usd: Optional[float],
+) -> None:
+    """
+    Jedna snímka na kalendárny deň (``snapshot_date`` YYYY-MM-DD) a ``ticker_scope``.
+    Opakovaný zápis v ten istý deň starý riadok prepíše.
+    """
+    scope = (ticker_scope or "").strip().upper()
+    saved_at = datetime.now().isoformat(timespec="seconds")
+    with get_connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO portfolio_greek_history
+            (ticker_scope, snapshot_date, apr_theta_pct, theta_usd, delta_usd, vega_usd, saved_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(ticker_scope, snapshot_date) DO UPDATE SET
+                apr_theta_pct = excluded.apr_theta_pct,
+                theta_usd = excluded.theta_usd,
+                delta_usd = excluded.delta_usd,
+                vega_usd = excluded.vega_usd,
+                saved_at = excluded.saved_at
+            """,
+            (scope, snapshot_date, apr_theta_pct, theta_usd, delta_usd, vega_usd, saved_at),
+        )
+        conn.commit()
+
+
+def list_portfolio_greek_history(
+    ticker_scope: str = "",
+    since_date: Optional[str] = None,
+    limit: int = 500,
+) -> list[dict]:
+    """Riadky od ``since_date`` (vrátane), zoradené podľa dátumu vzostupne (pre graf)."""
+    scope = (ticker_scope or "").strip().upper()
+    lim = max(1, min(int(limit), 2000))
+    with get_connection() as conn:
+        if since_date:
+            rows = conn.execute(
+                "SELECT * FROM portfolio_greek_history WHERE ticker_scope=? AND snapshot_date >= ? "
+                "ORDER BY snapshot_date ASC LIMIT ?",
+                (scope, since_date, lim),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM portfolio_greek_history WHERE ticker_scope=? "
+                "ORDER BY snapshot_date DESC LIMIT ?",
+                (scope, lim),
+            ).fetchall()
+            rows = list(reversed(rows))
+    return [dict(r) for r in rows]
 
 
 def list_spread_builder_ideas() -> list[dict]:

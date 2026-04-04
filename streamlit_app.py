@@ -146,8 +146,9 @@ if auto_on and not _tj_skip_global:
     db.init_db()
 
     if ibkr.is_connected():
-        # fetch_positions bez Greeks: len ib.portfolio() – synchrónna cache, rýchle
-        _res = ibkr.fetch_positions()
+        # Pri auto-sync berieme ceny z historical last, aby dashboard/portfolio
+        # neboli hneď po reloade prepísané späť na portfolio mark.
+        _res = ibkr.fetch_positions(use_historical_last=False)
         if not _res.get("error"):
             _fetched_positions = _res["positions"]
             st.session_state["live_positions"] = _fetched_positions

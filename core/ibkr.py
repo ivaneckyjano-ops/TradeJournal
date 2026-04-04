@@ -783,7 +783,6 @@ def _snapshot_enrich_position_prices(ib, positions: list[dict], snap_rows: list[
             pass
         mkt_rows.append((pidx, c, md))
 
-    # Krátky spoločný limit (predtým až ~12 s pri viacerých pozíciách)
     deadline = time.time() + min(4.0, 1.0 + 0.35 * len(mkt_rows))
     done: set[int] = set()
     while time.time() < deadline and len(done) < len(mkt_rows):
@@ -812,14 +811,126 @@ def _snapshot_enrich_position_prices(ib, positions: list[dict], snap_rows: list[
                 pass
 
 
-def fetch_positions(with_greeks: bool = False, use_mkt_snapshot: bool = False) -> dict:
+def _apply_upnl_from_price(positions: list[dict], pidx: int, c, px: float) -> None:
+    """
+    Prepočíta unrealized_pnl a market_value z danej ceny identicky ako TWS.
+    avg_cost z IB API = celková cena kontraktu (pre OPT 100× cena per share).
+    """
+    avg_cost  = float(positions[pidx].get("avg_cost") or 0)
+    contracts = float(positions[pidx].get("contracts") or 0)
+    if avg_cost <= 0 or contracts <= 0:
+        return
+    mult         = 100 if c.secType in ("OPT", "FOP") else 1
+    avg_per_unit = avg_cost / mult
+    leg_type     = positions[pidx].get("leg_type", "Long")
+    sign         = -1 if leg_type == "Short" else 1
+    positions[pidx]["unrealized_pnl"] = round(
+        (px - avg_per_unit) * contracts * mult * sign, 2
+    )
+    positions[pidx]["market_value"] = round(
+        px * contracts * mult * sign, 2
+    )
+
+
+def _historical_enrich_position_prices(
+    ib, positions: list[dict], snap_rows: list[tuple[int, object]]
+) -> None:
+    """
+    Obohatí pozície o settlement/close cenu cez reqMktData streaming (ticker.close).
+    ticker.close = denná záverečná (settlement) cena — presne tá, z ktorej TWS počíta UNRL.
+
+    Ak ticker.close nie je dostupný (NaN), padne na reqHistoricalData MIDPOINT.
+    """
+    if not snap_rows:
+        return
+
+    # ── Krok 1: reqMktData streaming pre všetky pozície naraz ──────────────────
+    mkt_rows: list[tuple[int, object, object]] = []
+    for pidx, c in snap_rows:
+        try:
+            ib.qualifyContracts(c)
+            tk = ib.reqMktData(c, "", snapshot=False, regulatorySnapshot=False)
+            mkt_rows.append((pidx, c, tk))
+        except Exception:
+            mkt_rows.append((pidx, c, None))
+
+    # Čakaj max 5 s na ticker.close
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        if all(
+            (tk is not None and tk.close is not None and not math.isnan(tk.close) and tk.close > 0)
+            for _, _, tk in mkt_rows
+        ):
+            break
+        try:
+            ib.sleep(0.1)
+        except Exception:
+            time.sleep(0.1)
+
+    # Spracuj výsledky a zruš subscripcie
+    fallback_rows: list[tuple[int, object]] = []
+    for pidx, c, tk in mkt_rows:
+        if tk is not None:
+            try:
+                ib.cancelMktData(c)
+            except Exception:
+                pass
+        close_px = None
+        if tk is not None and tk.close is not None:
+            try:
+                v = float(tk.close)
+                if v > 0:
+                    close_px = v
+            except Exception:
+                pass
+        if close_px is not None:
+            positions[pidx]["market_price"] = close_px
+            positions[pidx]["price_source"] = "settlement_close"
+            _apply_upnl_from_price(positions, pidx, c, close_px)
+        else:
+            fallback_rows.append((pidx, c))
+
+    # ── Krok 2: fallback – reqHistoricalData MIDPOINT pre neúspešné ────────────
+    for pidx, c in fallback_rows:
+        for dur, what in [("300 S", "TRADES"), ("300 S", "MIDPOINT")]:
+            try:
+                bars = ib.reqHistoricalData(
+                    c,
+                    endDateTime="",
+                    durationStr=dur,
+                    barSizeSetting="1 min",
+                    whatToShow=what,
+                    useRTH=False,
+                    formatDate=1,
+                    timeout=8,
+                )
+                if bars:
+                    px = float(bars[-1].close)
+                    if px > 0:
+                        positions[pidx]["market_price"] = px
+                        positions[pidx]["price_source"] = (
+                            "hist_trades" if what == "TRADES" else "hist_midpoint"
+                        )
+                        _apply_upnl_from_price(positions, pidx, c, px)
+                        break
+            except Exception:
+                continue
+
+
+def fetch_positions(
+    with_greeks: bool = False,
+    use_mkt_snapshot: bool = False,
+    use_historical_last: bool = False,
+) -> dict:
     """
     Načíta všetky aktuálne pozície z IBKR portfólia.
 
     use_mkt_snapshot=False (default): ib.portfolio() – rýchle (vhodné pre auto-sync).
-    use_mkt_snapshot=True: krátky reqMktData snapshot – ceny bližšie stĺpcu „Last“ v TWS.
+    use_mkt_snapshot=True: reqMktData snapshot – len ak máš streaming MD subscription.
+    use_historical_last=True: reqHistoricalData (posledný 1-min bar) – Last cena ako v TWS,
+        funguje aj bez streaming subscription. Pomalšie (1–2 s na pozíciu).
 
-    with_greeks=True: IV + Greeks z BS (market_price po prípadnom snapshot).
+    with_greeks=True: IV + Greeks z BS (market_price po prípadnom obohaténí).
     """
     ib = get_ib()
     if not ib or not ib.isConnected():
@@ -835,8 +946,6 @@ def fetch_positions(with_greeks: bool = False, use_mkt_snapshot: bool = False) -
 
         for item in raw:
             c = item.contract
-            if c.secType not in ("OPT", "STK"):
-                continue
             pos_size  = float(item.position)
             leg_type  = "Short" if pos_size < 0 else "Long"
             mp0 = item.marketPrice
@@ -849,6 +958,8 @@ def fetch_positions(with_greeks: bool = False, use_mkt_snapshot: bool = False) -
                 "leg_type":       leg_type,
                 "avg_cost":       item.averageCost,
                 "market_price":   float(mp0) if mp0 is not None else None,
+                # keep original portfolio marketPrice for debugging (may be overwritten by snapshot)
+                "market_price_portfolio": float(mp0) if mp0 is not None else None,
                 "market_value":   item.marketValue,
                 "unrealized_pnl": item.unrealizedPNL,
                 "realized_pnl":   item.realizedPNL,
@@ -860,10 +971,16 @@ def fetch_positions(with_greeks: bool = False, use_mkt_snapshot: bool = False) -
                 "theta":          None,
                 "vega":           None,
             }
-            if c.secType == "OPT":
+            if c.secType in ("OPT", "FOP"):
                 base.update({
                     "option_type": "Call" if c.right == "C" else "Put",
                     "strike":      float(c.strike),
+                    "expiry":      c.lastTradeDateOrContractMonth,
+                })
+            elif c.secType == "FUT":
+                base.update({
+                    "option_type": None,
+                    "strike":      None,
                     "expiry":      c.lastTradeDateOrContractMonth,
                 })
             else:
@@ -873,7 +990,12 @@ def fetch_positions(with_greeks: bool = False, use_mkt_snapshot: bool = False) -
             positions.append(base)
             snap_rows.append((pidx, c))
 
-        if use_mkt_snapshot and snap_rows:
+        if use_historical_last and snap_rows:
+            try:
+                _historical_enrich_position_prices(ib, positions, snap_rows)
+            except Exception:
+                pass
+        elif use_mkt_snapshot and snap_rows:
             try:
                 _snapshot_enrich_position_prices(ib, positions, snap_rows)
             except Exception:
@@ -890,7 +1012,7 @@ def fetch_positions(with_greeks: bool = False, use_mkt_snapshot: bool = False) -
 
         if with_greeks and under_price:
             for p in positions:
-                if p.get("sec_type") != "OPT":
+                if p.get("sec_type") not in ("OPT", "FOP"):
                     continue
                 opt_price = p.get("market_price")
                 if opt_price is None or math.isnan(float(opt_price)) or float(opt_price) <= 0:

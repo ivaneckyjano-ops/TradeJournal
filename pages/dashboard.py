@@ -6,8 +6,6 @@ from core import database as db
 from core import ibkr
 from core.page_context import set_tradejournal_page
 from core.portfolio_data import normalize_expiry
-from core.probability import calc_sd_lines
-from core.charts import sd_lines_chart, pnl_timeline_chart
 
 db.init_db()
 set_tradejournal_page("dashboard")
@@ -23,10 +21,13 @@ if "ib_cid" not in st.session_state:
 # Auto-refresh odkaz na session_state nastavené v streamlit_app.py
 auto_on = st.session_state.get("auto_refresh_on", False)
 
+# Stav pripojenia — raz vyhodnotený pre celú stránku
+_ib_connected = ibkr.is_connected()
+
 st.title("Dashboard")
 
 # ─── IBKR Panel ───────────────────────────────────────────────────────────────
-with st.expander("IBKR Pripojenie", expanded=not ibkr.is_connected()):
+with st.expander("IBKR Pripojenie", expanded=not _ib_connected):
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
         host = st.text_input("Host", value="127.0.0.1", key="ib_host")
@@ -57,10 +58,10 @@ with st.expander("IBKR Pripojenie", expanded=not ibkr.is_connected()):
     if st.session_state.get("ib_last_err"):
         st.caption(f"Posledná chyba: `{st.session_state['ib_last_err']}`")
 
-if ibkr.is_connected():
+if _ib_connected:
     st.success("IBKR: Pripojený")
 else:
-    st.warning("IBKR: Nie je pripojenie — SD grafy môžeš zobraziť aj manuálne.")
+    st.warning("IBKR: Nie je pripojenie. Použi panel vyššie na pripojenie.")
 
 st.divider()
 
@@ -72,7 +73,7 @@ with col_sync1:
     sync_btn = st.button(
         "Importuj pozície z IBKR",
         type="primary",
-        disabled=not ibkr.is_connected(),
+        disabled=not _ib_connected,
         use_container_width=True,
     )
 with col_sync2:
@@ -82,7 +83,7 @@ with col_sync2:
 
 if sync_btn:
     with st.spinner("Načítavam portfólio z IBKR..."):
-        res = ibkr.fetch_positions()
+        res = ibkr.fetch_positions(use_historical_last=False)
     if res["error"]:
         st.error(res["error"])
     else:
@@ -104,7 +105,7 @@ if sync_btn:
 
 fills_btn = st.button(
     "Importuj Fills + Uzavri pozície (BOT/SLD)",
-    disabled=not ibkr.is_connected(),
+    disabled=not _ib_connected,
     type="primary",
     help="Načíta vykonané obchody z TWS. Automaticky uzavrie Short pozície (BOT) a Long pozície (SLD).",
 )
@@ -161,9 +162,9 @@ if possibly_closed:
                     ]
                     st.rerun()
 
-if show_ibkr_raw and ibkr.is_connected():
+if show_ibkr_raw and _ib_connected:
     with st.spinner("Načítavam..."):
-        live_res = ibkr.fetch_positions()
+        live_res = ibkr.fetch_positions(use_historical_last=False)
     if live_res["error"]:
         st.error(live_res["error"])
     elif not live_res["positions"]:
@@ -180,11 +181,23 @@ if show_ibkr_raw and ibkr.is_connected():
             st.markdown("**Opcie v portfóliu:**")
             df_live = pd.DataFrame(opts)[[
                 "ticker", "leg_type", "option_type", "strike", "expiry",
-                "contracts", "avg_cost", "market_price", "unrealized_pnl"
+                "contracts", "avg_cost", "market_price", "price_source", "unrealized_pnl"
             ]].copy()
+            _src_map = {
+                "settlement_close": "Settle (=TWS)",
+                "hist_trades": "Last (hist)",
+                "hist_midpoint": "Midpoint (hist)",
+                "hist_last": "Last (hist)",
+                "portfolio_mark": "Mark (portfólia)",
+                "last": "Last",
+                "mid": "Mid",
+                "mark": "Mark",
+                "close": "Close",
+            }
+            df_live["price_source"] = df_live["price_source"].map(lambda x: _src_map.get(str(x), str(x)))
             df_live.columns = [
                 "Ticker", "Noha", "Typ", "Strike", "Expiry",
-                "Kontr.", "Avg Cost", "Trh. cena", "Unrealized P&L"
+                "Kontr.", "Avg Cost", "Trh. cena", "Zdroj ceny", "Unrealized P&L"
             ]
             # Súčtový riadok pre opcie
             total_row_opt = pd.DataFrame([{
@@ -209,8 +222,20 @@ if show_ibkr_raw and ibkr.is_connected():
 
         if stks:
             st.markdown("**Akcie v portfóliu:**")
-            df_stk = pd.DataFrame(stks)[["ticker", "leg_type", "contracts", "avg_cost", "market_price", "unrealized_pnl"]].copy()
-            df_stk.columns = ["Ticker", "Noha", "Kontr.", "Avg Cost", "Trh. cena", "Unrealized P&L"]
+            df_stk = pd.DataFrame(stks)[["ticker", "leg_type", "contracts", "avg_cost", "market_price", "price_source", "unrealized_pnl"]].copy()
+            _src_map = {
+                "settlement_close": "Settle (=TWS)",
+                "hist_trades": "Last (hist)",
+                "hist_midpoint": "Midpoint (hist)",
+                "hist_last": "Last (hist)",
+                "portfolio_mark": "Mark (portfólia)",
+                "last": "Last",
+                "mid": "Mid",
+                "mark": "Mark",
+                "close": "Close",
+            }
+            df_stk["price_source"] = df_stk["price_source"].map(lambda x: _src_map.get(str(x), str(x)))
+            df_stk.columns = ["Ticker", "Noha", "Kontr.", "Avg Cost", "Trh. cena", "Zdroj ceny", "Unrealized P&L"]
             total_row_stk = pd.DataFrame([{
                 "Ticker": "SPOLU",
                 "Noha": "",
@@ -240,14 +265,14 @@ st.divider()
 # ─── Kontrola: Porovnanie Denník ↔ TWS ────────────────────────────────────────
 st.subheader("Kontrola zhody Denník ↔ TWS")
 
-if not ibkr.is_connected():
+if not _ib_connected:
     st.info("Pripoj sa na IBKR pre živé porovnanie.")
 else:
     check_btn = st.button("Skontroluj zhodu s TWS", type="secondary", use_container_width=False)
     if check_btn or st.session_state.get("show_check"):
         st.session_state["show_check"] = True
         with st.spinner("Porovnávam..."):
-            live_chk = ibkr.fetch_positions()
+            live_chk = ibkr.fetch_positions(use_historical_last=False)
 
         if live_chk["error"]:
             st.error(live_chk["error"])
@@ -370,80 +395,6 @@ else:
 
 st.divider()
 
-# ─── SD Línie ─────────────────────────────────────────────────────────────────
-st.subheader("SD Línie — Probability Range")
-
-col_a, col_b, col_c, col_d = st.columns([2, 1, 1, 1])
-with col_a:
-    _sym_tickers = db.get_symbol_tickers()
-    if _sym_tickers:
-        _sym_opts = _sym_tickers + ["— vlastný —"]
-        _sym_sel = st.selectbox("Ticker", _sym_opts, key="dash_ticker_sel")
-        ticker = st.text_input("Vlastný ticker", value="", key="dash_ticker").upper().strip() if _sym_sel == "— vlastný —" else _sym_sel
-    else:
-        ticker = st.text_input("Ticker", value="AMZN", key="dash_ticker").upper()
-with col_b:
-    dte = st.number_input("DTE (dni)", value=30, min_value=1, max_value=730, step=1)
-with col_c:
-    manual_spot = st.number_input("Spot cena ($)", value=0.0, min_value=0.0, step=0.5,
-                                  help="0 = načítaj z IBKR")
-with col_d:
-    manual_iv = st.number_input("IV (napr. 0.30 = 30%)", value=0.0, min_value=0.0,
-                                max_value=5.0, step=0.01,
-                                help="0 = načítaj z IBKR")
-
-load_btn = st.button("Načítaj / Vypočítaj", type="primary")
-
-if load_btn:
-    spot = manual_spot if manual_spot > 0 else None
-    iv = manual_iv if manual_iv > 0 else None
-
-    if ibkr.is_connected():
-        if spot is None:
-            res = ibkr.fetch_underlying(ticker)
-            if res["error"]:
-                st.error(res["error"])
-            else:
-                spot = res["price"]
-                st.caption(f"Spot načítaný z IBKR: ${spot:.2f}")
-
-    if spot is None:
-        st.warning("Zadaj Spot cenu manuálne alebo sa pripoj na IBKR.")
-    elif iv is None or iv == 0:
-        st.info("Zadaj IV manuálne (napr. 0.30 = 30%).")
-    else:
-        sd = calc_sd_lines(spot, iv, int(dte))
-        st.session_state["sd_data"] = sd
-        st.session_state["sd_ticker"] = ticker
-
-if "sd_data" in st.session_state:
-    sd = st.session_state["sd_data"]
-    ticker_label = st.session_state.get("sd_ticker", ticker)
-
-    open_trades = db.get_open_trades()
-    ticker_trades = [t for t in open_trades if t["ticker"].upper() == ticker_label.upper()]
-    strikes = [t["strike"] for t in ticker_trades if t["strike"]]
-    strike_labels = [
-        f"{t['leg_type']} {t['option_type']} ${t['strike']:.0f}" for t in ticker_trades if t["strike"]
-    ]
-
-    fig = sd_lines_chart(sd, ticker=ticker_label, strikes=strikes or None, strike_labels=strike_labels or None)
-    st.plotly_chart(fig, width="stretch")
-
-    mc1, mc2, mc3, mc4 = st.columns(4)
-    mc1.metric("Spot", f"${sd.spot:.2f}")
-    mc2.metric("1SD pohyb", f"±${sd.sd_move:.2f}")
-    mc3.metric("+1SD", f"${sd.upper_1sd:.2f}", delta=f"+{sd.sd_move:.2f}")
-    mc4.metric("−1SD", f"${sd.lower_1sd:.2f}", delta=f"-{sd.sd_move:.2f}")
-
-    mc5, mc6, mc7, mc8 = st.columns(4)
-    mc5.metric("IV", f"{sd.iv*100:.1f}%")
-    mc6.metric("DTE", f"{sd.dte} dní")
-    mc7.metric("+2SD", f"${sd.upper_2sd:.2f}")
-    mc8.metric("−2SD", f"${sd.lower_2sd:.2f}")
-
-st.divider()
-
 # ─── Otvorené pozície ─────────────────────────────────────────────────────────
 st.subheader("Otvorené pozície")
 
@@ -495,10 +446,3 @@ else:
         },
     )
 
-st.divider()
-
-# ─── P&L Timeline ─────────────────────────────────────────────────────────────
-st.subheader("Kumulatívny P&L")
-all_trades = db.get_all_trades()
-fig_pnl = pnl_timeline_chart(all_trades)
-st.plotly_chart(fig_pnl, width="stretch")

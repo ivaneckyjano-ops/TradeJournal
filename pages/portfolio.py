@@ -1,20 +1,21 @@
 """
 Portfolio Command Center — analýza otvorenej knihy z denníka.
 
-Záložky: skupiny a expozícia, Greky a scenáre, časová os (DTE), história a súhrn (P&L, APR, TWS).
+Záložky: skupiny a expozícia, Greky a APR z Thety, časová os (DTE), história a súhrn (P&L, APR, TWS).
 """
 from __future__ import annotations
 
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-from datetime import date
+from plotly.subplots import make_subplots
+from datetime import date, timedelta
 from typing import Optional
 
 from core import database as db
 from core import ibkr
 from core.page_context import set_tradejournal_page
-from core.portfolio_data import normalize_expiry, compute_simple_apr
+from core.portfolio_data import normalize_expiry, compute_simple_apr, net_open_debit_capital_usd
 from core.portfolio_view import min_short_dte_open, open_groups_count
 from core.probability import bs_price, calc_greeks
 
@@ -88,71 +89,71 @@ def _bs_value(t: dict, spot: float, iv: float) -> Optional[float]:
     return unrealized
 
 
-def _exp_value(t: dict, spot_at_exp: float) -> float:
-    """P&L pri expirácii nohy pri danom spote."""
-    contracts = float(t.get("contracts", 1) or 1)
-    entry_p = float(t.get("entry_price", 0) or 0)
-    strike = float(t.get("strike", 0) or 0)
-    leg = t.get("leg_type", "Long")
-    opt = t.get("option_type", "Call")
-
-    if leg == "Short":
-        if opt == "Call":
-            intrinsic = max(0.0, spot_at_exp - strike)
-        else:
-            intrinsic = max(0.0, strike - spot_at_exp)
-        pnl = (entry_p - intrinsic) * contracts * 100
-    else:
-        if opt == "Call":
-            intrinsic = max(0.0, spot_at_exp - strike)
-        else:
-            intrinsic = max(0.0, strike - spot_at_exp)
-        pnl = (intrinsic - entry_p) * contracts * 100
-    return pnl
-
-
 # ─── Vstupné parametre ────────────────────────────────────────────────────────
+# Zisti unikátne tickery z otvorených pozícií pre per-ticker Spot/IV
+_all_open_for_tickers = [t for t in db.get_all_trades() if t["status"] == "Open"]
+_unique_tickers: list[str] = sorted({t["ticker"].upper() for t in _all_open_for_tickers if t.get("ticker")})
+
 with st.expander("Parametre výpočtu (spot, IV, filter)", expanded=True):
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        spot_input = st.number_input(
-            "Aktuálna cena podkladu ($)",
-            min_value=0.0, step=0.5, value=st.session_state.get("pf_spot", 0.0),
-            key="pf_spot",
-            help="0 = pri zadanom tickery sa pokúsi načítať z IBKR",
-        )
-    with c2:
-        iv_input = st.number_input(
-            "IV (napr. 0.45 = 45%)",
-            min_value=0.0, max_value=5.0, step=0.01,
-            value=st.session_state.get("pf_iv", 0.45),
-            key="pf_iv",
-        )
-    with c3:
-        ticker_filter = st.text_input(
-            "Ticker (prázdne = všetky)",
-            value=st.session_state.get("pf_ticker", ""),
-            key="pf_ticker",
-        ).upper().strip()
+    # Ticker filter
+    ticker_filter = st.text_input(
+        "Filter — Ticker (prázdne = všetky)",
+        value=st.session_state.get("pf_ticker", ""),
+        key="pf_ticker",
+    ).upper().strip()
 
-    if ibkr.is_connected() and spot_input == 0 and ticker_filter:
-        with st.spinner(f"Načítavam spot pre {ticker_filter}..."):
-            res = ibkr.fetch_underlying(ticker_filter)
-        if not res.get("error") and res.get("price"):
-            spot_input = res["price"]
-            st.session_state["pf_spot"] = spot_input
-            st.caption(f"Spot z IBKR: **${spot_input:.2f}**")
+    _tickers_to_show = [ticker_filter] if ticker_filter else _unique_tickers
 
-spot = spot_input
-iv = iv_input
+    if not _tickers_to_show:
+        _tickers_to_show = [""]
+
+    st.caption("Zadaj **Spot** a **IV** pre každý ticker (0 = načítaj z IBKR ak je pripojený).")
+
+    # Per-ticker Spot + IV vstupy
+    _spot_iv_map: dict[str, tuple[float, float]] = {}  # ticker -> (spot, iv)
+    _cols_per_row = 3
+    for _i in range(0, len(_tickers_to_show), _cols_per_row):
+        _row_tickers = _tickers_to_show[_i:_i + _cols_per_row]
+        _row_cols = st.columns(len(_row_tickers) * 2)
+        for _j, _tk in enumerate(_row_tickers):
+            _sk_spot = f"pf_spot_{_tk}" if _tk else "pf_spot"
+            _sk_iv   = f"pf_iv_{_tk}"   if _tk else "pf_iv"
+            with _row_cols[_j * 2]:
+                _sp = st.number_input(
+                    f"Spot {_tk}" if _tk else "Spot ($)",
+                    min_value=0.0, step=0.5,
+                    value=float(st.session_state.get(_sk_spot, 0.0)),
+                    key=_sk_spot,
+                )
+            with _row_cols[_j * 2 + 1]:
+                _iv = st.number_input(
+                    f"IV {_tk} (napr. 0.30)",
+                    min_value=0.0, max_value=5.0, step=0.01,
+                    value=float(st.session_state.get(_sk_iv, 0.45)),
+                    key=_sk_iv,
+                )
+            # Načítaj Spot z IBKR ak je 0 a ticker je zadaný
+            if _sp == 0 and _tk and ibkr.is_connected():
+                with st.spinner(f"Načítavam spot pre {_tk}..."):
+                    _res = ibkr.fetch_underlying(_tk)
+                if not _res.get("error") and _res.get("price"):
+                    _sp = _res["price"]
+                    st.session_state[_sk_spot] = _sp
+            _spot_iv_map[_tk] = (_sp, _iv)
+
+# Spätná kompatibilita — globálny spot/iv pre jednoticker alebo fallback
+if ticker_filter and ticker_filter in _spot_iv_map:
+    spot, iv = _spot_iv_map[ticker_filter]
+elif len(_spot_iv_map) == 1:
+    spot, iv = next(iter(_spot_iv_map.values()))
+else:
+    # Pri viac tickeroch — fallback 0 (BS sa počíta per-trade nižšie)
+    spot, iv = 0.0, 0.0
 
 _tick_lbl = ticker_filter if ticker_filter else "všetky tickery"
-if spot > 0 and iv > 0:
-    _model_lbl = (
-        "Black–Scholes; kde sedí párovanie s TWS, použije sa **live Unrealized** z IBKR."
-        if ibkr.is_connected()
-        else "Black–Scholes (bez IBKR nie je live P&L)."
-    )
+_any_spot = any(s > 0 for s, _ in _spot_iv_map.values())
+if _any_spot:
+    _model_lbl = "Black–Scholes per ticker; kde sedí párovanie s TWS, použije sa live Unrealized z IBKR."
 else:
     _model_lbl = "bez BS — zadaj Spot a IV pre odhad nerealizovaného P&L (inak 0)."
 st.caption(f"**Aktívny filter:** {_tick_lbl}. **Odhad otvorených:** {_model_lbl}")
@@ -180,9 +181,12 @@ unrealized_by_trade: dict[int, float] = {}
 
 ibkr_prices: dict[tuple, float] = {}
 if ibkr.is_connected():
-    live = ibkr.fetch_positions()
+    live = ibkr.fetch_positions(use_historical_last=False)
     if not live.get("error"):
+        _src_counts: dict[str, int] = {}
         for p in live["positions"]:
+            _src = str(p.get("price_source") or "?")
+            _src_counts[_src] = _src_counts.get(_src, 0) + 1
             if p["sec_type"] == "OPT":
                 key = _opt_match_key(
                     p["ticker"],
@@ -192,6 +196,23 @@ if ibkr.is_connected():
                     p.get("leg_type", ""),
                 )
                 ibkr_prices[key] = float(p.get("unrealized_pnl", 0) or 0)
+        if _src_counts:
+            _src_label = {
+                "settlement_close": "Settlement Close (=TWS)",
+                "hist_trades": "Last (historické)",
+                "hist_midpoint": "Midpoint (historické)",
+                "hist_last": "Last (historické)",
+                "portfolio_mark": "Mark (portfólio)",
+                "last": "Last",
+                "mid": "Mid",
+                "mark": "Mark",
+                "close": "Close",
+            }
+            _src_txt = ", ".join(
+                f"{_src_label.get(k, k)}: {v}"
+                for k, v in sorted(_src_counts.items(), key=lambda x: (-x[1], x[0]))
+            )
+            st.caption(f"Zdroj live cien: {_src_txt}")
 
 for t in open_trades:
     key = _opt_match_key(
@@ -201,10 +222,12 @@ for t in open_trades:
         t.get("option_type", ""),
         t.get("leg_type", ""),
     )
+    _tk = t["ticker"].upper()
+    _t_spot, _t_iv = _spot_iv_map.get(_tk, _spot_iv_map.get("", (0.0, 0.45)))
     if key in ibkr_prices:
         val = ibkr_prices[key]
-    elif spot > 0 and iv > 0:
-        val = _bs_value(t, spot, iv) or 0.0
+    elif _t_spot > 0 and _t_iv > 0:
+        val = _bs_value(t, _t_spot, _t_iv) or 0.0
     else:
         val = 0.0
     unrealized_by_trade[int(t["id"])] = val
@@ -217,13 +240,15 @@ for t in open_trades:
     contracts = float(t.get("contracts", 1) or 1)
     entry_p = float(t.get("entry_price", 0) or 0)
     leg = t.get("leg_type", "Long")
+    _tk = t["ticker"].upper()
+    _t_spot, _t_iv = _spot_iv_map.get(_tk, _spot_iv_map.get("", (0.0, 0.45)))
     if leg == "Short":
         exp_pnl_max += entry_p * contracts * 100
     else:
-        if spot > 0 and iv > 0:
+        if _t_spot > 0 and _t_iv > 0:
             dte_v = _dte(t.get("expiry", ""))
             right = "C" if t.get("option_type", "Call") == "Call" else "P"
-            bs_val = bs_price(spot, t.get("strike", 0), dte_v, iv, right)
+            bs_val = bs_price(_t_spot, t.get("strike", 0), dte_v, _t_iv, right)
             if bs_val:
                 exp_pnl_max += (bs_val - entry_p) * contracts * 100
 
@@ -233,13 +258,15 @@ port_vega = 0.0
 greeks_rows = []
 
 for t in open_trades:
-    if spot <= 0 or iv <= 0:
-        break
+    _tk = t["ticker"].upper()
+    _t_spot, _t_iv = _spot_iv_map.get(_tk, _spot_iv_map.get("", (0.0, 0.45)))
+    if _t_spot <= 0 or _t_iv <= 0:
+        continue
     dte_v = _dte(t.get("expiry", ""))
     if dte_v <= 0:
         continue
     right = "C" if t.get("option_type", "Call") == "Call" else "P"
-    g = calc_greeks(spot, t.get("strike", 0), dte_v, iv, right)
+    g = calc_greeks(_t_spot, t.get("strike", 0), dte_v, _t_iv, right)
     contracts = float(t.get("contracts", 1) or 1)
     sign = _leg_sign(t.get("leg_type", "Long"))
 
@@ -289,24 +316,32 @@ for gid, legs in sorted(groups_map.items()):
         leg = t.get("leg_type", "Long")
         if leg == "Short":
             g_exp += entry_p * contracts * 100
-        elif spot > 0 and iv > 0:
-            dte_v = _dte(t.get("expiry", ""))
-            right = "C" if t.get("option_type", "Call") == "Call" else "P"
-            bs_val = bs_price(spot, t.get("strike", 0), dte_v, iv, right)
-            if bs_val:
-                g_exp += (bs_val - entry_p) * contracts * 100
+        else:
+            _tk2 = t["ticker"].upper()
+            _ts2, _ti2 = _spot_iv_map.get(_tk2, _spot_iv_map.get("", (0.0, 0.45)))
+            if _ts2 > 0 and _ti2 > 0:
+                dte_v = _dte(t.get("expiry", ""))
+                right = "C" if t.get("option_type", "Call") == "Call" else "P"
+                bs_val = bs_price(_ts2, t.get("strike", 0), dte_v, _ti2, right)
+                if bs_val:
+                    g_exp += (bs_val - entry_p) * contracts * 100
 
     short_dtes = [_dte(t.get("expiry", "")) for t in open_l if t.get("leg_type") == "Short"]
     min_dte = min(short_dtes) if short_dtes else None
 
     g_theta = sum(
-        (calc_greeks(spot, t.get("strike", 0), _dte(t.get("expiry", "")), iv,
-                     "C" if t.get("option_type", "Call") == "Call" else "P")
-         .get("theta", 0) or 0)
+        (calc_greeks(
+            _spot_iv_map.get(t["ticker"].upper(), _spot_iv_map.get("", (0.0, 0.45)))[0],
+            t.get("strike", 0),
+            _dte(t.get("expiry", "")),
+            _spot_iv_map.get(t["ticker"].upper(), _spot_iv_map.get("", (0.0, 0.45)))[1],
+            "C" if t.get("option_type", "Call") == "Call" else "P",
+        ).get("theta", 0) or 0)
         * _leg_sign(t.get("leg_type", "Long"))
         * int(t.get("contracts", 1)) * 100
         for t in open_l
-        if spot > 0 and iv > 0 and _dte(t.get("expiry", "")) > 0
+        if _spot_iv_map.get(t["ticker"].upper(), (0.0, 0.0))[0] > 0
+        and _dte(t.get("expiry", "")) > 0
     )
 
     g_apr = compute_simple_apr(legs, unrealized_by_trade)
@@ -331,7 +366,7 @@ min_short_dte_pf = min_short_dte_open(open_trades, _dte)
 
 # ─── Záložky ──────────────────────────────────────────────────────────────────
 tab_skupiny, tab_greky, tab_cas, tab_hist = st.tabs(
-    ["Skupiny a expozícia", "Greky a scenáre", "Časová os (DTE)", "História a súhrn"]
+    ["Skupiny a expozícia", "Greky a APR z Thety", "Časová os (DTE)", "História a súhrn"]
 )
 
 # ─── Tab: Skupiny ─────────────────────────────────────────────────────────────
@@ -430,99 +465,244 @@ with tab_skupiny:
     else:
         st.info("Žiadne otvorené pozície v tomto filtri.")
 
-# ─── Tab: Greky a scenáre ─────────────────────────────────────────────────────
+# ─── Tab: Greky a APR z Thety ─────────────────────────────────────────────────
 with tab_greky:
     if ticker_filter:
-        st.caption(f"Greky a scenáre sa počítajú pre **otvorené** nohy s filtrom ticker **{ticker_filter}**.")
+        st.caption(f"Greky a APR z Thety pre **otvorené** nohy s filtrom ticker **{ticker_filter}**.")
     else:
-        st.caption("Greky a scenáre zahŕňajú **všetky** otvorené nohy v denníku (jeden zadaný spot + IV pre všetky).")
+        st.caption("Greky a APR z Thety pre **všetky** otvorené nohy v denníku (Spot + IV podľa tickera vyššie).")
 
-    if spot > 0 and iv > 0 and greeks_rows:
-        g1, g2, g3 = st.columns(3)
-        g1.metric(
-            "Celková Delta ($)",
-            f"${port_delta:+,.0f}",
-            help="Smerová expozícia pri zadanom spote a IV.",
+    # ── Korekcia Theta / Vega z TWS ──────────────────────────────────────────
+    st.caption("Zadaj hodnoty z TWS ak sa líšia od Black-Scholes (0 = použije BS výpočet).")
+    ov_col1, ov_col2, ov_col3 = st.columns([2, 2, 1])
+    with ov_col1:
+        tws_theta_override = st.number_input(
+            "Theta z TWS ($/deň)",
+            value=float(st.session_state.get("pf_tws_theta_override", 0.0)),
+            step=0.5,
+            format="%.2f",
+            key="pf_tws_theta_override",
+            help="Súčet Theta z TWS pre všetky otvorené pozície (napr. +15.30). "
+                 "Short opcii = + Theta (zbierajú čas. hodnotu).",
         )
+    with ov_col2:
+        tws_vega_override = st.number_input(
+            "Vega z TWS ($/1%IV)",
+            value=float(st.session_state.get("pf_tws_vega_override", 0.0)),
+            step=1.0,
+            format="%.2f",
+            key="pf_tws_vega_override",
+            help="Súčet Vega z TWS pre všetky otvorené pozície.",
+        )
+    with ov_col3:
+        if st.button("Vymazať", key="pf_tws_greek_reset", help="Vráti na BS hodnoty"):
+            st.session_state["pf_tws_theta_override"] = 0.0
+            st.session_state["pf_tws_vega_override"] = 0.0
+            st.rerun()
+
+    # Použi TWS hodnoty ak sú zadané, inak BS
+    has_tws_theta = tws_theta_override != 0.0
+    has_tws_vega  = tws_vega_override  != 0.0
+    display_theta = tws_theta_override if has_tws_theta else port_theta
+    display_vega  = tws_vega_override  if has_tws_vega  else port_vega
+    theta_src = "TWS" if has_tws_theta else "BS"
+    vega_src  = "TWS" if has_tws_vega  else "BS"
+
+    # Metriky — BS riadky môžu byť aj pri viacerých tickeroch (globálny spot môže byť 0)
+    has_bs    = bool(greeks_rows)
+    has_any   = has_bs or has_tws_theta or has_tws_vega
+
+    if has_any:
+        g1, g2, g3 = st.columns(3)
+        if has_bs:
+            g1.metric(
+                "Celková Delta ($)",
+                f"${port_delta:+,.0f}",
+                help="Smerová expozícia pri zadanom spote a IV (BS).",
+            )
+        else:
+            g1.caption("Delta: zadaj Spot a IV")
+
         g2.metric(
-            "Celková Theta ($/deň)",
-            f"${port_theta:+,.2f}",
-            help="Časový rozpad (BS).",
+            f"Celková Theta ($/deň) [{theta_src}]",
+            f"${display_theta:+,.2f}",
+            delta=f"BS: ${port_theta:+.2f}" if (has_tws_theta and has_bs) else None,
+            help="Časový rozpad. TWS hodnota má prednosť pred BS ak je zadaná.",
         )
         g3.metric(
-            "Celková Vega ($/1%IV)",
-            f"${port_vega:+,.2f}",
-            help="Citlivosť na zmenu impl. volatility.",
+            f"Celková Vega ($/1%IV) [{vega_src}]",
+            f"${display_vega:+,.2f}",
+            delta=f"BS: ${port_vega:+.2f}" if (has_tws_vega and has_bs) else None,
+            help="Citlivosť na zmenu impl. volatility. TWS hodnota má prednosť pred BS ak je zadaná.",
         )
-        with st.expander("Detail grekov po nohách"):
+        if has_bs:
+            with st.expander("Detail grekov po nohách (Black-Scholes)"):
+                st.dataframe(
+                    pd.DataFrame(greeks_rows),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Strike": st.column_config.NumberColumn(format="$%.0f"),
+                        "Delta $": st.column_config.NumberColumn(format="$%+.0f"),
+                        "Theta $/deň": st.column_config.NumberColumn(format="$%+.2f"),
+                        "Vega $/%IV": st.column_config.NumberColumn(format="$%+.2f"),
+                        "Unrealized P&L": st.column_config.NumberColumn(format="$%+.0f"),
+                    },
+                )
+        if not has_bs:
+            st.caption("Pre Delta a detail po nohách zadaj Spot a IV v parametroch hore.")
+    else:
+        st.info("Zadaj hodnoty z TWS vyššie, alebo Spot + IV pre Black-Scholes výpočet.")
+
+    st.divider()
+    st.subheader("APR z Thety (ročný výnos)")
+    st.caption(
+        "Vzorec: (Θ USD/deň × 365 / (net debet z denníka + marža)) × 100. "
+        "Θ je hodnota z metrík vyššie (TWS alebo Black–Scholes). Rovnaká logika ako na **TWS Dashboarde**."
+    )
+    _mm_apr_th = st.number_input(
+        "Udržiavacia marža (USD, voliteľné)",
+        min_value=0.0,
+        step=50.0,
+        format="%.0f",
+        key="pf_apr_theta_margin",
+        help="Z TWS (Margin Impact). Pripočíta sa k net debetu z Trade Logu ako celková báza nákladu.",
+    )
+    _net_debit_pf = net_open_debit_capital_usd(open_trades)
+    if not open_trades:
+        st.caption("Žiadne otvorené pozície v aktívnom filtri.")
+    elif not has_any:
+        st.info("Najprv zadaj Theta (TWS alebo Spot+IV pre BS), aby bolo z čoho počítať APR.")
+    elif _net_debit_pf is None:
+        st.warning(
+            "Net debet z denníka nie je spočítateľný — všetkým **otvoreným** nohám doplň **vstupnú cenu** v Trade Logu."
+        )
+    elif _net_debit_pf <= 0:
+        st.info(
+            "Tento APR z Thety je určený pre **net debetové** štruktúry (kladný net debet). "
+            "Pri net kredite použij iné metriky alebo TWS Dashboard."
+        )
+    else:
+        _basis_th = float(_net_debit_pf) + max(0.0, float(_mm_apr_th or 0.0))
+        _apr_theta_pct = (display_theta * 365.0 / _basis_th) * 100.0
+        ac1, ac2, ac3 = st.columns(3)
+        ac1.metric("Ročný výnos z Θ", f"{_apr_theta_pct:+.1f} %")
+        ac2.metric("Θ (použitá)", f"${display_theta:+,.2f}/deň", help=f"Zdroj: {theta_src}")
+        ac3.metric("Báza nákladu", f"${_basis_th:,.0f}")
+        st.caption(
+            f"Net debet z denníka: **{float(_net_debit_pf):,.0f}** USD"
+            + (f" · marža **{float(_mm_apr_th):,.0f}** USD" if float(_mm_apr_th or 0) >= 1.0 else " · marža 0 (menovateľ = len net debet)")
+        )
+
+    # ── História grafov (APR, Θ, Δ, Vega) ───────────────────────────────────
+    _apr_for_history: Optional[float] = None
+    if (
+        open_trades
+        and has_any
+        and _net_debit_pf is not None
+        and float(_net_debit_pf) > 0
+    ):
+        _b_hist = float(_net_debit_pf) + max(0.0, float(_mm_apr_th or 0))
+        if _b_hist > 0:
+            _apr_for_history = (display_theta * 365.0 / _b_hist) * 100.0
+
+    st.divider()
+    st.subheader("Vývoj v čase — APR, Theta, Delta, Vega")
+    st.caption(
+        "Grafy zobrazujú posledných **120 dní** (~4 mesiace). **Jeden záznam na kalendárny deň** "
+        "pre aktívny filter — opakované uloženie v ten istý deň **prepíše** predchádzajúci bod."
+    )
+    _scope_key_hist = (ticker_filter or "").strip().upper()
+    _scope_lbl_hist = ticker_filter if ticker_filter else "všetky tickery"
+    _today_hist = date.today().isoformat()
+    _since_hist = (date.today() - timedelta(days=120)).isoformat()
+    _hist_rows = db.list_portfolio_greek_history(_scope_key_hist, since_date=_since_hist, limit=500)
+
+    hc1, hc2 = st.columns([1, 2])
+    with hc1:
+        _do_snap = st.button(
+            "Zapísať dnešný údaj do grafu",
+            type="primary",
+            key="pf_greek_history_snap",
+            disabled=not has_any,
+            help="Uloží aktuálne APR z Thety (ak ide spočítať), Theta, Delta, Vega. Rovnaký deň = prepis.",
+        )
+    with hc2:
+        st.caption(
+            f"Dnešný dátum: **{_today_hist}** · filter: **{_scope_lbl_hist}** · bodov v okne: **{len(_hist_rows)}**"
+        )
+
+    if _do_snap and has_any:
+        db.upsert_portfolio_greek_history(
+            _scope_key_hist,
+            _today_hist,
+            _apr_for_history,
+            float(display_theta),
+            float(port_delta) if has_bs else None,
+            float(display_vega),
+        )
+        st.success(f"Uložené na {_today_hist} (scope: {_scope_lbl_hist}). Predchádzajúci záznam z toho dňa bol nahradený.")
+        st.rerun()
+
+    if _hist_rows:
+        _hx = [r["snapshot_date"] for r in _hist_rows]
+        _y_apr = [r.get("apr_theta_pct") for r in _hist_rows]
+        _y_th = [r.get("theta_usd") for r in _hist_rows]
+        _y_dl = [r.get("delta_usd") for r in _hist_rows]
+        _y_vg = [r.get("vega_usd") for r in _hist_rows]
+
+        _fig_h = make_subplots(
+            rows=4,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.06,
+            subplot_titles=(
+                "1. APR z Thety (%)",
+                "2. Theta ($/deň)",
+                "3. Delta ($)",
+                "4. Vega ($/1%IV)",
+            ),
+        )
+        _fig_h.add_trace(
+            go.Scatter(x=_hx, y=_y_apr, mode="lines+markers", name="APR", line=dict(color="#2ecc71")),
+            row=1,
+            col=1,
+        )
+        _fig_h.add_trace(
+            go.Scatter(x=_hx, y=_y_th, mode="lines+markers", name="Theta", line=dict(color="#3498db")),
+            row=2,
+            col=1,
+        )
+        _fig_h.add_trace(
+            go.Scatter(x=_hx, y=_y_dl, mode="lines+markers", name="Delta", line=dict(color="#9b59b6")),
+            row=3,
+            col=1,
+        )
+        _fig_h.add_trace(
+            go.Scatter(x=_hx, y=_y_vg, mode="lines+markers", name="Vega", line=dict(color="#e67e22")),
+            row=4,
+            col=1,
+        )
+        _fig_h.update_xaxes(title_text="Dátum", row=4, col=1)
+        _fig_h.update_layout(
+            height=920,
+            showlegend=False,
+            margin=dict(l=40, r=20, t=48, b=40),
+            hovermode="x unified",
+        )
+        st.plotly_chart(_fig_h, use_container_width=True)
+        with st.expander("Tabuľka uložených bodov"):
             st.dataframe(
-                pd.DataFrame(greeks_rows),
+                pd.DataFrame(_hist_rows)[
+                    ["snapshot_date", "apr_theta_pct", "theta_usd", "delta_usd", "vega_usd", "saved_at"]
+                ],
                 use_container_width=True,
                 hide_index=True,
-                column_config={
-                    "Strike": st.column_config.NumberColumn(format="$%.0f"),
-                    "Delta $": st.column_config.NumberColumn(format="$%+.0f"),
-                    "Theta $/deň": st.column_config.NumberColumn(format="$%+.2f"),
-                    "Vega $/%IV": st.column_config.NumberColumn(format="$%+.2f"),
-                    "Unrealized P&L": st.column_config.NumberColumn(format="$%+.0f"),
-                },
             )
     else:
-        st.warning("Zadaj **Spot** a **IV** v parametroch hore, aby sa vypočítali Greky.")
-
-    if spot > 0 and iv > 0 and open_trades:
-        st.subheader("Scenárová analýza — P&L pri rôznych cenách podkladu")
-        st.caption(
-            "Očakávaný P&L otvorených nôh, ak by podklad bol na danej úrovni **v deň expirácie** (intrinsic vs. vstupná prémia)."
+        st.info(
+            "Zatiaľ žiadne uložené body. Nastav Spot/IV alebo TWS Greky a klikni **Zapísať dnešný údaj do grafu**."
         )
-        pct_steps = [-20, -15, -10, -7.5, -5, -2.5, 0, +2.5, +5, +7.5, +10, +15, +20]
-        spot_levels = [round(spot * (1 + p / 100), 2) for p in pct_steps]
-        scenario_rows = []
-        for slevel in spot_levels:
-            total_exp = sum(_exp_value(t, slevel) for t in open_trades)
-            pct = (slevel / spot - 1) * 100
-            scenario_rows.append({
-                "Cena podkladu $": slevel,
-                "Zmena %": round(pct, 1),
-                "P&L pri expirácii $": round(total_exp, 0),
-            })
-        df_scen = pd.DataFrame(scenario_rows)
-        fig_scen = go.Figure()
-        colors = ["#2ecc71" if v >= 0 else "#e74c3c" for v in df_scen["P&L pri expirácii $"]]
-        fig_scen.add_trace(go.Bar(
-            x=df_scen["Cena podkladu $"],
-            y=df_scen["P&L pri expirácii $"],
-            marker_color=colors,
-            text=[f"${v:+,.0f}" for v in df_scen["P&L pri expirácii $"]],
-            textposition="outside",
-            hovertemplate="Podklad: $%{x:.2f}<br>P&L: $%{y:+,.0f}<extra></extra>",
-        ))
-        fig_scen.add_vline(
-            x=spot, line_dash="dash", line_color="#f39c12",
-            annotation_text=f"Spot ${spot:.0f}", annotation_position="top right",
-        )
-        fig_scen.add_hline(y=0, line_color="gray", line_width=1)
-        fig_scen.update_layout(
-            height=380,
-            xaxis_title="Cena podkladu pri expirácii",
-            yaxis_title="P&L ($)",
-            margin=dict(l=10, r=10, t=30, b=40),
-            showlegend=False,
-        )
-        st.plotly_chart(fig_scen, use_container_width=True)
-        with st.expander("Tabuľka scenárov"):
-            st.dataframe(
-                df_scen,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Cena podkladu $": st.column_config.NumberColumn(format="$%.2f"),
-                    "Zmena %": st.column_config.NumberColumn(format="%.1f%%"),
-                    "P&L pri expirácii $": st.column_config.NumberColumn(format="$%+d"),
-                },
-            )
-    elif open_trades:
-        st.info("Pre graf scenárov zadaj Spot a IV.")
 
 # ─── Tab: Časová os ───────────────────────────────────────────────────────────
 with tab_cas:
@@ -642,7 +822,7 @@ with tab_hist:
 
     if ibkr.is_connected():
         with st.expander("Live pozície z TWS (porovnanie s brokerom)", expanded=False):
-            _lr = ibkr.fetch_positions(with_greeks=False, use_mkt_snapshot=True)
+            _lr = ibkr.fetch_positions(with_greeks=False, use_historical_last=False)
             if _lr.get("error"):
                 st.warning(_lr["error"])
             elif not _lr.get("positions"):

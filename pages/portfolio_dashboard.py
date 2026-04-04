@@ -18,15 +18,12 @@ from core import ibkr
 from core import database as db
 from core.page_context import TWS_DASHBOARD_PAGE, set_tradejournal_page
 from core.portfolio_data import (
-    compute_group_apr_on_maint_margin,
     compute_portfolio_theta_aptr,
-    compute_simple_apr,
     compute_theta_annualized_yield_pct,
     dashboard_group_margin_widget_key,
     group_ibkr_positions_for_dashboard,
     ibkr_aggregates_by_underlying,
     journal_group_id,
-    unrealized_by_journal_ids_for_ib_legs,
 )
 
 db.init_db()
@@ -79,7 +76,7 @@ def _run_dashboard_fetch() -> None:
     """
     _JOB["error"] = None
     try:
-        pos_res = ibkr.fetch_positions(with_greeks=True)
+        pos_res = ibkr.fetch_positions(with_greeks=True, use_historical_last=False)
         if pos_res.get("error"):
             _JOB["error"] = pos_res["error"]
             _JOB["status"] = "error"
@@ -175,6 +172,28 @@ if job_status == "done":
     positions: list = _JOB.get("positions") or []
     account: dict = _JOB.get("account") or {}
 
+    _src_counts: dict[str, int] = {}
+    for _p in positions:
+        _src = str(_p.get("price_source") or "?")
+        _src_counts[_src] = _src_counts.get(_src, 0) + 1
+    if _src_counts:
+        _src_label = {
+            "settlement_close": "Settlement Close (=TWS)",
+            "hist_trades": "Last (historické)",
+            "hist_midpoint": "Midpoint (historické)",
+            "hist_last": "Last (historické)",
+            "portfolio_mark": "Mark (portfólio)",
+            "last": "Last",
+            "mid": "Mid",
+            "mark": "Mark",
+            "close": "Close",
+        }
+        _src_txt = ", ".join(
+            f"{_src_label.get(k, k)}: {v}"
+            for k, v in sorted(_src_counts.items(), key=lambda x: (-x[1], x[0]))
+        )
+        st.info(f"Zdroj cien pri poslednom načítaní: {_src_txt}")
+
     # Záloha: staršie sedenia mali objednávky None a načítali sa pri ďalšom rendri
     if _JOB.get("orders") is None and ibkr.is_connected():
         try:
@@ -207,8 +226,10 @@ if job_status == "done":
     buying_pwr = account.get("buying_power")       or _db_margin.get("buying_power", 0)
     maint_mrg  = account.get("maintenance_margin") or 0
 
-    opts   = [p for p in positions if p.get("sec_type") == "OPT"]
+    opts   = [p for p in positions if p.get("sec_type") in ("OPT", "FOP")]
     stocks = [p for p in positions if p.get("sec_type") == "STK"]
+    futs   = [p for p in positions if p.get("sec_type") == "FUT"]
+    other  = [p for p in positions if p.get("sec_type") not in ("OPT", "FOP", "STK", "FUT")]
 
     unreal_pnl = sum(float(p.get("unrealized_pnl") or 0) for p in positions)
     real_pnl   = sum(float(p.get("realized_pnl")   or 0) for p in positions)
@@ -279,10 +300,10 @@ if job_status == "done":
             f"${mkt_val:,.2f}",
         )
 
+    _sec_types_in = sorted(set(p.get("sec_type", "?") for p in positions))
     st.caption(
-        "Číslo **Unrealized P/L** vyššie je súčet stĺpca z **všetkých zobrazených riadkov** OPT+STK z API. "
-        "Panel v TWS často ukazuje **iný** súčet (iné produkty, viac účtov, FX, alebo iný stĺpec ako *Unrealized*). "
-        "Rozdiel 10–20 % pri väčšom portfóliu nie je nezvyčajný — porovnaj rovnaký filter účtu a typ riadkov v TWS."
+        f"Unrealized P/L je súčet zo **všetkých** pozícií z API (typy: {', '.join(_sec_types_in) or '—'}). "
+        "Ak TWS ukazuje iný súčet, skontroluj filter účtu a stĺpec *Unrealized P&L* (nie Mark alebo P&L%)."
     )
 
     st.subheader("Podľa podkladu (IBKR)")
@@ -404,17 +425,15 @@ if job_status == "done":
 
     # ── Pozície podľa skupín (denník), marža, APR ──────────────────────────────
     st.subheader("📋 Pozície podľa skupín (denník ↔ TWS)")
-    st.caption(
-        "Cena opcie z **API** sa môže líšiť od TWS (**mark vs Last**) — **Unreal. P/L** na riadku je z IB, ale môže sa líšiť od toho, čo porovnávaš v okne. "
-        "Pre rozhodnutie **či držať** spread je hlavná metrika **Ročný výnos z Θ** a jej **trend**. "
-        "Báza nákladu: **vstupný net debet** (Trade Log) **+ udržiavacia marža** (ak ju zadáš) — čo spread reálne stojí. "
-        "Vzorec: ``(Θ×365 / (net debet + marža)) × 100``; Θ z IB. "
-        "**APR z P&L** (s IB unrealized) je len voliteľné — unrealized vie skresliť, preto je schované nižšie. "
-        "**Udržiavacia marža** z TWS ostáva k dispozícii pre ten voliteľný APR."
+    st.info(
+        "**Hlavná metrika: Ročný výnos z Θ** — nezávisí od trhovej ceny, počíta sa z IB Theta a vstupného net debetu z denníka. "
+        "Trhové ceny a P/L v tabuľke sú **IB mark** (orientačné, môžu sa líšiť od TWS Last)."
     )
 
     def _row_from_ib_position(p: dict) -> dict:
-        is_opt = p.get("sec_type") == "OPT"
+        is_opt = p.get("sec_type") in ("OPT", "FOP")
+        src = p.get("price_source", "")
+        src_label = {"settlement_close": "Settle (=TWS)", "hist_trades": "Last (hist)", "hist_midpoint": "Midpoint (hist)", "hist_last": "Last (hist)", "portfolio_mark": "Mark (portfólio)", "last": "Last", "mid": "Mid", "mark": "Mark", "close": "Close"}.get(src, src)
         return {
             "Ticker": p.get("ticker", ""),
             "Typ": p.get("sec_type", ""),
@@ -424,9 +443,10 @@ if job_status == "done":
             "Expiry": p.get("expiry", "—") if is_opt else "—",
             "Opt. typ": p.get("option_type", "—") if is_opt else "—",
             "Trhová cena": f"${float(p.get('market_price') or 0):.2f}",
+            "Zdroj ceny": src_label,
             "Trhová hodnota": f"${float(p.get('market_value') or 0):,.2f}",
-            "Unreal. P/L": f"${float(p.get('unrealized_pnl') or 0):+,.2f}",
-            "Real. P/L": f"${float(p.get('realized_pnl') or 0):+,.2f}",
+            "Neskutoč. P/L": f"${float(p.get('unrealized_pnl') or 0):+,.2f}",
+            "Skutočný zisk/strata": f"${float(p.get('realized_pnl') or 0):+,.2f}",
             "Delta": f"{p['delta']:+.3f}" if p.get("delta") else "—",
             "Theta": f"{p['theta']:+.4f}" if p.get("theta") else "—",
             "Vega": f"{p['vega']:+.4f}" if p.get("vega") else "—",
@@ -445,7 +465,7 @@ if job_status == "done":
                 st.session_state[_wk] = float(_margins.get(_gid, 0.0) or 0.0)
 
             with st.expander(
-                f"{_gid} · {len(_plist)} IB · Unreal Σ ${_sum_u:+,.0f} · MV Σ ${_sum_mv:+,.0f}",
+                f"{_gid} · {len(_plist)} pozíc. v TWS",
                 expanded=(_idx == 0),
             ):
                 st.number_input(
@@ -458,11 +478,27 @@ if job_status == "done":
                 )
                 _mval = float(st.session_state.get(_wk, 0) or 0)
                 _open_legs_g = [t for t in _legs_g if t.get("status") == "Open"]
+
+                # Ručná korekcia Theta z TWS
+                _twk = f"pf_dash_theta_override_{_gid}"
+                _theta_ov = st.number_input(
+                    "Theta z TWS ($/deň) — 0 = použi IB API",
+                    value=float(st.session_state.get(_twk, 0.0)),
+                    step=0.5,
+                    format="%.2f",
+                    key=_twk,
+                    help="Zadaj súčet Theta z TWS pre túto skupinu ak sa líši od IB API (napr. +8.50). "
+                         "Nechaj 0 pre automatickú hodnotu z IB.",
+                )
+
                 _theta_y = compute_theta_annualized_yield_pct(
-                    _open_legs_g, _plist, maintenance_margin_usd=_mval
+                    _open_legs_g, _plist,
+                    maintenance_margin_usd=_mval,
+                    theta_override_usd=_theta_ov,
                 )
 
                 if _theta_y is not None:
+                    _th_src_label = "manuál TWS" if _theta_y.get("theta_source") == "manual" else "IB API"
                     st.metric(
                         "Ročný výnos z Θ (náklad: net debet + marža)",
                         f"{_theta_y['yield_pct']:+.1f} %",
@@ -472,19 +508,22 @@ if job_status == "done":
                     _nd = float(_theta_y["net_debit_usd"])
                     _mm = float(_theta_y["maintenance_margin_usd"])
                     _cb = float(_theta_y["capital_basis_usd"])
+                    _th_ib = float(_theta_y.get("theta_per_day_ib") or 0)
                     if _mm >= 1.0:
                         st.caption(
-                            f"Θ **${_theta_y['theta_per_day']:+.2f}**/deň (IB) · náklad **${_nd:,.0f}** net debet + **${_mm:,.0f}** marža "
-                            f"= **${_cb:,.0f}** (menovateľ výnosu z Θ)."
+                            f"Θ **${_theta_y['theta_per_day']:+.2f}**/deň ({_th_src_label})"
+                            + (f" · IB API: ${_th_ib:+.2f}" if _theta_y.get("theta_source") == "manual" else "")
+                            + f" · náklad **${_nd:,.0f}** net debet + **${_mm:,.0f}** marža = **${_cb:,.0f}**"
                         )
                     else:
                         st.caption(
-                            f"Θ **${_theta_y['theta_per_day']:+.2f}**/deň (IB) · menovateľ zatiaľ len **net debet ${_nd:,.0f}** — "
-                            f"doplň **udržiavaciu maržu** vyššie pre bázu *net debet + marža*."
+                            f"Θ **${_theta_y['theta_per_day']:+.2f}**/deň ({_th_src_label})"
+                            + (f" · IB API: ${_th_ib:+.2f}" if _theta_y.get("theta_source") == "manual" else "")
+                            + f" · menovateľ zatiaľ len **net debet ${_nd:,.0f}** — doplň **maržu** vyššie."
                         )
-                    if _theta_y.get("incomplete_theta"):
+                    if _theta_y.get("incomplete_theta") and _theta_y.get("theta_source") != "manual":
                         st.caption(
-                            "⚠️ Aspoň jedna opčná noha v TWS nemá Theta — súčet Θ môže byť neúplný."
+                            "⚠️ Aspoň jedna opčná noha v TWS nemá Theta — zadaj hodnotu manuálne vyššie."
                         )
                     if do_refresh:
                         db.append_group_apr_snapshot(
@@ -519,43 +558,14 @@ if job_status == "done":
                         "zosúladenie s TWS a že IB posiela **Theta** pre opcie."
                     )
 
-                _umap = unrealized_by_journal_ids_for_ib_legs(_legs_g, _plist)
-                _apr = compute_group_apr_on_maint_margin(_legs_g, _sum_u, _mval)
-                _apr_prem = (
-                    compute_simple_apr(_legs_g, _umap) if (_apr is None and _legs_g) else None
-                )
-                with st.expander(
-                    "Nepovinné: APR z P&L (vrátane IB unrealized) — môže zavádzať",
-                    expanded=False,
-                ):
-                    st.caption(
-                        "Tento APR používa **nerealizovaný P&L z IB** a realizovaný z denníka. "
-                        "Pre úvahu *či držať kvôli času* je spoľahlivejší **Ročný výnos (Theta)** vyššie."
-                    )
-                    if _apr is not None:
-                        st.metric("APR (na udrž. marži)", f"{_apr['apr_pct']:+.1f} %")
-                        st.caption(
-                            f"Vzorec: **P&L** / marža × 365/dní × 100 — čitateľ je **zisk/strata** (denník + IB unreal.), "
-                            f"**nie** Theta. Ak je číslo zhodné s **Ročný výnos z Θ** vyššie, ide o **náhodu**."
-                        )
-                        st.caption(
-                            f"P&L **${_apr['pnl']:+,.0f}** (Rlz denník ${_apr['realized']:+,.0f} + IB unreal. ${_apr['unreal_ib']:+,.0f}) "
-                            f"· **{_apr['days']}** dní · marža **${_mval:,.0f}**"
-                        )
-                    elif _apr_prem is not None:
-                        st.metric("APR (orient., báza prémia)", f"{_apr_prem['apr_pct']:+.1f} %")
-                        st.caption(
-                            f"P&L **${_apr_prem['pnl']:+,.0f}** · báza **${_apr_prem['basis']:,.0f}** · **{_apr_prem['days']}** dní."
-                        )
-                        if _apr_prem.get("short_horizon"):
-                            st.caption("Krátky horizont: annualizácia je hlučná.")
-                    elif _mval >= 1:
-                        st.caption("APR z P&L: chýbajú dáta (denník / dátum vstupu).")
-                    else:
-                        st.caption("Zadaj maržu vyššie, ak chceš tento orientačný APR.")
-
                 if _plist:
-                    st.table(pd.DataFrame([_row_from_ib_position(p) for p in _plist]))
+                    _df_pos = pd.DataFrame([_row_from_ib_position(p) for p in _plist])
+                    # Skry stĺpce s P/L — sú IB mark a môžu zavádzať
+                    _cols_show = [c for c in _df_pos.columns if c not in ("Neskutoč. P/L", "Skutočný zisk/strata", "Trhová hodnota", "Zdroj ceny")]
+                    st.table(_df_pos[_cols_show])
+                    with st.expander("Orientačné: IB mark ceny a P/L (môžu sa líšiť od TWS)", expanded=False):
+                        st.caption("Trhová cena = **IB mark** (mid bid/ask alebo model). Unrealized P/L je vypočítaný IB z tejto ceny — **nie** z TWS Last.")
+                        st.table(_df_pos[["Ticker", "Trhová cena", "Trhová hodnota", "Neskutoč. P/L"]])
                 else:
                     st.caption("Žiadne IB riadky priradené k tejto skupine.")
 

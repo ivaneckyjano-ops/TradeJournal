@@ -497,6 +497,7 @@ def compute_theta_annualized_yield_pct(
     open_journal_legs: list[dict],
     ib_positions_for_group: list[dict],
     maintenance_margin_usd: float = 0.0,
+    theta_override_usd: float = 0.0,
 ) -> Optional[dict]:
     """
     Ročný výnos (%) podľa časového rozpadu: ``(Θ × 365 / báza) × 100``.
@@ -536,11 +537,16 @@ def compute_theta_annualized_yield_pct(
         if not any_th:
             return None
 
-    theta_day, inc = group_net_theta_usd_per_day(ib_positions_for_group)
+    theta_day_ib, inc = group_net_theta_usd_per_day(ib_positions_for_group)
+    # Ručný override z TWS má prednosť pred IB API hodnotou
+    theta_day = float(theta_override_usd) if theta_override_usd != 0.0 else theta_day_ib
+    theta_source = "manual" if theta_override_usd != 0.0 else "ib"
     yld = (theta_day * 365.0 / capital_basis) * 100.0
     return {
         "yield_pct": yld,
         "theta_per_day": theta_day,
+        "theta_per_day_ib": theta_day_ib,
+        "theta_source": theta_source,
         "net_debit_usd": net_debit,
         "maintenance_margin_usd": mm,
         "capital_basis_usd": capital_basis,
