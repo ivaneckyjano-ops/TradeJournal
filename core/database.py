@@ -723,8 +723,16 @@ def _migrate_portfolio_greek_history(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_pgh_scope_date ON portfolio_greek_history (ticker_scope, snapshot_date)"
     )
+    _pgh_cols = {row[1] for row in conn.execute("PRAGMA table_info(portfolio_greek_history)").fetchall()}
+    if "capital_basis_usd" not in _pgh_cols:
+        conn.execute("ALTER TABLE portfolio_greek_history ADD COLUMN capital_basis_usd REAL")
     conn.commit()
     conn.close()
+
+
+PORTFOLIO_GREEKS_APR_BACKUP_KEY = "portfolio_greeks_apr_backup"
+PORTFOLIO_TOTAL_TRADING_CAPITAL_KEY = "portfolio_total_trading_capital_usd"
+PORTFOLIO_CAPITAL_RESERVE_PCT_KEY = "portfolio_capital_reserve_pct"
 
 
 def upsert_portfolio_greek_history(
@@ -734,6 +742,7 @@ def upsert_portfolio_greek_history(
     theta_usd: Optional[float],
     delta_usd: Optional[float],
     vega_usd: Optional[float],
+    capital_basis_usd: Optional[float] = None,
 ) -> None:
     """
     Jedna snímka na kalendárny deň (``snapshot_date`` YYYY-MM-DD) a ``ticker_scope``.
@@ -745,16 +754,26 @@ def upsert_portfolio_greek_history(
         conn.execute(
             """
             INSERT INTO portfolio_greek_history
-            (ticker_scope, snapshot_date, apr_theta_pct, theta_usd, delta_usd, vega_usd, saved_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            (ticker_scope, snapshot_date, apr_theta_pct, theta_usd, delta_usd, vega_usd, saved_at, capital_basis_usd)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(ticker_scope, snapshot_date) DO UPDATE SET
                 apr_theta_pct = excluded.apr_theta_pct,
                 theta_usd = excluded.theta_usd,
                 delta_usd = excluded.delta_usd,
                 vega_usd = excluded.vega_usd,
-                saved_at = excluded.saved_at
+                saved_at = excluded.saved_at,
+                capital_basis_usd = excluded.capital_basis_usd
             """,
-            (scope, snapshot_date, apr_theta_pct, theta_usd, delta_usd, vega_usd, saved_at),
+            (
+                scope,
+                snapshot_date,
+                apr_theta_pct,
+                theta_usd,
+                delta_usd,
+                vega_usd,
+                saved_at,
+                capital_basis_usd,
+            ),
         )
         conn.commit()
 

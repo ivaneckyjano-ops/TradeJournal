@@ -11,6 +11,12 @@ from core import ibkr
 from core import agent as ai_agent
 from core.page_context import set_tradejournal_page
 from core.portfolio_data import compute_spread_model_theta_aptr_pct
+from core.spread_mentor import (
+    analyze_calendar_mentor,
+    analyze_diagonal_mentor,
+    mentor_calendar_rows,
+    mentor_comparison_rows,
+)
 
 db.init_db()
 set_tradejournal_page("spread_builder")
@@ -525,6 +531,48 @@ for i, leg in enumerate(legs):
 if st.button("🗑 Vymazať všetky nohy", key="sb_clear_all"):
     st.session_state["sb_legs"] = []
     st.rerun()
+
+_sb_mentor = analyze_diagonal_mentor(legs)
+_sb_calendar = analyze_calendar_mentor(legs)
+with st.expander(
+    "Mentor — porovnanie s konzervatívnym nastavením (kalendár / diagonál / KO)",
+    expanded=bool(_sb_mentor or _sb_calendar),
+):
+    st.caption(
+        "**Kalendár** (rovnaký strike & call/put): short **25–45 DTE**, long **50–150 DTE**, rozstup **0,5–2,5 mes.** "
+        "**Diagonál / KO:** short **30–45 DTE**, long **60–120 DTE**, rozptyl **1–3 mes.** "
+        "Orientačné okná — nie investičná rada."
+    )
+    if _sb_calendar is None and _sb_mentor is None:
+        st.info(
+            "**Diagonál:** aspoň jedna **Short** a jedna **Long** s expiráciou (YYYYMMDD). "
+            "**Kalendárny spread:** navyše rovnaký **strike** a typ opcie (Call/Put) na oboch stranách. "
+            "Pri jednej nohe alebo iba long/iba short mentor nehodnotí."
+        )
+    if _sb_calendar is not None:
+        st.markdown("##### Kalendárny spread (rovnaký strike)")
+        st.dataframe(
+            pd.DataFrame(mentor_calendar_rows(_sb_calendar)),
+            use_container_width=True,
+            hide_index=True,
+            column_config={"Stav": st.column_config.TextColumn()},
+        )
+        st.markdown("##### Charakteristika (kalendár)")
+        for _line in _sb_calendar.summary_lines:
+            st.markdown(f"- {_line}")
+    if _sb_mentor is not None:
+        if _sb_calendar is not None:
+            st.markdown("---")
+        st.markdown("##### Diagonál / KO (celý setup — všetky nohy)")
+        st.dataframe(
+            pd.DataFrame(mentor_comparison_rows(_sb_mentor)),
+            use_container_width=True,
+            hide_index=True,
+            column_config={"Stav": st.column_config.TextColumn()},
+        )
+        st.markdown("##### Charakteristika (diagonál)")
+        for _line in _sb_mentor.summary_lines:
+            st.markdown(f"- {_line}")
 
 st.divider()
 

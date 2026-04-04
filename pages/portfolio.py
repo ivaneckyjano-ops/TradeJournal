@@ -5,6 +5,7 @@ Záložky: skupiny a expozícia, Greky a APR z Thety, časová os (DTE), histór
 """
 from __future__ import annotations
 
+import json
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -21,6 +22,44 @@ from core.probability import bs_price, calc_greeks
 
 db.init_db()
 set_tradejournal_page("portfolio_cc")
+
+if "pf_total_trading_capital_usd" not in st.session_state:
+    try:
+        st.session_state["pf_total_trading_capital_usd"] = float(
+            db.get_setting(db.PORTFOLIO_TOTAL_TRADING_CAPITAL_KEY, "0") or 0
+        )
+    except ValueError:
+        st.session_state["pf_total_trading_capital_usd"] = 0.0
+if "pf_capital_reserve_pct" not in st.session_state:
+    try:
+        _rp = float(db.get_setting(db.PORTFOLIO_CAPITAL_RESERVE_PCT_KEY, "20") or 20)
+        st.session_state["pf_capital_reserve_pct"] = min(90.0, max(0.0, _rp))
+    except ValueError:
+        st.session_state["pf_capital_reserve_pct"] = 20.0
+
+# Programová zmena widgetov (záloha, TWS) — až na ďalšom behu PRED vykreslením Spot/IV.
+_pf_restore = st.session_state.pop("_pf_pending_session_patch", None)
+if isinstance(_pf_restore, dict) and _pf_restore:
+    for _rk, _rv in _pf_restore.items():
+        _rks = str(_rk)
+        if _rks.startswith("_"):
+            continue
+        try:
+            if _rks == "pf_ticker":
+                st.session_state[_rks] = "" if _rv is None else str(_rv)
+            elif _rks.startswith("pf_spot") or _rks.startswith("pf_iv") or _rks in (
+                "pf_tws_theta_override",
+                "pf_tws_vega_override",
+                "pf_tws_delta_override",
+                "pf_apr_theta_margin",
+                "pf_total_trading_capital_usd",
+                "pf_capital_reserve_pct",
+            ):
+                st.session_state[_rks] = float(_rv) if _rv is not None else 0.0
+            else:
+                st.session_state[_rks] = _rv
+        except (TypeError, ValueError):
+            st.session_state[_rks] = _rv
 
 st.title("Portfolio — analýza otvorenej knihy")
 st.caption(
@@ -102,6 +141,36 @@ with st.expander("Parametre výpočtu (spot, IV, filter)", expanded=True):
         key="pf_ticker",
     ).upper().strip()
 
+    st.markdown("**Celkový obchodný kapitál**")
+    _cap_c1, _cap_c2 = st.columns(2)
+    with _cap_c1:
+        st.number_input(
+            "Celkový obchodný kapitál (USD)",
+            min_value=0.0,
+            step=500.0,
+            format="%.0f",
+            key="pf_total_trading_capital_usd",
+            help="Všetok kapitál, ktorý považuješ za určený na obchodovanie (pre percentá nasadenia).",
+        )
+    with _cap_c2:
+        st.number_input(
+            "Rezerva — neobchodovaný podiel (%)",
+            min_value=0.0,
+            max_value=90.0,
+            step=5.0,
+            format="%.0f",
+            key="pf_capital_reserve_pct",
+            help="Časť kapitálu má ostať mimo (buffer). Použiteľné = kapitál × (1 − rezerva/100).",
+        )
+    db.set_setting(
+        db.PORTFOLIO_TOTAL_TRADING_CAPITAL_KEY,
+        str(float(st.session_state.get("pf_total_trading_capital_usd", 0) or 0)),
+    )
+    db.set_setting(
+        db.PORTFOLIO_CAPITAL_RESERVE_PCT_KEY,
+        str(float(st.session_state.get("pf_capital_reserve_pct", 20) or 0)),
+    )
+
     _tickers_to_show = [ticker_filter] if ticker_filter else _unique_tickers
 
     if not _tickers_to_show:
@@ -157,6 +226,15 @@ if _any_spot:
 else:
     _model_lbl = "bez BS — zadaj Spot a IV pre odhad nerealizovaného P&L (inak 0)."
 st.caption(f"**Aktívny filter:** {_tick_lbl}. **Odhad otvorených:** {_model_lbl}")
+
+_total_cap_usd = float(st.session_state.get("pf_total_trading_capital_usd", 0) or 0)
+_reserve_pct_pf = float(st.session_state.get("pf_capital_reserve_pct", 20) or 0)
+_usable_cap_pf = _total_cap_usd * max(0.0, 1.0 - min(0.95, _reserve_pct_pf / 100.0))
+if _total_cap_usd >= 1.0:
+    st.caption(
+        f"**Obchodný kapitál:** {_total_cap_usd:,.0f} USD · **rezerva** {_reserve_pct_pf:.0f} % · "
+        f"**použiteľné** {_usable_cap_pf:,.0f} USD (po odrátaní bufferu)."
+    )
 
 # ─── Dáta ─────────────────────────────────────────────────────────────────────
 all_trades = db.get_all_trades()
@@ -472,9 +550,93 @@ with tab_greky:
     else:
         st.caption("Greky a APR z Thety pre **všetky** otvorené nohy v denníku (Spot + IV podľa tickera vyššie).")
 
-    # ── Korekcia Theta / Vega z TWS ──────────────────────────────────────────
+    st.markdown("**Záloha parametrov a TWS**")
+    st.caption(
+        "Uloží / obnoví Spot, IV, filter, maržu a ručné Greky z **databázy**. **Natiahnuť z TWS** doplní Greky "
+        "(a ceny akcií ako Spot) z IBKR pre aktívny filter."
+    )
+    _zb1, _zb2, _zb3 = st.columns(3)
+    with _zb1:
+        if st.button("Uložiť údaje do zálohy", key="pf_greeks_save_backup", type="secondary"):
+            _bak: dict[str, object] = {}
+            for _k in list(st.session_state.keys()):
+                _ks = str(_k)
+                if _ks == "pf_ticker" or _ks.startswith("pf_spot") or _ks.startswith("pf_iv"):
+                    _bak[_ks] = st.session_state[_k]
+                elif _ks in (
+                    "pf_tws_theta_override",
+                    "pf_tws_vega_override",
+                    "pf_tws_delta_override",
+                    "pf_apr_theta_margin",
+                    "pf_total_trading_capital_usd",
+                    "pf_capital_reserve_pct",
+                ):
+                    _bak[_ks] = st.session_state[_k]
+            db.set_setting(db.PORTFOLIO_GREEKS_APR_BACKUP_KEY, json.dumps(_bak))
+            st.success("Parametre uložené do zálohy (databáza).")
+    with _zb2:
+        if st.button("Natiahnuť zo zálohy", key="pf_greeks_load_backup"):
+            _raw_b = db.get_setting(db.PORTFOLIO_GREEKS_APR_BACKUP_KEY, "{}")
+            try:
+                _loaded = json.loads(_raw_b)
+                if not isinstance(_loaded, dict) or not _loaded:
+                    st.warning("Záloha je prázdna — najprv ulož parametre.")
+                else:
+                    st.session_state["_pf_pending_session_patch"] = _loaded
+                    st.success("Parametre načítané zo zálohy.")
+                    st.rerun()
+            except json.JSONDecodeError:
+                st.error("Poškodená záloha v databáze.")
+    with _zb3:
+        _tws_ok = ibkr.is_connected()
+        if st.button(
+            "Natiahnuť Greky z TWS",
+            key="pf_greeks_pull_tws",
+            disabled=not _tws_ok,
+            help="Potrebné pripojenie IBKR. Sčíta Θ, Δ, Vega z opcií v portfóliu (podľa filtra).",
+        ):
+            _pres = ibkr.fetch_positions(with_greeks=True)
+            if _pres.get("error"):
+                st.error(_pres["error"])
+            else:
+                _tfu = ticker_filter.upper() if ticker_filter else None
+                _t_th = _t_vg = _t_dl = 0.0
+                for _p in _pres.get("positions", []):
+                    if _p.get("sec_type") not in ("OPT", "FOP"):
+                        continue
+                    if _tfu and str(_p.get("ticker", "")).upper() != _tfu:
+                        continue
+                    _sgn = -1 if _p.get("leg_type") == "Short" else 1
+                    _q = float(_p.get("contracts") or 1)
+                    if _p.get("theta") is not None:
+                        _t_th += float(_p["theta"]) * _sgn * _q * 100.0
+                    if _p.get("vega") is not None:
+                        _t_vg += float(_p["vega"]) * _sgn * _q * 100.0
+                    if _p.get("delta") is not None:
+                        _t_dl += float(_p["delta"]) * _sgn * _q * 100.0
+                _tw_patch: dict[str, object] = {
+                    "pf_tws_theta_override": round(_t_th, 2),
+                    "pf_tws_vega_override": round(_t_vg, 2),
+                    "pf_tws_delta_override": round(_t_dl, 2),
+                }
+                for _p in _pres.get("positions", []):
+                    if _p.get("sec_type") != "STK":
+                        continue
+                    _sym = str(_p.get("ticker", "")).upper()
+                    if not _sym:
+                        continue
+                    if _tfu and _sym != _tfu:
+                        continue
+                    _mp = _p.get("market_price")
+                    if _mp is not None and float(_mp) > 0:
+                        _tw_patch[f"pf_spot_{_sym}"] = float(_mp)
+                st.session_state["_pf_pending_session_patch"] = _tw_patch
+                st.success("Greky a Spot akcií načítané z TWS.")
+                st.rerun()
+
+    # ── Korekcia Theta / Vega / Delta z TWS ──────────────────────────────────
     st.caption("Zadaj hodnoty z TWS ak sa líšia od Black-Scholes (0 = použije BS výpočet).")
-    ov_col1, ov_col2, ov_col3 = st.columns([2, 2, 1])
+    ov_col1, ov_col2, ov_col3, ov_col4 = st.columns([2, 2, 2, 1])
     with ov_col1:
         tws_theta_override = st.number_input(
             "Theta z TWS ($/deň)",
@@ -495,33 +657,47 @@ with tab_greky:
             help="Súčet Vega z TWS pre všetky otvorené pozície.",
         )
     with ov_col3:
-        if st.button("Vymazať", key="pf_tws_greek_reset", help="Vráti na BS hodnoty"):
+        tws_delta_override = st.number_input(
+            "Delta z TWS ($)",
+            value=float(st.session_state.get("pf_tws_delta_override", 0.0)),
+            step=10.0,
+            format="%.0f",
+            key="pf_tws_delta_override",
+            help="Súčet Delta v USD z TWS (alebo nechaj 0 pre Black–Scholes).",
+        )
+    with ov_col4:
+        if st.button("Vymazať", key="pf_tws_greek_reset", help="Vráti Greky na BS"):
             st.session_state["pf_tws_theta_override"] = 0.0
             st.session_state["pf_tws_vega_override"] = 0.0
+            st.session_state["pf_tws_delta_override"] = 0.0
             st.rerun()
 
     # Použi TWS hodnoty ak sú zadané, inak BS
     has_tws_theta = tws_theta_override != 0.0
     has_tws_vega  = tws_vega_override  != 0.0
+    has_tws_delta = tws_delta_override != 0.0
     display_theta = tws_theta_override if has_tws_theta else port_theta
     display_vega  = tws_vega_override  if has_tws_vega  else port_vega
+    display_delta = tws_delta_override if has_tws_delta else port_delta
     theta_src = "TWS" if has_tws_theta else "BS"
     vega_src  = "TWS" if has_tws_vega  else "BS"
+    delta_src = "TWS" if has_tws_delta else "BS"
 
     # Metriky — BS riadky môžu byť aj pri viacerých tickeroch (globálny spot môže byť 0)
     has_bs    = bool(greeks_rows)
-    has_any   = has_bs or has_tws_theta or has_tws_vega
+    has_any   = has_bs or has_tws_theta or has_tws_vega or has_tws_delta
 
     if has_any:
         g1, g2, g3 = st.columns(3)
-        if has_bs:
+        if has_bs or has_tws_delta:
             g1.metric(
-                "Celková Delta ($)",
-                f"${port_delta:+,.0f}",
-                help="Smerová expozícia pri zadanom spote a IV (BS).",
+                f"Celková Delta ($) [{delta_src}]",
+                f"${display_delta:+,.0f}",
+                delta=f"BS: ${port_delta:+,.0f}" if (has_tws_delta and has_bs) else None,
+                help="Smerová expozícia — TWS alebo Black–Scholes.",
             )
         else:
-            g1.caption("Delta: zadaj Spot a IV")
+            g1.caption("Delta: zadaj Spot a IV alebo TWS")
 
         g2.metric(
             f"Celková Theta ($/deň) [{theta_src}]",
@@ -589,10 +765,28 @@ with tab_greky:
         ac1.metric("Ročný výnos z Θ", f"{_apr_theta_pct:+.1f} %")
         ac2.metric("Θ (použitá)", f"${display_theta:+,.2f}/deň", help=f"Zdroj: {theta_src}")
         ac3.metric("Báza nákladu", f"${_basis_th:,.0f}")
-        st.caption(
+        _cap_lines = [
             f"Net debet z denníka: **{float(_net_debit_pf):,.0f}** USD"
-            + (f" · marža **{float(_mm_apr_th):,.0f}** USD" if float(_mm_apr_th or 0) >= 1.0 else " · marža 0 (menovateľ = len net debet)")
-        )
+            + (
+                f" · marža **{float(_mm_apr_th):,.0f}** USD"
+                if float(_mm_apr_th or 0) >= 1.0
+                else " · marža 0 (menovateľ = len net debet)"
+            )
+        ]
+        if _total_cap_usd >= 1.0:
+            _pct_tot = (_basis_th / _total_cap_usd) * 100.0
+            _cap_lines.append(
+                f"**Nasadenie voči celkovému kapitálu:** {_pct_tot:.1f} % (báza / {_total_cap_usd:,.0f} USD)."
+            )
+            if _usable_cap_pf >= 1.0:
+                _pct_use = (_basis_th / _usable_cap_pf) * 100.0
+                _cap_lines.append(
+                    f"**Nasadenie voči použiteľnému** (po rezerve {_reserve_pct_pf:.0f} %): "
+                    f"{_pct_use:.1f} % (báza / {_usable_cap_pf:,.0f} USD)."
+                )
+        st.caption(_cap_lines[0])
+        for _ln in _cap_lines[1:]:
+            st.caption(_ln)
 
     # ── História grafov (APR, Θ, Δ, Vega) ───────────────────────────────────
     _apr_for_history: Optional[float] = None
@@ -607,7 +801,7 @@ with tab_greky:
             _apr_for_history = (display_theta * 365.0 / _b_hist) * 100.0
 
     st.divider()
-    st.subheader("Vývoj v čase — APR, Theta, Delta, Vega")
+    st.subheader("Vývoj v čase — APR, Theta, Delta, Vega, nákladová báza")
     st.caption(
         "Grafy zobrazujú posledných **120 dní** (~4 mesiace). **Jeden záznam na kalendárny deň** "
         "pre aktívny filter — opakované uloženie v ten istý deň **prepíše** predchádzajúci bod."
@@ -618,6 +812,10 @@ with tab_greky:
     _since_hist = (date.today() - timedelta(days=120)).isoformat()
     _hist_rows = db.list_portfolio_greek_history(_scope_key_hist, since_date=_since_hist, limit=500)
 
+    _basis_for_snap: Optional[float] = None
+    if _net_debit_pf is not None and float(_net_debit_pf) > 0:
+        _basis_for_snap = float(_net_debit_pf) + max(0.0, float(_mm_apr_th or 0))
+
     hc1, hc2 = st.columns([1, 2])
     with hc1:
         _do_snap = st.button(
@@ -625,7 +823,7 @@ with tab_greky:
             type="primary",
             key="pf_greek_history_snap",
             disabled=not has_any,
-            help="Uloží aktuálne APR z Thety (ak ide spočítať), Theta, Delta, Vega. Rovnaký deň = prepis.",
+            help="Uloží APR z Thety (ak ide), Theta, Delta, Vega a **základnú nákladovú bázu** (net debet + marža).",
         )
     with hc2:
         st.caption(
@@ -638,8 +836,9 @@ with tab_greky:
             _today_hist,
             _apr_for_history,
             float(display_theta),
-            float(port_delta) if has_bs else None,
+            float(display_delta),
             float(display_vega),
+            _basis_for_snap,
         )
         st.success(f"Uložené na {_today_hist} (scope: {_scope_lbl_hist}). Predchádzajúci záznam z toho dňa bol nahradený.")
         st.rerun()
@@ -650,17 +849,19 @@ with tab_greky:
         _y_th = [r.get("theta_usd") for r in _hist_rows]
         _y_dl = [r.get("delta_usd") for r in _hist_rows]
         _y_vg = [r.get("vega_usd") for r in _hist_rows]
+        _y_bs = [r.get("capital_basis_usd") for r in _hist_rows]
 
         _fig_h = make_subplots(
-            rows=4,
+            rows=5,
             cols=1,
             shared_xaxes=True,
-            vertical_spacing=0.06,
+            vertical_spacing=0.05,
             subplot_titles=(
                 "1. APR z Thety (%)",
                 "2. Theta ($/deň)",
                 "3. Delta ($)",
                 "4. Vega ($/1%IV)",
+                "5. Základná nákladová báza ($)",
             ),
         )
         _fig_h.add_trace(
@@ -683,19 +884,39 @@ with tab_greky:
             row=4,
             col=1,
         )
-        _fig_h.update_xaxes(title_text="Dátum", row=4, col=1)
+        _fig_h.add_trace(
+            go.Scatter(
+                x=_hx,
+                y=_y_bs,
+                mode="lines+markers",
+                name="Báza",
+                line=dict(color="#1abc9c"),
+            ),
+            row=5,
+            col=1,
+        )
+        _fig_h.update_xaxes(title_text="Dátum", row=5, col=1)
         _fig_h.update_layout(
-            height=920,
+            height=1120,
             showlegend=False,
-            margin=dict(l=40, r=20, t=48, b=40),
+            margin=dict(l=40, r=20, t=52, b=40),
             hovermode="x unified",
         )
         st.plotly_chart(_fig_h, use_container_width=True)
         with st.expander("Tabuľka uložených bodov"):
+            _cols_tbl = [
+                "snapshot_date",
+                "apr_theta_pct",
+                "theta_usd",
+                "delta_usd",
+                "vega_usd",
+                "capital_basis_usd",
+                "saved_at",
+            ]
+            _df_h = pd.DataFrame(_hist_rows)
+            _df_show = _df_h[[c for c in _cols_tbl if c in _df_h.columns]]
             st.dataframe(
-                pd.DataFrame(_hist_rows)[
-                    ["snapshot_date", "apr_theta_pct", "theta_usd", "delta_usd", "vega_usd", "saved_at"]
-                ],
+                _df_show,
                 use_container_width=True,
                 hide_index=True,
             )
