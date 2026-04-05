@@ -1,4 +1,6 @@
 import json
+from typing import Optional
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -17,14 +19,24 @@ from core.spread_mentor import (
     mentor_calendar_rows,
     mentor_comparison_rows,
 )
+from core.spread_margin import estimate_spread_margin_usd
+from core.spread_leg_sync import sync_pair_after_edit
+from core.expiration_catalog import (
+    append_expiries_from_text,
+    format_expiry_select_options,
+    get_catalog_expiries,
+    merge_catalog_with_generated,
+    replace_catalog_with_generated,
+    save_catalog_expiries,
+)
 
 db.init_db()
 set_tradejournal_page("spread_builder")
 
 st.title("Spread Builder")
 st.caption(
-    "Poskladaj opčný spread z ľubovoľných nôh a okamžite vidíš P&L, Greeks, max profit/loss a breakeveny. "
-    "**APTR (Θ)** = rovnaká logika ako na TWS dashboarde: Θ×365 / (net debet + marža), Theta z BS modelu."
+    "Poskladaj opčný spread z ľubovoľných nôh alebo začni **šablónou** (kalendár, železný kondor, vertikál) — potom uprav striky, expirácie a ceny. "
+    "P&L, Greeks, max profit/loss a breakeveny. **APTR (Θ)** = rovnaká logika ako na TWS dashboarde: Θ×365 / (net debet + marža), Theta z BS modelu."
 )
 
 
@@ -109,6 +121,66 @@ def _apply_sb_pending_patch() -> None:
         _tk = (st.session_state.get("sb_ticker") or "AMZN").upper()
         _iv = float(st.session_state.get("sb_iv", 0.30))
         _sync_sb_market_widgets(ticker=_tk, spot=float(patch["spot"]), iv=_iv)
+    elif op == "strategy":
+        tpl = patch.get("template")
+        spot = float(patch["spot"])
+        iv = float(patch["iv"])
+        contracts = int(patch.get("contracts", 1) or 1)
+        if tpl == "calendar":
+            r = str(patch.get("right", "C"))
+            if r not in ("C", "P"):
+                r = "C"
+            near, far = _calendar_near_far_expiries()
+            _sk_mode = str(patch.get("calendar_strike", "atm") or "atm")
+            atm_k = _strike_round_spot(spot)
+            if _sk_mode == "otm":
+                _lv = int(patch.get("calendar_otm_levels", 1) or 1)
+                k = _calendar_strike_otm_from_atm_levels(atm_k, r, _lv)
+            else:
+                k = atm_k
+            st.session_state["sb_legs"] = [
+                _make_sb_leg(1, "Short", r, k, near, contracts, spot, iv),
+                _make_sb_leg(2, "Long", r, k, far, contracts, spot, iv),
+            ]
+        elif tpl == "iron_condor":
+            exp = _first_monthly_expiry()
+            atm_k = _strike_round_spot(spot)
+            body = max(1, int(patch.get("ic_body_levels", 2) or 2))
+            wing = max(1, int(patch.get("ic_wing_levels", 2) or 2))
+            short_put_k = atm_k - body * 0.5
+            long_put_k = short_put_k - wing * 0.5
+            short_call_k = atm_k + body * 0.5
+            long_call_k = short_call_k + wing * 0.5
+            long_put_k = max(0.5, long_put_k)
+            short_put_k = max(0.5, short_put_k)
+            if long_put_k >= short_put_k:
+                long_put_k = max(0.5, short_put_k - 0.5)
+            st.session_state["sb_legs"] = [
+                _make_sb_leg(1, "Long", "P", long_put_k, exp, contracts, spot, iv),
+                _make_sb_leg(2, "Short", "P", short_put_k, exp, contracts, spot, iv),
+                _make_sb_leg(3, "Short", "C", short_call_k, exp, contracts, spot, iv),
+                _make_sb_leg(4, "Long", "C", long_call_k, exp, contracts, spot, iv),
+            ]
+        elif tpl == "vertical_call_debit":
+            exp = _first_monthly_expiry()
+            k0 = _strike_round_spot(spot)
+            long_k, short_k = k0 - 2.5, k0 + 2.5
+            if long_k < 0.5:
+                long_k, short_k = 0.5, min(short_k, 5.0)
+            st.session_state["sb_legs"] = [
+                _make_sb_leg(1, "Long", "C", long_k, exp, contracts, spot, iv),
+                _make_sb_leg(2, "Short", "C", short_k, exp, contracts, spot, iv),
+            ]
+        elif tpl == "vertical_put_debit":
+            exp = _first_monthly_expiry()
+            k0 = _strike_round_spot(spot)
+            long_k, short_k = k0 + 2.5, k0 - 2.5
+            if short_k < 0.5:
+                short_k = 0.5
+            st.session_state["sb_legs"] = [
+                _make_sb_leg(1, "Long", "P", long_k, exp, contracts, spot, iv),
+                _make_sb_leg(2, "Short", "P", short_k, exp, contracts, spot, iv),
+            ]
 
 
 # ─── Pomocné funkcie ───────────────────────────────────────────────────────────
@@ -119,6 +191,81 @@ def _dte(expiry_str: str) -> int:
         return max(0, (e - date.today()).days)
     except Exception:
         return 0
+
+
+def _strike_round_spot(spot: float) -> float:
+    """Najbližší strike po 0,5 $ k spotu."""
+    return round(float(spot) * 2.0) / 2.0
+
+
+def _calendar_strike_otm_from_atm_levels(atm_strike: float, right: str, levels: int) -> float:
+    """
+    OTM od ATM striku: každá úroveň = jeden krok 0,5 $ (call smerom hore, put dolu).
+    """
+    n = max(1, min(int(levels), 50))
+    step = 0.5 * n
+    r = str(right).upper()[:1]
+    ak = float(atm_strike)
+    if r == "C":
+        return max(0.5, ak + step)
+    return max(0.5, ak - step)
+
+
+def _calendar_near_far_expiries() -> tuple[str, str]:
+    """Predná a zadná expirácia z katalógu (aspoň ~21 DTE predná, ~28+ dní rozstup)."""
+    exps = get_catalog_expiries(months=18)
+    if not exps:
+        td = date.today()
+        return (td + timedelta(days=30)).strftime("%Y%m%d"), (td + timedelta(days=75)).strftime("%Y%m%d")
+    near = None
+    for e in exps:
+        if _dte(e) >= 21:
+            near = e
+            break
+    if near is None:
+        near = exps[0]
+    dn = _dte(near)
+    far = near
+    for e in exps:
+        if _dte(e) - dn >= 28:
+            far = e
+            break
+    if far == near and len(exps) >= 2:
+        far = exps[-1]
+    return near, far
+
+
+def _first_monthly_expiry(min_dte: int = 28) -> str:
+    exps = get_catalog_expiries(months=18)
+    for e in exps:
+        if _dte(e) >= min_dte:
+            return e
+    return exps[0] if exps else date.today().strftime("%Y%m%d")
+
+
+def _make_sb_leg(
+    leg_id: int,
+    leg_type: str,
+    right: str,
+    strike: float,
+    expiry: str,
+    contracts: int,
+    spot: float,
+    iv: float,
+) -> dict:
+    dte = max(1, _dte(expiry))
+    ep = bs_price(spot, strike, dte, iv, right)
+    ep = round(max(0.01, ep or 0.5), 2)
+    return {
+        "id": leg_id,
+        "leg_type": leg_type,
+        "right": right,
+        "strike": float(strike),
+        "expiry": expiry,
+        "contracts": int(contracts),
+        "entry_price": ep,
+        "iv": float(iv),
+    }
 
 
 def _leg_greeks(leg: dict, spot: float) -> dict:
@@ -198,6 +345,58 @@ with st.container():
                 st.rerun()
             else:
                 st.warning(_res.get("error", "Spot nenájdený"))
+
+# ─── Centrálny katalóg expirácií ───────────────────────────────────────────────
+with st.expander("📅 Centrálny katalóg expirácií (výber v celom Spread Builderi)", expanded=False):
+    st.caption(
+        "Jeden zoznam **YYYYMMDD** pre **Pridať nohu**, **úpravu nôh** a automatické posuny kalendára. "
+        "Kým nič neuložíš, používa sa generátor (piatky + 3. piatok). Dátumy z TWS, ktoré generátor nemá, sem **doplň**."
+    )
+    _cat_now = get_catalog_expiries()
+    st.metric("Počet dátumov v katalógu", len(_cat_now))
+    _ta_add = st.text_area(
+        "Pridať expirácie (YYYYMMDD alebo YYYY-MM-DD, jeden riadok = jeden dátum)",
+        height=88,
+        key="sb_exp_cat_add_lines",
+        placeholder="20260522\n20260619",
+    )
+    _c1, _c2, _c3, _c4 = st.columns(4)
+    with _c1:
+        if st.button("➕ Pridať riadky do katalógu", key="sb_exp_cat_btn_append"):
+            if (_ta_add or "").strip():
+                append_expiries_from_text(_ta_add, months=18)
+                st.success("Doplnené.")
+                st.rerun()
+            else:
+                st.warning("Nič na pridanie.")
+    with _c2:
+        if st.button("⧉ Zlúčiť s generovaným", key="sb_exp_cat_btn_merge"):
+            merge_catalog_with_generated(months=18)
+            st.success("Zlúčené s generovaným zoznamom.")
+            st.rerun()
+    with _c3:
+        if st.button("🔁 Nahradiť generovaným", key="sb_exp_cat_btn_replace"):
+            replace_catalog_with_generated(months=18)
+            st.success("Katalóg = len generované piatky / mesačné.")
+            st.rerun()
+    with _c4:
+        pass
+    _bulk = st.text_area(
+        "Upraviť celý zoznam (prepíše katalóg)",
+        value="\n".join(_cat_now),
+        height=160,
+        key="sb_exp_cat_bulk_edit",
+        help="Jeden YYYYMMDD na riadok. Neplatné riadky sa vyhodia.",
+    )
+    if st.button("💾 Uložiť katalóg z tohto poľa", key="sb_exp_cat_btn_save_bulk"):
+        _lines: list[str] = []
+        for _ln in (_bulk or "").splitlines():
+            _s = _ln.strip().replace("-", "").replace(".", "")
+            if len(_s) == 8 and _s.isdigit():
+                _lines.append(_s)
+        save_catalog_expiries(_lines)
+        st.success("Katalóg uložený.")
+        st.rerun()
 
 # ─── Zoznam uložených nápadov ─────────────────────────────────────────────────
 _ideas_list = db.list_spread_builder_ideas()
@@ -418,6 +617,111 @@ with st.expander("📂 Uložené nápady — vyber, načítaj, ulož, trend APTR
 
 st.divider()
 
+# ─── Šablóny stratégií ─────────────────────────────────────────────────────────
+_SB_STRATEGY_OPTIONS: dict[str, Optional[str]] = {
+    "— Manuálne (bez šablóny) —": None,
+    "Kalendárny spread": "calendar",
+    "Železný kondor (kredit)": "iron_condor",
+    "Vertikálny call spread (debet)": "vertical_call_debit",
+    "Vertikálny put spread (debet)": "vertical_put_debit",
+}
+
+with st.expander("📋 Šablóna stratégie — predvyplnené nohy", expanded=False):
+    st.caption(
+        "1) Zadaj **Ticker**, **Spot** a **IV** vyššie (pre KO napr. spot z IBKR). "
+        "2) Vyber stratégiu. 3) **Nastaviť nohy** — **prepíše celý zoznam nôh**; expirácie berie z **centrálneho katalógu** (predvolene generované piatky / mesačné; vieš ho upraviť v expandéri vyššie). "
+        "Úvodné ceny nôh sú **BS odhad** — v tabuľke ich uprav podľa bid/ask z TWS."
+    )
+    _strat_lbl = st.selectbox(
+        "Stratégia",
+        list(_SB_STRATEGY_OPTIONS.keys()),
+        key="sb_strat_lbl",
+    )
+    _strat_id = _SB_STRATEGY_OPTIONS[_strat_lbl]
+    if _strat_id == "calendar":
+        st.selectbox(
+            "Kalendár — typ opcie",
+            ["C", "P"],
+            key="sb_strat_cal_right",
+            format_func=lambda x: "Call" if x == "C" else "Put",
+        )
+        st.selectbox(
+            "Kalendár — strike",
+            ["atm", "otm"],
+            key="sb_strat_cal_strike",
+            format_func=lambda x: (
+                "ATM — referenčný strike (najbližší k spotu po 0,5 $)"
+                if x == "atm"
+                else "OTM — o koľko úrovní od ATM (nie od spotu)"
+            ),
+            help="ATM = zaokrúhlený strike k spotu. OTM = call smerom nahor / put smerom dolu o N×0,5 $ od tohto ATM striku.",
+        )
+        if st.session_state.get("sb_strat_cal_strike", "atm") == "otm":
+            st.number_input(
+                "OTM — počet úrovní od ATM (1 úroveň = 0,5 $)",
+                min_value=1,
+                max_value=50,
+                value=1,
+                step=1,
+                key="sb_strat_cal_otm_levels",
+                help="Napr. pri ATM 75 a 2 úrovne: call strike 76, put strike 74.",
+            )
+    if _strat_id == "iron_condor":
+        st.caption(
+            "ATM = strike najbližší k spotu (0,5 $). **Telo** = vzdialenosť short put/call od ATM v úrovniach. "
+            "**Krídlo** = šírka medzi short a long na každej strane (tiež v úrovniach × 0,5 $)."
+        )
+        st.number_input(
+            "Kondor — telo (úrovne od ATM k short strike)",
+            min_value=1,
+            max_value=40,
+            value=2,
+            step=1,
+            key="sb_strat_ic_body",
+        )
+        st.number_input(
+            "Kondor — krídlo (úrovne short → long)",
+            min_value=1,
+            max_value=40,
+            value=2,
+            step=1,
+            key="sb_strat_ic_wing",
+        )
+    _strat_k = st.number_input(
+        "Kontrakty (šablóna)",
+        min_value=1,
+        step=1,
+        value=1,
+        key="sb_strat_contracts",
+    )
+    _strat_apply = st.button(
+        "Nastaviť nohy z šablóny",
+        type="primary",
+        key="sb_strat_apply",
+        disabled=_strat_id is None,
+    )
+    if _strat_apply and _strat_id is not None:
+        _payload: dict = {
+            "op": "strategy",
+            "template": _strat_id,
+            "spot": float(st.session_state.get("sb_spot", 100)),
+            "iv": float(st.session_state.get("sb_iv", 0.30)),
+            "contracts": int(_strat_k),
+        }
+        if _strat_id == "calendar":
+            _payload["right"] = str(st.session_state.get("sb_strat_cal_right", "C"))
+            _payload["calendar_strike"] = str(
+                st.session_state.get("sb_strat_cal_strike", "atm")
+            )
+            _payload["calendar_otm_levels"] = int(
+                st.session_state.get("sb_strat_cal_otm_levels", 1) or 1
+            )
+        if _strat_id == "iron_condor":
+            _payload["ic_body_levels"] = int(st.session_state.get("sb_strat_ic_body", 2) or 2)
+            _payload["ic_wing_levels"] = int(st.session_state.get("sb_strat_ic_wing", 2) or 2)
+        st.session_state["_sb_pending_patch"] = _payload
+        st.rerun()
+
 # ─── Panel: Pridanie nohy ──────────────────────────────────────────────────────
 with st.expander("➕ Pridať nohu", expanded=len(st.session_state["sb_legs"]) == 0):
     lc1, lc2, lc3, lc4 = st.columns(4)
@@ -429,17 +733,16 @@ with st.expander("➕ Pridať nohu", expanded=len(st.session_state["sb_legs"]) =
     _add_contr  = lc4.number_input("Kontrakty", min_value=1, step=1, value=1, key="sb_add_contr")
 
     lc5, lc6, lc7 = st.columns(3)
-    # Expirácia – výber z lokálnych alebo manuálne
-    _exps = ibkr.generate_expirations_local(months=12)["expirations"]
-    _exp_fmt = {}
-    for _e in _exps:
-        try:
-            _ed = date(int(_e[:4]), int(_e[4:6]), int(_e[6:]))
-            _exp_fmt[f"{_ed.strftime('%d.%m.%Y')} ({(_ed-date.today()).days}d)"] = _e
-        except Exception:
-            pass
-    _sel_exp_lbl = lc5.selectbox("Expirácia", list(_exp_fmt.keys()), key="sb_add_exp_sel")
-    _add_exp = _exp_fmt.get(_sel_exp_lbl, _exps[0] if _exps else "")
+    _exps = get_catalog_expiries(months=18)
+    _add_lbls, _add_exp_map = format_expiry_select_options(_exps)
+    if not _add_lbls:
+        st.error(
+            "Katalóg expirácií je prázdny — v expandéri „Centrálny katalóg“ použi **Zlúčiť s generovaným**."
+        )
+        _add_exp = ""
+    else:
+        _sel_exp_lbl = lc5.selectbox("Expirácia", _add_lbls, key="sb_add_exp_sel")
+        _add_exp = _add_exp_map[_sel_exp_lbl]
 
     _add_entry = lc6.number_input(
         "Vstupná cena ($)", min_value=0.01, step=0.05,
@@ -456,17 +759,20 @@ with st.expander("➕ Pridať nohu", expanded=len(st.session_state["sb_legs"]) =
     )
 
     if st.button("✅ Pridať nohu", type="primary", key="sb_btn_add"):
-        st.session_state["sb_legs"].append({
-            "id":         len(st.session_state["sb_legs"]) + 1,
-            "leg_type":   _add_lt,
-            "right":      _add_right,
-            "strike":     _add_strike,
-            "expiry":     _add_exp,
-            "contracts":  int(_add_contr),
-            "entry_price": _add_entry,
-            "iv":          _add_leg_iv,
-        })
-        st.rerun()
+        if not _add_exp:
+            st.warning("Najprv doplni katalóg expirácií (expandér „Centrálny katalóg“).")
+        else:
+            st.session_state["sb_legs"].append({
+                "id":         len(st.session_state["sb_legs"]) + 1,
+                "leg_type":   _add_lt,
+                "right":      _add_right,
+                "strike":     _add_strike,
+                "expiry":     _add_exp,
+                "contracts":  int(_add_contr),
+                "entry_price": _add_entry,
+                "iv":          _add_leg_iv,
+            })
+            st.rerun()
 
 # ─── Tabuľka nôh ──────────────────────────────────────────────────────────────
 legs = st.session_state["sb_legs"]
@@ -474,6 +780,10 @@ legs = st.session_state["sb_legs"]
 if not legs:
     st.info("Žiadne nohy. Pridaj aspoň jednu nohu spreadu vyššie.")
     st.stop()
+
+_sb_sync_note = st.session_state.pop("_sb_sync_notice", None)
+if _sb_sync_note:
+    st.success(_sb_sync_note)
 
 st.markdown(f"### Nohy spreadu  ({len(legs)})")
 
@@ -516,6 +826,234 @@ st.dataframe(
         "Vega $":       st.column_config.NumberColumn(format="$%+.2f"),
     },
 )
+
+st.markdown("##### Upraviť nohu")
+_sel_ix = st.selectbox(
+    "Vyber nohu na úpravu",
+    options=list(range(len(legs))),
+    format_func=lambda i: (
+        f"#{i + 1} {legs[i]['leg_type']} "
+        f"{'Call' if legs[i]['right'] == 'C' else 'Put'} K{legs[i]['strike']} "
+        f"{legs[i]['expiry']} ×{legs[i]['contracts']}"
+    ),
+    key="sb_legedit_pick",
+)
+_Le = legs[_sel_ix]
+_edit_cat = get_catalog_expiries(months=18)
+_edit_lbls, _edit_exp_map = format_expiry_select_options(_edit_cat)
+_cur_ex = str(_Le["expiry"]).strip().replace("-", "")
+if _cur_ex and all(_edit_exp_map[lb] != _cur_ex for lb in _edit_lbls):
+    _orphan_lbl = f"⚠ Nie v katalógu — {_cur_ex} (doplň v „Centrálnom katalógu“ alebo zmeň výber)"
+    _edit_lbls = [_orphan_lbl] + _edit_lbls
+    _edit_exp_map = {**{_orphan_lbl: _cur_ex}, **_edit_exp_map}
+_edit_default_lbl = next(
+    (lb for lb in _edit_lbls if _edit_exp_map[lb] == _cur_ex),
+    _edit_lbls[0] if _edit_lbls else "",
+)
+with st.form(f"sb_legedit_{_sel_ix}"):
+    _f1, _f2 = st.columns(2)
+    _e_lt = _f1.selectbox(
+        "Long / Short",
+        ["Long", "Short"],
+        index=0 if _Le["leg_type"] == "Long" else 1,
+    )
+    _e_rt = _f2.selectbox(
+        "Call / Put",
+        ["C", "P"],
+        index=0 if _Le["right"] == "C" else 1,
+        format_func=lambda x: "Call" if x == "C" else "Put",
+    )
+    _e_st = st.number_input(
+        "Strike ($)", min_value=0.5, step=0.5, value=float(_Le["strike"])
+    )
+    if not _edit_lbls:
+        st.error("Katalóg expirácií je prázdny.")
+        _e_ex_lbl = ""
+    else:
+        _e_ex_lbl = st.selectbox(
+            "Expirácia",
+            _edit_lbls,
+            index=_edit_lbls.index(_edit_default_lbl),
+            key=f"sb_legedit_exp_{_sel_ix}",
+        )
+    _f3, _f4 = st.columns(2)
+    _e_ct = _f3.number_input(
+        "Kontrakty", min_value=1, step=1, value=int(_Le["contracts"])
+    )
+    _e_en = _f4.number_input(
+        "Vstupná cena ($)", min_value=0.01, step=0.05, value=float(_Le["entry_price"])
+    )
+    _e_iv = st.number_input(
+        "IV (0.30 = 30 %)",
+        min_value=0.01,
+        max_value=5.0,
+        step=0.01,
+        value=float(_Le.get("iv") or _iv_val),
+    )
+    st.checkbox(
+        "Po uložení **zosúladiť druhú nohu** — kalendár: rovnaký strike + expirácie podľa mentora; "
+        "diagonál / vertikál: zachovaný rozostup strikov (v $)",
+        value=True,
+        key="sb_legedit_sync_pair",
+    )
+    if st.form_submit_button("💾 Uložiť zmeny na tejto nohe"):
+        _ex_ok = bool(_edit_lbls) and bool(_e_ex_lbl)
+        _ex_norm = _edit_exp_map.get(_e_ex_lbl, "").strip().replace("-", "") if _ex_ok else ""
+        if not _ex_ok:
+            st.error("Vyber expiráciu z katalógu.")
+        elif len(_ex_norm) != 8 or not _ex_norm.isdigit():
+            st.error("Neplatná expirácia.")
+            _ex_ok = False
+        else:
+            try:
+                date(int(_ex_norm[:4]), int(_ex_norm[4:6]), int(_ex_norm[6:8]))
+            except ValueError:
+                st.error("Neplatný dátum expirácie.")
+                _ex_ok = False
+        if _ex_ok:
+            _allowed_exp = set(get_catalog_expiries(months=18))
+            _prev_ex = str(_Le["expiry"]).strip().replace("-", "")
+            if _ex_norm not in _allowed_exp and _ex_norm != _prev_ex:
+                st.error(
+                    "Táto expirácia **nie je v katalógu**. Pridaj ju v expandéri „Centrálny katalóg expirácií“ "
+                    "alebo zvoľ iný dátum z rovnakého zdroja ako pri „Pridať nohu“."
+                )
+                _ex_ok = False
+        if _ex_ok:
+            _snap_k = ("strike", "expiry", "right", "leg_type")
+            _old_e = {k: legs[_sel_ix][k] for k in _snap_k}
+            _old_o = (
+                {k: legs[1 - _sel_ix][k] for k in _snap_k}
+                if len(legs) == 2
+                else None
+            )
+            _try_legs = json.loads(json.dumps(st.session_state["sb_legs"]))
+            _try_legs[_sel_ix].update(
+                {
+                    "leg_type": _e_lt,
+                    "right": _e_rt,
+                    "strike": float(_e_st),
+                    "expiry": _ex_norm,
+                    "contracts": int(_e_ct),
+                    "entry_price": float(_e_en),
+                    "iv": float(_e_iv),
+                }
+            )
+            for _j, _lg in enumerate(_try_legs):
+                _lg["id"] = _j + 1
+            _sync_msgs: list[str] = []
+            if (
+                len(_try_legs) == 2
+                and _old_o is not None
+                and st.session_state.get("sb_legedit_sync_pair", True)
+            ):
+                _sync_msgs = sync_pair_after_edit(_try_legs, _sel_ix, _old_e, _old_o)
+            _cal_chk = analyze_calendar_mentor(_try_legs)
+            _diag_chk = analyze_diagonal_mentor(_try_legs)
+
+            _cal_fail = _cal_chk is not None and (
+                _cal_chk.inverted
+                or not (_cal_chk.short_ok and _cal_chk.long_ok and _cal_chk.spread_ok)
+            )
+            _diag_fail = (
+                _cal_chk is None
+                and _diag_chk is not None
+                and (
+                    _diag_chk.inverted
+                    or not (_diag_chk.short_ok and _diag_chk.long_ok and _diag_chk.spread_ok)
+                )
+            )
+
+            if _cal_fail:
+                _why: list[str] = []
+                if _cal_chk is not None and _cal_chk.inverted:
+                    _why.append("prehodené expirácie (Long musí byť neskôr než Short)")
+                if _cal_chk is not None and not _cal_chk.short_ok:
+                    _why.append("Short DTE mimo okna kalendárového mentora")
+                if _cal_chk is not None and not _cal_chk.long_ok:
+                    _why.append("Long DTE mimo okna kalendárového mentora")
+                if (
+                    _cal_chk is not None
+                    and not _cal_chk.spread_ok
+                    and not _cal_chk.inverted
+                ):
+                    _why.append("rozstup expirácií (mesiace) mimo okna kalendárového mentora")
+                st.error(
+                    "**Kalendárny mentor:** " + "; ".join(_why) + ". "
+                    "**Nič sa neuložilo.** Uprav dátumy/strike alebo vypni zosúladenie druhej nohy."
+                )
+            elif _diag_fail:
+                _dw: list[str] = []
+                if _diag_chk is not None and _diag_chk.inverted:
+                    _dw.append("prehodené DTE (max Long musí byť ≥ min Short naprieč nohami)")
+                if _diag_chk is not None and not _diag_chk.short_ok:
+                    _dw.append("Short DTE mimo okna diagonálneho mentora (30–45 dní)")
+                if _diag_chk is not None and not _diag_chk.long_ok:
+                    _dw.append("Long DTE mimo okna diagonálneho mentora (60–120 dní)")
+                if (
+                    _diag_chk is not None
+                    and not _diag_chk.spread_ok
+                    and not _diag_chk.inverted
+                ):
+                    _dw.append("rozptyl expirácií (1–3 mes.) mimo okna diagonálneho mentora")
+                st.error(
+                    "**Diagonál / KO mentor:** " + "; ".join(_dw) + ". "
+                    "**Nič sa neuložilo.** Uprav dátumy alebo vypni zosúladenie druhej nohy."
+                )
+            else:
+                st.session_state["sb_legs"] = _try_legs
+                if _sync_msgs:
+                    st.session_state["_sb_sync_notice"] = "\n\n".join(_sync_msgs)
+                st.rerun()
+
+if ibkr.is_connected():
+    st.caption(
+        "Z IBKR vieš natiahnuť **mid cenu** (bid/ask alebo last) a **IV** pre každý kontrakt — potrebuješ market data na opcie a otvorené TWS/Gateway."
+    )
+    if st.button(
+        "📡 Načítať z IBKR: vstupné ceny + IV pre všetky nohy",
+        key="sb_load_legs_ibkr",
+        help="Prepíše Vstup $ a IV na každej nohe podľa snapshotu. Pri viacerých nohách to môže trvať desiatky sekúnd.",
+    ):
+        _tk_ib = (st.session_state.get("sb_ticker") or "").strip().upper()
+        if not _tk_ib:
+            st.warning("Najprv zadaj ticker hore.")
+        else:
+            _warn: list[str] = []
+            _ok = 0
+            _bar = st.progress(0.0, text="Pripravujem…")
+            for _idx, _leg in enumerate(st.session_state["sb_legs"]):
+                _bar.progress(
+                    (_idx) / max(1, len(st.session_state["sb_legs"])),
+                    text=f"IBKR {_tk_ib} noha {_idx + 1}/{len(st.session_state['sb_legs'])}…",
+                )
+                _od = ibkr.fetch_option_data(
+                    _tk_ib,
+                    str(_leg["expiry"]),
+                    float(_leg["strike"]),
+                    str(_leg["right"]),
+                )
+                _mid = _od.get("mid")
+                if _mid is None and _od.get("bid") and _od.get("ask"):
+                    _mid = (_od["bid"] + _od["ask"]) / 2.0
+                if _mid is not None and _mid > 0:
+                    _leg["entry_price"] = round(float(_mid), 2)
+                    _ok += 1
+                _iv_ib = _od.get("iv")
+                if _iv_ib is not None and float(_iv_ib) > 0:
+                    _leg["iv"] = float(_iv_ib)
+                if _od.get("error") and (_mid is None or _mid <= 0):
+                    _warn.append(
+                        f"#{_idx + 1} {_tk_ib} {_leg['expiry']} K{_leg['strike']}{_leg['right']}: {_od.get('error', '?')}"
+                    )
+            _bar.progress(1.0, text="Hotovo.")
+            if _ok:
+                st.success(f"IBKR: aktualizované ceny pre {_ok} nohu/ôh (IV tam, kde ju API vrátilo).")
+            if _warn:
+                st.warning("Problémy:\n" + "\n".join(_warn))
+            st.rerun()
+else:
+    st.caption("Pre automatické ceny a IV z brokera pripoj **TWS / IB Gateway** (rovnako ako pri načítaní spotu).")
 
 # Tlačidlá na mazanie nôh
 _del_cols = st.columns(min(len(legs), 6))
@@ -598,13 +1136,68 @@ _flow_lbl = "Čistý kredit" if _net_flow >= 0 else "Čistý debet"
 st.metric(_flow_lbl, f"${abs(_net_flow):,.0f}",
           help="Suma prijatého prémia mínus zaplatené prémium za celý spread")
 
+_marg_est = estimate_spread_margin_usd(legs)
+st.markdown("#### Marža pri otvorení")
+_mcol1, _mcol2, _mcol3 = st.columns([1.2, 1.2, 1.6])
+_me_usd = _marg_est.get("maintenance_usd")
+if _me_usd is None:
+    _me_usd = _marg_est.get("initial_usd")
+with _mcol1:
+    st.metric(
+        "Lokálny odhad ($)",
+        f"${_me_usd:,.0f}" if _me_usd is not None else "—",
+        help="Zjednodušený Reg T / max. strata — nie presná IB Portfolio Margin.",
+    )
+with _mcol2:
+    if _me_usd is not None:
+        if st.button(
+            "Dosadiť odhad do maržy (APTR)",
+            key="sb_margin_apply_est",
+            help="Nastaví pole „Modelová udržiavacia marža“ podľa lokálneho odhadu.",
+        ):
+            st.session_state["sb_maint_margin"] = float(_me_usd)
+            st.rerun()
+    else:
+        st.caption("Lokálny odhad nie je k dispozícii pre túto štruktúru.")
+with _mcol3:
+    if ibkr.is_connected():
+        if st.button(
+            "📐 Marža z IB what-if (combo)",
+            key="sb_margin_ib_whatif",
+            help="Pošle BAG combo do IB a doplní Init/Maint maržu z odpovede; udržiavacia sa dosadí do poľa APTR.",
+        ):
+            _tk_m = (st.session_state.get("sb_ticker") or "").strip().upper()
+            if not _tk_m:
+                st.warning("Najprv zadaj ticker.")
+            else:
+                with st.spinner("IB what-if marža (combo)…"):
+                    _wm = ibkr.fetch_spread_whatif_margin(_tk_m, legs)
+                if _wm.get("error") and _wm.get("maintenance_margin") is None and _wm.get("initial_margin") is None:
+                    st.warning(_wm["error"])
+                else:
+                    _use_m = _wm.get("maintenance_margin")
+                    if _use_m is None:
+                        _use_m = _wm.get("initial_margin")
+                    if _use_m is not None and _use_m >= 0:
+                        st.session_state["sb_maint_margin"] = float(_use_m)
+                        st.success(
+                            f"IB what-if: init {_wm.get('initial_margin')}, maint {_wm.get('maintenance_margin')} "
+                            f"— objednávka { _wm.get('order_action') }, počet combo { _wm.get('combo_quantity') }."
+                        )
+                        st.rerun()
+                    else:
+                        st.warning(_wm.get("error") or "IB nevrátil číselnú maržu.")
+    else:
+        st.caption("Pre **what-if** z IB pripoj TWS / Gateway.")
+st.caption(_marg_est.get("note", ""))
+
 st.markdown("#### APTR z Theta (model — rovnako ako TWS Dashboard)")
 st.number_input(
     "Modelová udržiavacia marža ($) — pridá sa k net debetu do bázy APTR",
     min_value=0.0,
     step=50.0,
     key="sb_maint_margin",
-    help="Náklad = vstupný net debet z prémií + táto marža. Zadaj orientačnú udržiavaciu maržu z TWS (Margin Impact).",
+    help="Náklad = vstupný net debet z prémií + táto marža. Môžeš ju dosadiť odhadom alebo IB what-if vyššie, alebo z TWS (Margin Impact).",
 )
 _maint_sb = float(st.session_state.get("sb_maint_margin", 0) or 0)
 _net_debit_mod = -float(_net_flow)

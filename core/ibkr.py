@@ -10,10 +10,11 @@ po zaistení event loop pomocou _ensure_event_loop().
 from __future__ import annotations
 
 import asyncio
+import math
+import re
 import socket
 import threading
 import time
-import math
 from datetime import date as _date
 
 import streamlit as st
@@ -560,6 +561,166 @@ def fetch_iv(ticker: str, expiry: str, strike: float, right: str = "C") -> dict:
         return {"iv": greeks.impliedVol, "und_price": greeks.undPrice, "error": None}
     except Exception as e:
         return {"iv": None, "und_price": None, "error": str(e)}
+
+
+def _parse_ib_margin_value(v) -> Optional[float]:
+    if v is None or v == "":
+        return None
+    try:
+        f = float(v)
+        if not math.isnan(f):
+            return f
+    except (TypeError, ValueError):
+        pass
+    s = str(v).replace(",", "")
+    m = re.search(r"[-+]?\d+(?:\.\d+)?", s)
+    if m:
+        try:
+            return float(m.group(0))
+        except ValueError:
+            return None
+    return None
+
+
+def fetch_spread_whatif_margin(ticker: str, legs: list[dict]) -> dict:
+    """
+    Požiada IB o what-if maržu pre BAG combo z nôh Spread Builderu (otvorenie pozície).
+
+    Vráti initial_margin, maintenance_margin (USD), prípadne error.
+    """
+    ib = get_ib()
+    if not ib or not ib.isConnected():
+        return {"error": "Nie je pripojenie na IBKR", "initial_margin": None, "maintenance_margin": None}
+
+    if not legs:
+        return {"error": "Žiadne nohy", "initial_margin": None, "maintenance_margin": None}
+    if len(legs) < 2:
+        return {
+            "error": "What-if combo vyžaduje aspoň 2 nohy (BAG). Pri jednej nohe použij TWS.",
+            "initial_margin": None,
+            "maintenance_margin": None,
+        }
+
+    sym = (ticker or "").strip().upper()
+    if not sym:
+        return {"error": "Prázdny ticker", "initial_margin": None, "maintenance_margin": None}
+
+    result: dict = {
+        "error": None,
+        "initial_margin": None,
+        "maintenance_margin": None,
+        "order_action": None,
+        "combo_quantity": None,
+    }
+    done = threading.Event()
+
+    def _worker():
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            import nest_asyncio
+
+            nest_asyncio.apply(loop)
+            from ib_insync import ComboLeg, Contract, MarketOrder, Option as IBOption
+
+            ratios = [max(1, int(leg.get("contracts", 1) or 1)) for leg in legs]
+            from functools import reduce
+
+            g_all = reduce(math.gcd, ratios)
+            combo_qty = max(1, g_all)
+            norm_ratios = [r // g_all for r in ratios]
+
+            combo_legs = []
+            for leg, ratio in zip(legs, norm_ratios):
+                exp = str(leg.get("expiry") or "")
+                strike = float(leg.get("strike") or 0)
+                right = str(leg.get("right") or "C")[:1]
+                if len(exp) < 8 or strike <= 0 or right not in ("C", "P"):
+                    result["error"] = f"Neplatná noha: {leg}"
+                    return
+                opt = IBOption(sym, exp, strike, right, "SMART", currency="USD")
+                ib.qualifyContracts(opt)
+                if not getattr(opt, "conId", None):
+                    result["error"] = f"Kontrakt nenájdený: {sym} {exp} {strike} {right}"
+                    return
+                action = "BUY" if str(leg.get("leg_type")) == "Long" else "SELL"
+                combo_legs.append(
+                    ComboLeg(
+                        conId=opt.conId,
+                        ratio=int(ratio),
+                        action=action,
+                        exchange="SMART",
+                        openClose=0,
+                        shortSaleSlot=0,
+                        designatedLocation="",
+                        exemptCode=-1,
+                    )
+                )
+
+            bag = Contract(symbol=sym, secType="BAG", currency="USD", exchange="SMART", comboLegs=combo_legs)
+            ib.qualifyContracts(bag)
+
+            net = sum(
+                (
+                    -float(leg.get("entry_price") or 0)
+                    if str(leg.get("leg_type")) == "Long"
+                    else float(leg.get("entry_price") or 0)
+                )
+                * max(1, int(leg.get("contracts", 1) or 1))
+                * 100
+                for leg in legs
+            )
+            order_action = "SELL" if net >= 0 else "BUY"
+            result["order_action"] = order_action
+            result["combo_quantity"] = int(combo_qty)
+
+            order = MarketOrder(order_action, int(combo_qty))
+            order.whatIf = True
+            order.transmit = False
+
+            trade = ib.placeOrder(bag, order)
+            for _ in range(60):
+                time.sleep(0.25)
+                stt = trade.orderStatus
+                if stt:
+                    ini = _parse_ib_margin_value(getattr(stt, "initMarginBefore", None))
+                    mai = _parse_ib_margin_value(getattr(stt, "maintMarginBefore", None))
+                    if ini is not None or mai is not None:
+                        result["initial_margin"] = ini
+                        result["maintenance_margin"] = mai
+                        break
+                    if getattr(stt, "status", None) in ("Cancelled", "Inactive") and getattr(
+                        stt, "whyHeld", ""
+                    ):
+                        break
+            try:
+                ib.cancelOrder(order)
+            except Exception:
+                pass
+
+            if result["initial_margin"] is None and result["maintenance_margin"] is None:
+                msg = getattr(trade.orderStatus, "warningText", None) or getattr(
+                    trade.orderStatus, "whyHeld", None
+                )
+                result["error"] = (
+                    msg
+                    or "IB nevrátil maržu (what-if). Skús znova alebo TWS Margin Impact."
+                )
+        except Exception as e:
+            result["error"] = str(e)
+        finally:
+            done.set()
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    done.wait(timeout=25)
+
+    if not result.get("error") and result["initial_margin"] is None and result["maintenance_margin"] is None:
+        result["error"] = result.get("error") or "Timeout alebo prázdna odpoveď z IB."
+    elif result.get("initial_margin") is not None or result.get("maintenance_margin") is not None:
+        result["error"] = None
+
+    return result
 
 
 def _contract_label_from_details(ct) -> str:

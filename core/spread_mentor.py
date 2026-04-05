@@ -54,6 +54,7 @@ class DiagonalMentorResult:
     short_ok: bool
     long_ok: bool
     spread_ok: bool
+    inverted: bool
     summary_lines: list[str]
 
 
@@ -143,6 +144,7 @@ def analyze_diagonal_mentor(legs: list[dict], today: Optional[date] = None) -> O
         short_ok=short_ok,
         long_ok=long_ok,
         spread_ok=spread_ok,
+        inverted=inverted,
         summary_lines=lines,
     )
 
@@ -158,6 +160,7 @@ class CalendarMentorResult:
     short_ok: bool
     long_ok: bool
     spread_ok: bool
+    inverted: bool
     summary_lines: list[str]
 
 
@@ -269,6 +272,7 @@ def analyze_calendar_mentor(legs: list[dict], today: Optional[date] = None) -> O
         short_ok=short_ok,
         long_ok=long_ok,
         spread_ok=spread_ok,
+        inverted=inverted,
         summary_lines=lines,
     )
 
