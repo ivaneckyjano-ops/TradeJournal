@@ -222,6 +222,9 @@ with st.sidebar:
                     st.error(f"Chyba pri zálohe: {res.stderr}")
             except Exception as e:
                 st.error(f"Chyba: {e}")
+    st.caption(
+        "Zahrnuté je všetko mimo .gitignore — vrátane **journal.db** (obchody, kalendár, konzultácie, nápady)."
+    )
 
     st.divider()
     from core import ibkr

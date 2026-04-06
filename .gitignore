@@ -5,5 +5,7 @@ __pycache__/
 .ipynb_checkpoints/
 .streamlit/config.toml
 .env
-# .sqlite or .db should NOT be ignored based on user request for backup
+# GitHub záloha (tlačidlo v sidebar-e) = git add . — teda všetko okrem riadkov vyššie.
+# data/journal.db je zámerne ZÁLOHOVANÉ: obsahuje obchody, kalendár (events), poznámky,
+# Spread Builder nápady, históriu portfólia atď.
 # data/journal.db

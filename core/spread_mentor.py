@@ -27,6 +27,15 @@ CAL_SPREAD_MONTHS_MIN = 0.5
 CAL_SPREAD_MONTHS_MAX = 2.5
 
 
+def _strike_grid_half_dollar(raw: object) -> float:
+    """Rovnaká mriežka strikov ako v Spread Builderi (0,5 $) — zlučuje float odchýlky pri detekcii kalendára."""
+    try:
+        x = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.5, round(x * 2.0) / 2.0)
+
+
 def _parse_expiry_yyyymmdd(expiry_str: str) -> Optional[date]:
     s = (expiry_str or "").strip().replace("-", "")
     if len(s) < 8:
@@ -183,9 +192,8 @@ def analyze_calendar_mentor(legs: list[dict], today: Optional[date] = None) -> O
         r = str(leg.get("right") or "").strip().upper()[:1]
         if r not in ("C", "P"):
             continue
-        try:
-            strike = round(float(leg.get("strike")), 4)
-        except (TypeError, ValueError):
+        strike = _strike_grid_half_dollar(leg.get("strike"))
+        if strike <= 0:
             continue
         key = (strike, r)
         if lt == "Short":

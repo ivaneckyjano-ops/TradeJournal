@@ -54,8 +54,10 @@ def sync_pair_after_edit(
 
     td = today or date.today()
 
-    # ── Kalendár: rovnaký typ opcie, rôzna expirácia, pred úpravou rovnaký strike
-    if same_right and diff_exp and abs(float(oa.get("strike", 0)) - float(ob.get("strike", 0))) < 1e-6:
+    # ── Kalendár: rovnaký typ opcie, rôzna expirácia, pred úpravou rovnaký strike (mriežka 0,5 $)
+    if same_right and diff_exp and abs(
+        _round_strike(float(oa.get("strike", 0))) - _round_strike(float(ob.get("strike", 0)))
+    ) < 1e-6:
         new_k = _round_strike(float(a.get("strike", 0)))
         b["strike"] = new_k
         msgs.append(f"Kalendár: noha #{j + 1} — strike zosúladený na **${new_k:g}**.")
@@ -69,7 +71,10 @@ def sync_pair_after_edit(
     elif (
         same_right
         and diff_exp
-        and abs(float(oa.get("strike", 0)) - float(ob.get("strike", 0))) >= 1e-6
+        and abs(
+            _round_strike(float(oa.get("strike", 0))) - _round_strike(float(ob.get("strike", 0)))
+        )
+        >= 1e-6
         and oa.get("leg_type") != ob.get("leg_type")
     ):
         w = abs(float(oa["strike"]) - float(ob["strike"]))

@@ -35,7 +35,11 @@ EVENT_COLORS = {
 DAY_NAMES = ["Po", "Ut", "St", "Št", "Pi", "So", "Ne"]
 
 st.title("📅 Kalendár")
-st.caption("Expirácie, earnings, alerty, udalosti a poznámky na jednom mieste.")
+st.caption(
+    "Expirácie, earnings, alerty, udalosti a poznámky na jednom mieste. "
+    "Záznamy v kalendári staršie ako **365 dní** sa v databáze automaticky mažú (najviac raz denne); "
+    "obchody a konzultácie v denníku ostávajú."
+)
 
 # ─── Navigácia mesiacov ─────────────────────────────────────────────────────────
 today = date.today()

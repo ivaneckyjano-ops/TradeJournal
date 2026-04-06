@@ -1,7 +1,7 @@
 import json
 import os
 import sqlite3
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "journal.db")
@@ -91,6 +91,10 @@ def init_db() -> None:
     _migrate_group_apr_snapshots(get_connection())
     _migrate_spread_builder(get_connection())
     _migrate_portfolio_greek_history(get_connection())
+    with get_connection() as conn:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_date ON events (date)")
+        conn.commit()
+    maybe_purge_old_calendar_events()
 
 
 def _migrate_symbols(conn: sqlite3.Connection) -> None:
@@ -537,6 +541,38 @@ def get_note_by_id(note_id: int) -> Optional[dict]:
 
 
 # ─── EVENTS ────────────────────────────────────────────────────────────────────
+
+# Manuálne udalosti v kalendári (tabuľka events). Obchody / poznámky / Spread Builder sa nemažú.
+CALENDAR_EVENTS_RETENTION_DAYS = 365
+CALENDAR_EVENTS_LAST_PURGE_DAY_KEY = "calendar_events_last_purge_day"
+# "1" = zapnuté (predvolené). "0" = vypnuté — cez db.set_setting v konzole alebo budúci prepínač v UI.
+CALENDAR_AUTO_PURGE_ENABLED_KEY = "calendar_auto_purge_enabled"
+
+
+def purge_old_calendar_events(retention_days: int = CALENDAR_EVENTS_RETENTION_DAYS) -> int:
+    """
+    Vymaže riadky v ``events``, kde ``date`` (YYYY-MM-DD) je staršia ako ``retention_days``.
+    Expirácie z otvorených obchodov v kalendári sú virtuálne (z ``trades``), tie sa týmto nedotknú.
+    """
+    rd = max(30, int(retention_days))
+    cutoff = (date.today() - timedelta(days=rd)).isoformat()
+    with get_connection() as conn:
+        cur = conn.execute("DELETE FROM events WHERE date < ?", (cutoff,))
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
+def maybe_purge_old_calendar_events() -> None:
+    """Najviac raz za kalendárny deň spustí purge, ak je zapnuté v nastaveniach."""
+    raw = get_setting(CALENDAR_AUTO_PURGE_ENABLED_KEY, "1").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return
+    today_s = date.today().isoformat()
+    if get_setting(CALENDAR_EVENTS_LAST_PURGE_DAY_KEY, "") == today_s:
+        return
+    purge_old_calendar_events(CALENDAR_EVENTS_RETENTION_DAYS)
+    set_setting(CALENDAR_EVENTS_LAST_PURGE_DAY_KEY, today_s)
+
 
 def get_events(year: int, month: int) -> list[dict]:
     """Vráti všetky udalosti pre daný mesiac + expirujúce obchody."""

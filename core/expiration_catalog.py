@@ -6,6 +6,7 @@ Uložené v DB (`settings`). Ak nie je uložené nič, použije sa generátor pi
 from __future__ import annotations
 
 import json
+import re
 from datetime import date
 from typing import Optional
 
@@ -78,17 +79,61 @@ def merge_catalog_with_generated(months: int = 18) -> list[str]:
     return out
 
 
+def _parse_line_to_yyyymmdd(line: str) -> Optional[str]:
+    """YYYYMMDD, YYYY-MM-DD, DD.MM.RRRR alebo DD-MM-RRRR → YYYYMMDD."""
+    raw = (line or "").strip()
+    if not raw:
+        return None
+    s = raw.replace("-", "").replace(".", "")
+    if len(s) == 8 and s.isdigit():
+        try:
+            date(int(s[:4]), int(s[4:6]), int(s[6:8]))
+            return s
+        except ValueError:
+            return None
+    m = re.match(r"^(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{4})\s*$", raw)
+    if m:
+        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            date(y, mo, d)
+            return f"{y:04d}{mo:02d}{d:02d}"
+        except ValueError:
+            return None
+    return None
+
+
+def remove_expiries_from_catalog(dates_yyyymmdd: list[str], months: int = 18) -> list[str]:
+    """Vyhodí uvedené YYYYMMDD z katalógu a uloží. Ak katalóg ešte nebol v DB, vychádza z aktuálneho zoznamu."""
+    norm: list[str] = []
+    for x in dates_yyyymmdd:
+        s = _parse_line_to_yyyymmdd(str(x))
+        if s:
+            norm.append(s)
+    cur = set(get_catalog_expiries(months))
+    for s in norm:
+        cur.discard(s)
+    out = sorted(cur)
+    save_catalog_expiries(out)
+    return out
+
+
+def remove_expiries_from_text(block: str, months: int = 18) -> list[str]:
+    """Odstráni dátumy podľa riadkov (formáty ako pri pridávaní + DD.MM.RRRR)."""
+    to_remove: list[str] = []
+    for line in (block or "").splitlines():
+        t = _parse_line_to_yyyymmdd(line)
+        if t:
+            to_remove.append(t)
+    return remove_expiries_from_catalog(to_remove, months)
+
+
 def append_expiries_from_text(block: str, months: int = 18) -> list[str]:
-    """Pridá riadky YYYYMMDD (alebo YYYY-MM-DD) do katalógu."""
+    """Pridá riadky do katalógu (YYYYMMDD, YYYY-MM-DD, DD.MM.RRRR, …)."""
     cur = set(get_catalog_expiries(months))
     for line in (block or "").splitlines():
-        s = line.strip().replace("-", "").replace(".", "")
-        if len(s) == 8 and s.isdigit():
-            try:
-                date(int(s[:4]), int(s[4:6]), int(s[6:8]))
-                cur.add(s)
-            except ValueError:
-                continue
+        t = _parse_line_to_yyyymmdd(line)
+        if t:
+            cur.add(t)
     out = sorted(cur)
     save_catalog_expiries(out)
     return out
