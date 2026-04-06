@@ -11,8 +11,13 @@ st.markdown("""
 """)
 
 # ─── Navigácia ────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "Začíname", "Trade Log", "Konzultácie", "Roll Simulátor", "IBKR Pripojenie"
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "Začíname",
+    "Trade Log",
+    "Konzultácie",
+    "Roll Simulátor",
+    "IBKR Pripojenie",
+    "Steady Yields",
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -261,3 +266,17 @@ with tab5:
 
     st.divider()
     st.info("Všetky import funkcie sú **Read-Only** — denník nikdy neposiela príkazy do TWS.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+with tab6:
+    st.header("Steady Yields")
+    st.markdown("""
+**Účel:** PMCC, diagonály a kalendáre — sledovanie **realizovaného APR** a **cost basis** oproti očakávaniu,
+semafor podľa **delty shortu** a **DTE**, konzervatívny odhad **net kreditu** pri rolle a **skener** likvidity (OI, bid–ask, IV rank, sektor).
+
+- **Group ID:** V Trade Log nastav rovnaké Group ID na Long (LEAPS) aj Short (overlay). Bez toho súhrny APR nemusia sedieť.
+- **Yield a APR:** Profil skupiny (očakávaný APR, náklad LEAPS), manuálne **roll udalosti** (netto + komisia) — výpočty uprednostňujú tieto **realizované** čísla pred teoretickými cenami.
+- **Fills z IBKR:** Stĺpec ``realized_fill_price`` v importe = cena exekúcie z TWS (rovnaký zmysel ako pri manuálnych zápisoch).
+- **Monitoring:** Tlačidlo *Obnoviť pozície s Greeks*; voliteľné prahy semafora. **TWS Dashboard** má expandér so zhrnutím semafora pre shorty z denníka.
+- **Skener:** Vyžaduje market data na opcie (OI, quote). Nepodáva príkazy — len náhľad.
+""")

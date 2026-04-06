@@ -18,13 +18,16 @@ from core import ibkr
 from core import database as db
 from core.page_context import TWS_DASHBOARD_PAGE, set_tradejournal_page
 from core.portfolio_data import (
+    calc_dte,
     compute_portfolio_theta_aptr,
     compute_theta_annualized_yield_pct,
     dashboard_group_margin_widget_key,
     group_ibkr_positions_for_dashboard,
     ibkr_aggregates_by_underlying,
     journal_group_id,
+    normalize_expiry,
 )
+from core.steady_yields.engine import traffic_light
 
 db.init_db()
 set_tradejournal_page(TWS_DASHBOARD_PAGE)
@@ -367,6 +370,53 @@ if job_status == "done":
             f"⚠️ Greeks chýbajú pre: {', '.join(dict.fromkeys(no_greeks))} "
             "– z TWS neprišli (pravdepodobne chýba STK pozícia pre BS výpočet)."
         )
+
+    with st.expander("Steady Yields — semafor (short z denníka + IBKR)", expanded=False):
+        st.caption(
+            "Páruje **otvorené Short** z Trade Log (s Group ID) s opčnými riadkami z práve načítaného portfólia. "
+            "Detail a roll odhad: stránka **Steady Yields**."
+        )
+        _sy_shorts = [
+            t
+            for t in db.get_open_trades()
+            if t.get("leg_type") == "Short" and (t.get("group_id") or "").strip()
+        ]
+        if not _sy_shorts:
+            st.caption("Žiadne otvorené Short s vyplneným Group ID.")
+        else:
+            _sy_rows = []
+            for _t in _sy_shorts:
+                _exp = normalize_expiry(str(_t.get("expiry") or ""))
+                _k = float(_t.get("strike") or 0)
+                _tk = (_t.get("ticker") or "").upper()
+                _dte = calc_dte(_exp) or 0
+                _pos = None
+                for _p in opts:
+                    if (_p.get("ticker") or "").upper() != _tk:
+                        continue
+                    if abs(float(_p.get("strike") or -1) - _k) > 0.01:
+                        continue
+                    if normalize_expiry(str(_p.get("expiry") or "")) != _exp:
+                        continue
+                    _pos = _p
+                    break
+                _ad = None
+                if _pos and _pos.get("delta") is not None:
+                    _ad = abs(float(_pos.get("delta")))
+                _tl = traffic_light(abs_delta=_ad, dte=_dte)
+                _emoji = {"green": "🟢", "orange": "🟠", "red": "🔴"}.get(_tl.level, "⚪")
+                _sy_rows.append(
+                    {
+                        "Group": (_t.get("group_id") or "")[:24],
+                        "Ticker": _tk,
+                        "Short": f"K{_k:g} {_exp}",
+                        "DTE": _dte,
+                        "Stav": _emoji,
+                        "Úroveň": _tl.level,
+                        "Δ live": _pos.get("delta") if _pos else None,
+                    }
+                )
+            st.dataframe(pd.DataFrame(_sy_rows), use_container_width=True, hide_index=True)
 
     if _pf_theta_aptr is not None:
         st.metric(

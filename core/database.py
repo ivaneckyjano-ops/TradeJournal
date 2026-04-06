@@ -91,6 +91,9 @@ def init_db() -> None:
     _migrate_group_apr_snapshots(get_connection())
     _migrate_spread_builder(get_connection())
     _migrate_portfolio_greek_history(get_connection())
+    _migrate_steady_yields(get_connection())
+    _migrate_steady_yields_alerts(get_connection())
+    _migrate_symbol_market_snapshots(get_connection())
     with get_connection() as conn:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_events_date ON events (date)")
         conn.commit()
@@ -107,6 +110,10 @@ def _migrate_symbols(conn: sqlite3.Connection) -> None:
         "ir_url":          "ALTER TABLE symbols ADD COLUMN ir_url TEXT",
         "spot":            "ALTER TABLE symbols ADD COLUMN spot REAL DEFAULT 0",
         "iv_pct":          "ALTER TABLE symbols ADD COLUMN iv_pct REAL DEFAULT 30",
+        "industry":        "ALTER TABLE symbols ADD COLUMN industry TEXT",
+        "market_synced_at": "ALTER TABLE symbols ADD COLUMN market_synced_at TEXT",
+        "iv_rank_13w": "ALTER TABLE symbols ADD COLUMN iv_rank_13w REAL",
+        "iv_rank_52w": "ALTER TABLE symbols ADD COLUMN iv_rank_52w REAL",
     }
     for col, sql in migrations.items():
         if col not in existing:
@@ -298,6 +305,16 @@ def get_symbol_tickers() -> list[str]:
     return [s["ticker"] for s in get_symbols()]
 
 
+def get_distinct_trade_tickers() -> list[str]:
+    """Distinct tickery z Trade Log (obchody) — underlying symboly z nôh."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT UPPER(TRIM(ticker)) AS t FROM trades "
+            "WHERE ticker IS NOT NULL AND TRIM(ticker) != '' ORDER BY t"
+        ).fetchall()
+    return [r["t"] for r in rows]
+
+
 def get_symbol(ticker: str) -> Optional[dict]:
     with get_connection() as conn:
         row = conn.execute("SELECT * FROM symbols WHERE ticker=?", (ticker.upper(),)).fetchone()
@@ -309,21 +326,118 @@ def update_symbol(symbol_id: int, ticker: str, company_name: str, sector: str,
                   earnings_date: str = None, iv_rank: float = None,
                   earnings_date_2: str = None, earnings_date_3: str = None,
                   earnings_date_4: str = None, ir_url: str = None,
-                  spot: float = None, iv_pct: float = None) -> None:
+                  spot: float = None, iv_pct: float = None,
+                  iv_rank_13w: Optional[float] = None,
+                  iv_rank_52w: Optional[float] = None) -> None:
     with get_connection() as conn:
         conn.execute(
             "UPDATE symbols SET ticker=?, company_name=?, sector=?, asset_type=?, "
             "description=?, earnings_date=?, earnings_date_2=?, earnings_date_3=?, "
-            "earnings_date_4=?, ir_url=?, iv_rank=?, spot=?, iv_pct=? WHERE id=?",
+            "earnings_date_4=?, ir_url=?, iv_rank=?, spot=?, iv_pct=?, "
+            "iv_rank_13w=?, iv_rank_52w=? WHERE id=?",
             (ticker.strip().upper(), company_name, sector, asset_type,
              description, earnings_date, earnings_date_2, earnings_date_3,
-             earnings_date_4, ir_url, iv_rank, spot, iv_pct, symbol_id),
+             earnings_date_4, ir_url, iv_rank, spot, iv_pct,
+             iv_rank_13w, iv_rank_52w, symbol_id),
         )
 
 
 def delete_symbol(symbol_id: int) -> None:
     with get_connection() as conn:
         conn.execute("DELETE FROM symbols WHERE id=?", (symbol_id,))
+
+
+def upsert_symbol_market_snapshot(
+    ticker: str,
+    recorded_date: str,
+    *,
+    iv_pct: Optional[float] = None,
+    spot: Optional[float] = None,
+    source: str = "yahoo",
+) -> None:
+    tk = (ticker or "").strip().upper()
+    if not tk:
+        return
+    d = (recorded_date or "")[:10]
+    if not d:
+        return
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT INTO symbol_market_snapshots (ticker, recorded_date, iv_pct, spot, source)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(ticker, recorded_date) DO UPDATE SET
+                 iv_pct=COALESCE(excluded.iv_pct, iv_pct),
+                 spot=COALESCE(excluded.spot, spot),
+                 source=excluded.source""",
+            (tk, d, iv_pct, spot, source),
+        )
+        conn.commit()
+
+
+def get_symbol_iv_pct_history_before(
+    ticker: str,
+    before_date: str,
+    limit: int = 260,
+) -> list[float]:
+    tk = (ticker or "").strip().upper()
+    if not tk:
+        return []
+    lim = max(5, min(int(limit), 500))
+    bd = (before_date or "")[:10]
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT iv_pct FROM symbol_market_snapshots
+               WHERE ticker=? AND recorded_date < ? AND iv_pct IS NOT NULL AND iv_pct > 0
+               ORDER BY recorded_date DESC LIMIT ?""",
+            (tk, bd, lim),
+        ).fetchall()
+    return [float(r["iv_pct"]) for r in rows]
+
+
+def apply_symbol_yahoo_patch(symbol_id: int, patch: dict) -> None:
+    """Čiastočná aktualizácia riadku symbols (Yahoo sync). Kľúče: company_name, sector, industry, spot, iv_pct, iv_rank, market_synced_at."""
+    allowed = (
+        "company_name",
+        "sector",
+        "industry",
+        "spot",
+        "iv_pct",
+        "iv_rank",
+        "market_synced_at",
+    )
+    cols: list[str] = []
+    vals: list = []
+    for k in allowed:
+        if k not in patch:
+            continue
+        cols.append(f"{k}=?")
+        vals.append(patch[k])
+    if not cols:
+        return
+    vals.append(int(symbol_id))
+    with get_connection() as conn:
+        conn.execute(f"UPDATE symbols SET {', '.join(cols)} WHERE id=?", vals)
+        conn.commit()
+
+
+def normalize_symbols_iv_pct_fraction_scale() -> tuple[int, int]:
+    """
+    Opraví iv_pct uložený ako desatinný zlomok (napr. 0.35 namiesto 35 %) — vynásobí 100.
+    Platí pre ``symbols`` aj ``symbol_market_snapshots``. Vráti (počet riadkov symbols, snapshots).
+    """
+    with get_connection() as conn:
+        cur1 = conn.execute(
+            "UPDATE symbols SET iv_pct = iv_pct * 100.0 "
+            "WHERE iv_pct IS NOT NULL AND iv_pct > 0 AND iv_pct < 2"
+        )
+        cur2 = conn.execute(
+            "UPDATE symbol_market_snapshots SET iv_pct = iv_pct * 100.0 "
+            "WHERE iv_pct IS NOT NULL AND iv_pct > 0 AND iv_pct < 2"
+        )
+        conn.commit()
+        n1 = cur1.rowcount if cur1.rowcount is not None else 0
+        n2 = cur2.rowcount if cur2.rowcount is not None else 0
+    return (int(n1), int(n2))
 
 
 # ─── TRADES ────────────────────────────────────────────────────────────────────
@@ -685,6 +799,9 @@ def set_setting(key: str, value: str) -> None:
 
 GROUP_MAINT_MARGIN_KEY = "group_maintenance_margin"
 
+# Voľný text: IBKR predplatné trhových dát — portfóliový agent (analýza + follow-up chat)
+AGENT_IBKR_MARKET_DATA_KEY = "agent_ibkr_market_data"
+
 
 def get_group_maint_margins() -> dict[str, float]:
     """Slovník ``group_id`` → udržiavacia marža (USD), len kladné hodnoty (kľúče ``strip``)."""
@@ -983,6 +1100,298 @@ def get_spread_builder_snapshots(idea_id: int, limit: int = 120) -> list[dict]:
     out = [dict(r) for r in rows]
     out.reverse()
     return out
+
+
+def _migrate_steady_yields(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS steady_yield_roll_events (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id        TEXT NOT NULL,
+            occurred_at     TEXT NOT NULL,
+            ticker          TEXT NOT NULL,
+            leg_type        TEXT CHECK(leg_type IN ('Long','Short')),
+            action          TEXT NOT NULL,
+            net_premium     REAL NOT NULL DEFAULT 0,
+            commission      REAL NOT NULL DEFAULT 0,
+            delta_snapshot  REAL,
+            dte_snapshot    INTEGER,
+            strike          REAL,
+            expiry          TEXT,
+            option_type     TEXT,
+            notes           TEXT,
+            created_at      TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sy_roll_group ON steady_yield_roll_events (group_id, occurred_at)"
+    )
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS steady_yield_group_profile (
+            group_id            TEXT PRIMARY KEY,
+            expected_apr_pct    REAL,
+            leap_initial_cost   REAL,
+            notes               TEXT,
+            updated_at          TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def _migrate_steady_yields_alerts(conn: sqlite3.Connection) -> None:
+    """Rozšírenie profilu (profit target, semafor alerty) + história upozornení."""
+    try:
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(steady_yield_group_profile)").fetchall()}
+    except sqlite3.OperationalError:
+        existing = set()
+    col_sql = {
+        "profit_target_pct": "ALTER TABLE steady_yield_group_profile ADD COLUMN profit_target_pct REAL",
+        "alert_semafor_enabled": (
+            "ALTER TABLE steady_yield_group_profile ADD COLUMN alert_semafor_enabled INTEGER DEFAULT 1"
+        ),
+    }
+    for col, sql in col_sql.items():
+        if col not in existing:
+            try:
+                conn.execute(sql)
+            except sqlite3.OperationalError:
+                pass
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS steady_yield_alert_events (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id        TEXT NOT NULL,
+            trade_id        INTEGER,
+            alert_type      TEXT NOT NULL,
+            message         TEXT NOT NULL,
+            detail_json     TEXT,
+            created_at      TEXT DEFAULT (datetime('now')),
+            acknowledged    INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sy_alert_group_time ON steady_yield_alert_events (group_id, created_at)"
+    )
+    conn.commit()
+    conn.close()
+
+
+def _migrate_symbol_market_snapshots(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS symbol_market_snapshots (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker          TEXT NOT NULL,
+            recorded_date   TEXT NOT NULL,
+            iv_pct          REAL,
+            spot            REAL,
+            source          TEXT DEFAULT 'yahoo',
+            UNIQUE (ticker, recorded_date)
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sym_snap_ticker_date ON symbol_market_snapshots (ticker, recorded_date)"
+    )
+    conn.commit()
+    conn.close()
+
+
+def append_steady_yield_roll_event(
+    group_id: str,
+    occurred_at: str,
+    ticker: str,
+    action: str,
+    net_premium: float = 0.0,
+    commission: float = 0.0,
+    *,
+    leg_type: Optional[str] = None,
+    delta_snapshot: Optional[float] = None,
+    dte_snapshot: Optional[int] = None,
+    strike: Optional[float] = None,
+    expiry: Optional[str] = None,
+    option_type: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> int:
+    gid = (group_id or "").strip()
+    if not gid:
+        return -1
+    with get_connection() as conn:
+        cur = conn.execute(
+            """INSERT INTO steady_yield_roll_events
+               (group_id, occurred_at, ticker, leg_type, action, net_premium, commission,
+                delta_snapshot, dte_snapshot, strike, expiry, option_type, notes)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                gid,
+                occurred_at,
+                (ticker or "").strip().upper(),
+                leg_type,
+                action,
+                float(net_premium),
+                float(commission),
+                delta_snapshot,
+                dte_snapshot,
+                strike,
+                expiry,
+                option_type,
+                notes or "",
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def get_steady_yield_roll_events(group_id: str, limit: int = 500) -> list[dict]:
+    gid = (group_id or "").strip()
+    if not gid:
+        return []
+    lim = max(1, min(int(limit), 5000))
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT * FROM steady_yield_roll_events WHERE group_id=? "
+            "ORDER BY occurred_at DESC, id DESC LIMIT ?",
+            (gid, lim),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_steady_yield_roll_event(event_id: int) -> None:
+    with get_connection() as conn:
+        conn.execute("DELETE FROM steady_yield_roll_events WHERE id=?", (int(event_id),))
+        conn.commit()
+
+
+def get_steady_yield_group_profile(group_id: str) -> Optional[dict]:
+    gid = (group_id or "").strip()
+    if not gid:
+        return None
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM steady_yield_group_profile WHERE group_id=?",
+            (gid,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def upsert_steady_yield_group_profile(
+    group_id: str,
+    *,
+    expected_apr_pct: Optional[float] = None,
+    leap_initial_cost: Optional[float] = None,
+    notes: Optional[str] = None,
+    profit_target_pct: Optional[float] = None,
+    alert_semafor_enabled: Optional[bool] = None,
+) -> None:
+    gid = (group_id or "").strip()
+    if not gid:
+        return
+    existing = get_steady_yield_group_profile(gid) or {}
+    exp_a = expected_apr_pct if expected_apr_pct is not None else existing.get("expected_apr_pct")
+    leap_c = leap_initial_cost if leap_initial_cost is not None else existing.get("leap_initial_cost")
+    nts = notes if notes is not None else (existing.get("notes") or "")
+    if profit_target_pct is not None:
+        pt = None if float(profit_target_pct) <= 0 else float(profit_target_pct)
+    else:
+        pt = existing.get("profit_target_pct")
+    if alert_semafor_enabled is not None:
+        sf = 1 if alert_semafor_enabled else 0
+    else:
+        v = existing.get("alert_semafor_enabled")
+        sf = 1 if v is None else int(v)
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT INTO steady_yield_group_profile
+               (group_id, expected_apr_pct, leap_initial_cost, notes,
+                profit_target_pct, alert_semafor_enabled, updated_at)
+               VALUES (?,?,?,?,?,?, datetime('now'))
+               ON CONFLICT(group_id) DO UPDATE SET
+                 expected_apr_pct=excluded.expected_apr_pct,
+                 leap_initial_cost=excluded.leap_initial_cost,
+                 notes=excluded.notes,
+                 profit_target_pct=excluded.profit_target_pct,
+                 alert_semafor_enabled=excluded.alert_semafor_enabled,
+                 updated_at=datetime('now')""",
+            (gid, exp_a, leap_c, nts or "", pt, sf),
+        )
+        conn.commit()
+
+
+def append_steady_yield_alert_event(
+    group_id: str,
+    alert_type: str,
+    message: str,
+    *,
+    trade_id: Optional[int] = None,
+    detail_json: Optional[str] = None,
+    dedupe_hours: Optional[float] = 24.0,
+) -> Optional[int]:
+    """
+    Uloží upozornenie. Ak ``dedupe_hours`` je zadané a rovnaký typ + trade už existuje v okne, vráti None.
+    """
+    gid = (group_id or "").strip()
+    if not gid or not message.strip():
+        return None
+    with get_connection() as conn:
+        if dedupe_hours is not None and dedupe_hours > 0:
+            tid = trade_id if trade_id is not None else -1
+            row = conn.execute(
+                """
+                SELECT id FROM steady_yield_alert_events
+                WHERE group_id=? AND alert_type=? AND COALESCE(trade_id,-1)=?
+                  AND IFNULL(acknowledged,0)=0
+                  AND datetime(created_at) > datetime('now', ?)
+                LIMIT 1
+                """,
+                (gid, alert_type, tid, f"-{int(max(1, round(float(dedupe_hours))))} hours"),
+            ).fetchone()
+            if row:
+                return None
+        cur = conn.execute(
+            """INSERT INTO steady_yield_alert_events
+               (group_id, trade_id, alert_type, message, detail_json)
+               VALUES (?,?,?,?,?)""",
+            (gid, trade_id, alert_type, message.strip(), detail_json),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def get_steady_yield_alert_events(
+    group_id: str,
+    limit: int = 80,
+    *,
+    unacknowledged_only: bool = False,
+) -> list[dict]:
+    gid = (group_id or "").strip()
+    if not gid:
+        return []
+    lim = max(1, min(int(limit), 500))
+    with get_connection() as conn:
+        q = "SELECT * FROM steady_yield_alert_events WHERE group_id=?"
+        params: list = [gid]
+        if unacknowledged_only:
+            q += " AND IFNULL(acknowledged,0)=0"
+        q += " ORDER BY datetime(created_at) DESC LIMIT ?"
+        params.append(lim)
+        rows = conn.execute(q, params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def acknowledge_steady_yield_alert(alert_id: int) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE steady_yield_alert_events SET acknowledged=1 WHERE id=?",
+            (int(alert_id),),
+        )
+        conn.commit()
+
+
+def list_steady_yield_group_ids_from_trades() -> list[str]:
+    """Distinct group_id z obchodov (neprázdne)."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT group_id FROM trades WHERE group_id IS NOT NULL AND TRIM(group_id) != '' "
+            "ORDER BY group_id"
+        ).fetchall()
+    return [r["group_id"] for r in rows if r["group_id"]]
 
 
 def set_group_maint_margins(margins: dict[str, float]) -> None:

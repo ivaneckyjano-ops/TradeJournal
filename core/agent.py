@@ -290,6 +290,7 @@ def build_portfolio_prompt(
       - iv_data: dict {ticker: iv_value}
       - iv_ranks: dict {ticker: rank} (manuálne zadané)
       - open_orders: list otvorených objednávok z TWS (vrátane BAG combo nôh a podmienok)
+      - ibkr_market_data_notes: str — predplatné / dostupnosť dát (voliteľné)
     """
     today_str    = date.today().strftime("%d.%m.%Y")
     groups       = portfolio_data.get("groups", [])
@@ -301,6 +302,18 @@ def build_portfolio_prompt(
     acct         = portfolio_data.get("account", {})
     strat        = portfolio_data.get("strategy_params", {})
     open_orders  = portfolio_data.get("open_orders", [])
+
+    _md_raw = (portfolio_data.get("ibkr_market_data_notes") or "").strip()
+    _md = _md_raw[:6000] if _md_raw else ""
+    market_data_text = ""
+    if _md:
+        market_data_text = (
+            f"\n## Predplatné trhových dát IBKR (od obchodníka)\n{_md}\n"
+            "Pri otázkach na live IV, opčné reťazce, Greeks alebo „či mám dostatok dát“ "
+            "tomuto textu dôveruj viac než všeobecným predpokladom. "
+            "TWS môže zobrazovať IV Rank 13t a 52t — to sú rozdielne okná (percentil IV voči min/max v danom horizonte); "
+            "nie je to automaticky to isté číslo ako stĺpec IV Rank v tejto aplikácii (tam môže byť manuálne alebo z vlastnej histórie).\n"
+        )
 
     # Sekcia: otvorené skupiny
     groups_text = ""
@@ -433,7 +446,7 @@ DÔLEŽITÉ PRAVIDLÁ:
 - Pri ochrane: posudzuj každú skupinu samostatne aj portfólio ako celok
 
 ## Dátum analýzy: {today_str}
-
+{market_data_text}
 ## Otvorené skupiny ({len(groups)}):
 {groups_text}
 {metrics_text}
@@ -511,6 +524,18 @@ def chat_portfolio(history: list[dict], model: str | None = None) -> str:
     client = _load_client()
     m, max_tok = _resolve_model(model)
 
+    try:
+        from core import database as _db
+
+        _ibkr_ctx = (_db.get_setting(_db.AGENT_IBKR_MARKET_DATA_KEY, "") or "").strip()[:4000]
+    except Exception:
+        _ibkr_ctx = ""
+    _sys_ibkr = (
+        f" Predplatné / dostupnosť trhových dát IBKR (od používateľa): {_ibkr_ctx}"
+        if _ibkr_ctx
+        else ""
+    )
+
     api_messages = []
     for i, msg in enumerate(history):
         role    = msg["role"]
@@ -539,6 +564,7 @@ def chat_portfolio(history: list[dict], model: str | None = None) -> str:
             "Si skúsený portfóliový manažér pre opčné stratégie (call diagonaly). "
             "Píš v slovenčine. Buď konkrétny a číselný. "
             "Ceny píš ako '190 USD', nikdy nepoužívaj LaTeX."
+            + _sys_ibkr
         ),
         messages=api_messages,
     )

@@ -35,22 +35,24 @@ DEFAULT_IV      = 0.30
 # Utility
 # ─────────────────────────────────────────────────────────────────────────────
 
-def calc_dte(expiry_str: Optional[str]) -> Optional[int]:
-    """Vráti počet dní do expirácie z reťazca YYYY-MM-DD. None ak chýba / chyba."""
-    if not expiry_str:
-        return None
-    try:
-        return (datetime.strptime(expiry_str, "%Y-%m-%d").date() - date.today()).days
-    except ValueError:
-        return None
-
-
 def normalize_expiry(exp: str) -> str:
     """Prevedie YYYYMMDD → YYYY-MM-DD. Ak je už YYYY-MM-DD, vráti bez zmeny."""
     exp = str(exp).strip()
     if len(exp) == 8 and "-" not in exp:
         return f"{exp[:4]}-{exp[4:6]}-{exp[6:]}"
     return exp
+
+
+def calc_dte(expiry_str: Optional[str]) -> Optional[int]:
+    """Dni do expirácie. Podporuje YYYYMMDD (IBKR opčný reťazec) aj YYYY-MM-DD."""
+    if not expiry_str:
+        return None
+    try:
+        raw = str(expiry_str).strip().split()[0]
+        s = normalize_expiry(raw)
+        return (datetime.strptime(s, "%Y-%m-%d").date() - date.today()).days
+    except ValueError:
+        return None
 
 
 def _right(option_type: str) -> str:

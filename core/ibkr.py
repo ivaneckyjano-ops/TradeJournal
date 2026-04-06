@@ -328,99 +328,102 @@ def disconnect() -> None:
 def fetch_underlying(ticker: str, timeout: float = 10.0) -> dict:
     """
     Vráti aktuálnu cenu podkladového aktíva.
-    1. Portfólio (okamžité), 2. reqMktData (~10s).
+    Preferuje snapshot/stream z IB; fallback je historický posledný bar.
     """
     ib = get_ib()
     if not ib or not ib.isConnected():
         return {"price": None, "ticker": ticker, "error": "Nie je pripojenie na IBKR"}
 
-    _, Stock, _ = _ib_ready()
+    ib_loop = getattr(ib, "_loop", None) or _MAIN_LOOP
+    if ib_loop is None or getattr(ib_loop, "is_closed", lambda: False)():
+        return {"price": None, "ticker": ticker, "error": "Chýba IB event loop (odpoj/pripoj TWS)"}
 
-    # 1. Portfólio — okamžité (ale len ak sa zdá byť aktuálne, tu sa často skrýva stará 'marketPrice')
-    # Ak nemáš STK, ale len OPT, nechceme brať cenu z portfólia lebo býva neaktuálna.
-    # Urobíme to tak, že najprv skúsime načítat streamovanú cenu.
-    
-    # 2. Streaming reqMktData — čerstvá cena v separátnom vlákne
-    price_result: dict = {}
-    done2 = threading.Event()
+    prev_loop = None
+    try:
+        prev_loop = asyncio.get_event_loop()
+    except RuntimeError:
+        prev_loop = None
 
-    def _spot_worker():
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            import nest_asyncio
-            nest_asyncio.apply(loop)
-            from ib_insync import Stock as IBStock
+    asyncio.set_event_loop(ib_loop)
+    try:
+        _, Stock, _ = _ib_ready()
+        stock = Stock(ticker, "SMART", "USD")
+        q = ib.qualifyContracts(stock)
+        if not q:
+            return {"price": None, "ticker": ticker, "error": f"Underlying {ticker} nenájdený"}
+        stock = q[0]
 
-            stock = IBStock(ticker, "SMART", "USD")
-            ib.qualifyContracts(stock)
+        def _valid(v) -> float | None:
+            try:
+                f = float(v)
+                return f if f and not math.isnan(f) and f > 0 else None
+            except Exception:
+                return None
 
-            def _valid(v) -> float | None:
-                try:
-                    f = float(v)
-                    return f if f and not math.isnan(f) and f > 0 else None
-                except Exception:
-                    return None
-
-            # Skúsi live (1) → delayed (3) → frozen live (2) → delayed frozen (4)
-            for mdt in (1, 3, 2, 4):
+        # 1) Snapshot/live pokusy (live/delayed/frozen)
+        per_try = max(1.5, float(timeout) / 4.0)
+        for mdt in (1, 3, 2, 4):
+            try:
                 ib.reqMarketDataType(mdt)
-                # DÔLEŽITÉ: Niekedy stock stream nepríde, ak nedržíš akcie, ale chce to reqMktData priamo na smart.
-                # Snapshot request s False čaká na plný stream. 
-                tkr = ib.reqMktData(stock, "106", False, False)
-                deadline = time.time() + 3
+                tkr = ib.reqMktData(stock, "106", True, False)
+                deadline = time.time() + per_try
                 found = None
                 while time.time() < deadline and not found:
-            # TWS posiela tickPrice eventy. 'last' a 'close' sa updatujú.
-                    if getattr(tkr, "last", None) and not math.isnan(tkr.last) and tkr.last > 0:
-                        found = float(tkr.last)
-                    elif getattr(tkr, "close", None) and not math.isnan(tkr.close) and tkr.close > 0:
-                        found = float(tkr.close)
-                    elif getattr(tkr, "bid", None) and getattr(tkr, "ask", None) and not math.isnan(tkr.bid) and not math.isnan(tkr.ask) and tkr.bid > 0 and tkr.ask > 0:
-                        found = float(round((tkr.bid + tkr.ask) / 2, 2))
-                    
+                    found = _valid(getattr(tkr, "last", None))
                     if not found:
-                        val = tkr.marketPrice()
-                        if val and not math.isnan(val) and val > 0:
-                            found = float(val)
-
+                        found = _valid(getattr(tkr, "close", None))
+                    if not found:
+                        bid = _valid(getattr(tkr, "bid", None))
+                        ask = _valid(getattr(tkr, "ask", None))
+                        if bid and ask:
+                            found = round((bid + ask) / 2.0, 2)
+                    if not found:
+                        found = _valid(tkr.marketPrice())
                     if not found:
                         ib.sleep(0.1)
-                        
                 ib.cancelMktData(stock)
                 if found:
-                    price_result["price"] = found
-                    price_result["source"] = f"live-stream mdt={mdt}"
-                    break
+                    return {"price": float(found), "ticker": ticker, "error": None, "source": f"snapshot mdt={mdt}"}
+            except Exception:
+                continue
 
+        # 2) Historický fallback (často funguje aj keď snapshot nie)
+        for dur, what in [("300 S", "TRADES"), ("300 S", "MIDPOINT"), ("1 D", "TRADES"), ("1 D", "MIDPOINT")]:
+            try:
+                bars = ib.reqHistoricalData(
+                    stock,
+                    endDateTime="",
+                    durationStr=dur,
+                    barSizeSetting="1 min",
+                    whatToShow=what,
+                    useRTH=False,
+                    formatDate=1,
+                    timeout=min(max(float(timeout), 6.0), 20.0),
+                )
+                if bars:
+                    px = _valid(getattr(bars[-1], "close", None))
+                    if px:
+                        return {"price": float(px), "ticker": ticker, "error": None, "source": f"hist {what.lower()}"}
+            except Exception:
+                continue
 
-        except Exception as e:
-            price_result["error"] = str(e)
-        finally:
-            done2.set()
-
-    t2 = threading.Thread(target=_spot_worker, daemon=True)
-    t2.start()
-    finished2 = done2.wait(timeout=timeout)
-
-    # 3. Záchranné lano – ak reqMktData nenašiel nič, ale máme niečo v portfóliu
-    if not price_result.get("price"):
+        # 3) Posledné záchranné lano – portfólio cena
         try:
             for item in ib.portfolio():
                 if item.contract.symbol == ticker and item.contract.secType == "STK":
-                    p = item.marketPrice
-                    if p and not math.isnan(p) and p > 0:
+                    p = _valid(item.marketPrice)
+                    if p:
                         return {"price": float(p), "ticker": ticker, "error": None, "source": "portfolio fallback"}
         except Exception:
             pass
 
-    if not finished2:
-        return {"price": None, "ticker": ticker, "error": f"Timeout {timeout}s — cena nedostupná"}
-    if price_result.get("price"):
-        return {"price": price_result["price"], "ticker": ticker, "error": None,
-                "source": price_result.get("source", "mktdata")}
-    return {"price": None, "ticker": ticker,
-            "error": price_result.get("error", "Cena nedostupná — zadaj manuálne")}
+        return {"price": None, "ticker": ticker, "error": "Spot nedostupný (snapshot aj historical bez dát)"}
+    finally:
+        if prev_loop is not None and not getattr(prev_loop, "is_closed", lambda: False)():
+            try:
+                asyncio.set_event_loop(prev_loop)
+            except Exception:
+                pass
 
 
 def fetch_option_data(ticker: str, expiry: str, strike: float, right: str) -> dict:
@@ -542,25 +545,323 @@ def fetch_option_data(ticker: str, expiry: str, strike: float, right: str) -> di
     return result
 
 
+def _ib_expiry_compact(expiry: str) -> str:
+    """IB Option kontrakt očakáva YYYYMMDD; ak príde YYYY-MM-DD, znormalizuje."""
+    s = str(expiry or "").strip().split()[0]
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        return s[:4] + s[5:7] + s[8:10]
+    if len(s) == 8 and s.isdigit():
+        return s
+    s2 = s.replace("-", "")
+    return s2[:8] if len(s2) >= 8 else s2
+
+
 def fetch_iv(ticker: str, expiry: str, strike: float, right: str = "C") -> dict:
-    """Načíta IV pre konkrétny opčný kontrakt."""
+    """Načíta IV pre konkrétny opčný kontrakt (na ``ib._loop`` + skúška live/delayed)."""
     ib = get_ib()
     if not ib or not ib.isConnected():
         return {"iv": None, "und_price": None, "error": "Nie je pripojenie na IBKR"}
 
-    _, _, Option = _ib_ready()
+    sym = (ticker or "").strip().upper()
+    rr = (right or "C").upper()[:1]
+    if rr not in ("C", "P"):
+        rr = "C"
+    expiry_ib = _ib_expiry_compact(expiry)
 
+    ib_loop = getattr(ib, "_loop", None) or _MAIN_LOOP
+    if ib_loop is None or getattr(ib_loop, "is_closed", lambda: False)():
+        return {"iv": None, "und_price": None, "error": "Chýba IB event loop"}
+
+    prev_loop = None
     try:
-        opt = Option(ticker, expiry, strike, right, "SMART")
-        ib.qualifyContracts(opt)
-        ib.reqMarketDataType(4)
-        [t] = ib.reqTickers(opt)
-        greeks = t.modelGreeks or t.bidGreeks or t.askGreeks
-        if greeks is None:
-            return {"iv": None, "und_price": None, "error": "Greeks nedostupné"}
-        return {"iv": greeks.impliedVol, "und_price": greeks.undPrice, "error": None}
+        prev_loop = asyncio.get_event_loop()
+    except RuntimeError:
+        prev_loop = None
+
+    asyncio.set_event_loop(ib_loop)
+    try:
+        _ib_ready()
+        from ib_insync import Option as IBOption
+
+        opt = IBOption(sym, expiry_ib, float(strike), rr, "SMART", currency="USD")
+        q = ib.qualifyContracts(opt)
+        if not q:
+            return {"iv": None, "und_price": None, "error": f"Kontrakt {sym} nenájdený"}
+        opt = q[0]
+        last_err = "Greeks nedostupné"
+        for mdt in (1, 3, 2, 4):
+            ib.reqMarketDataType(mdt)
+            try:
+                [tk] = ib.reqTickers(opt)
+            except Exception as e:
+                last_err = str(e)
+                continue
+            for _wait in range(5):
+                ib.sleep(0.22)
+                g = tk.modelGreeks or tk.bidGreeks or tk.askGreeks
+                if g is not None and getattr(g, "impliedVol", None) is not None:
+                    try:
+                        ivv = float(g.impliedVol)
+                        if ivv == ivv and ivv > 0:
+                            return {
+                                "iv": g.impliedVol,
+                                "und_price": g.undPrice,
+                                "error": None,
+                            }
+                    except (TypeError, ValueError):
+                        pass
+        return {"iv": None, "und_price": None, "error": last_err}
     except Exception as e:
         return {"iv": None, "und_price": None, "error": str(e)}
+    finally:
+        if prev_loop is not None and not getattr(prev_loop, "is_closed", lambda: False)():
+            try:
+                asyncio.set_event_loop(prev_loop)
+            except Exception:
+                pass
+
+
+def fetch_secdef_option_params(ticker: str, timeout: float = 14.0) -> dict:
+    """
+    Zoznam opčných reťazcov (expirácie, striky) pre akciu — ``reqSecDefOptParams``.
+
+    ``ib_insync`` používa ``asyncio.get_event_loop()`` (``util.getLoop()``). Ak Streamlit /
+    Python 3.12 nastaví iný loop ako ``ib._loop`` z ``connect()``, ``reqSecDefOptParams``
+    skončí s prázdnym výsledkom. Preto tu dočasne viažeme aktuálne vlákno na ``ib._loop``.
+    """
+    ib = get_ib()
+    if not ib or not ib.isConnected():
+        return {"chains": [], "error": "Nie je pripojenie na IBKR"}
+    sym = (ticker or "").strip().upper()
+    result: dict = {"chains": [], "error": None}
+
+    ib_loop = getattr(ib, "_loop", None) or _MAIN_LOOP
+    if ib_loop is None or getattr(ib_loop, "is_closed", lambda: False)():
+        return {
+            "chains": [],
+            "error": "Chýba IB event loop (ib._loop) — odpoj sa a znova pripoj TWS.",
+        }
+
+    prev_loop = None
+    try:
+        prev_loop = asyncio.get_event_loop()
+    except RuntimeError:
+        prev_loop = None
+
+    asyncio.set_event_loop(ib_loop)
+    old_timeout = None
+    try:
+        _ib_ready()
+        from ib_insync import Stock as IBStock
+
+        old_timeout = getattr(ib, "RequestTimeout", None)
+        try:
+            ib.RequestTimeout = int(max(8, min(float(timeout), 60.0)))
+        except Exception:
+            pass
+        try:
+            stc = IBStock(sym, "SMART", "USD")
+            qualified = ib.qualifyContracts(stc)
+            if not qualified:
+                result["error"] = f"Underlying {sym} nenájdený"
+                return result
+            und = qualified[0]
+            uid = und.conId
+            sec_type = getattr(und, "secType", None) or "STK"
+            chains = ib.reqSecDefOptParams(sym, "", sec_type, uid)
+            out = []
+            for c in chains or []:
+                exps = sorted(getattr(c, "expirations", []) or [])
+                strikes = sorted({float(x) for x in (getattr(c, "strikes", []) or [])})
+                out.append({
+                    "exchange": getattr(c, "exchange", ""),
+                    "trading_class": getattr(c, "tradingClass", ""),
+                    "expirations": exps,
+                    "strikes": strikes,
+                })
+            merged_exp: set[str] = set()
+            merged_str: set[float] = set()
+            for row in out:
+                merged_exp.update(row.get("expirations") or [])
+                merged_str.update(row.get("strikes") or [])
+            if merged_exp:
+                out.insert(0, {
+                    "exchange": "MERGED",
+                    "trading_class": "",
+                    "expirations": sorted(merged_exp),
+                    "strikes": sorted(merged_str),
+                })
+            result["chains"] = out
+        except Exception as e:
+            result["error"] = str(e)
+        finally:
+            if old_timeout is not None:
+                try:
+                    ib.RequestTimeout = old_timeout
+                except Exception:
+                    pass
+    finally:
+        if prev_loop is not None and not getattr(prev_loop, "is_closed", lambda: False)():
+            try:
+                asyncio.set_event_loop(prev_loop)
+            except Exception:
+                pass
+
+    return result
+
+
+def fetch_option_scan_metrics(ticker: str, expiry: str, strike: float, right: str, timeout: float = 12.0) -> dict:
+    """
+    Bid/ask/mid, spread % mid, open interest, IV a theta z modelGreeks (tick 101) pre jeden kontrakt.
+    Beží na ``ib._loop`` (rovnako ako ``fetch_secdef_option_params``) — vlákno + cudzí loop
+    často nevráti ticky ani pri otvorenom trhu.
+    """
+    ib = get_ib()
+    if not ib or not ib.isConnected():
+        return {"error": "Nie je pripojenie na IBKR"}
+    sym = (ticker or "").strip().upper()
+    r = (right or "C").upper()[:1]
+    if r not in ("C", "P"):
+        r = "C"
+
+    def _sf(v):
+        try:
+            f = float(v)
+            return f if not math.isnan(f) and f > 0 else None
+        except Exception:
+            return None
+
+    def _tick_ok(t_obj) -> bool:
+        return bool(_sf(getattr(t_obj, "bid", None)) or _sf(getattr(t_obj, "ask", None)) or _sf(getattr(t_obj, "last", None)))
+
+    def _fill_from_ticker(t_obj, out: dict) -> None:
+        bid = _sf(t_obj.bid)
+        ask = _sf(t_obj.ask)
+        last = _sf(t_obj.last)
+        greeks = t_obj.modelGreeks or t_obj.bidGreeks or t_obj.askGreeks
+        iv_raw = getattr(greeks, "impliedVol", None) if greeks is not None else None
+        und_price = getattr(greeks, "undPrice", None) if greeks is not None else None
+        theta_raw = getattr(greeks, "theta", None) if greeks is not None else None
+        oi = getattr(t_obj, "openInterest", None)
+        if oi is not None:
+            try:
+                oi = int(oi)
+            except (TypeError, ValueError):
+                oi = None
+        mid = None
+        if bid and ask:
+            mid = round((bid + ask) / 2.0, 4)
+        elif last:
+            mid = round(last, 4)
+        spread_pct = None
+        if bid and ask and mid and mid > 0:
+            spread_pct = round((ask - bid) / mid * 100.0, 3)
+        th = None
+        if theta_raw is not None:
+            try:
+                tf = float(theta_raw)
+                if not math.isnan(tf):
+                    th = round(tf, 5)
+            except (TypeError, ValueError):
+                pass
+        out.update({
+            "ticker": sym,
+            "expiry": expiry,
+            "strike": float(strike),
+            "right": r,
+            "bid": bid,
+            "ask": ask,
+            "last": last,
+            "mid": mid,
+            "realized_fill_price": mid or last,
+            "spread_pct_mid": spread_pct,
+            "open_interest": oi,
+            "iv": _sf(iv_raw),
+            "theta": th,
+            "und_price": _sf(und_price),
+            "error": None if (bid or ask or last) else "Žiadna cena (trh/market data)",
+        })
+
+    ib_loop = getattr(ib, "_loop", None) or _MAIN_LOOP
+    if ib_loop is None or getattr(ib_loop, "is_closed", lambda: False)():
+        return {"error": "Chýba IB event loop (odpoj/pripoj TWS)"}
+
+    prev_loop = None
+    try:
+        prev_loop = asyncio.get_event_loop()
+    except RuntimeError:
+        prev_loop = None
+
+    result: dict = {"error": None}
+    asyncio.set_event_loop(ib_loop)
+    old_timeout = None
+    try:
+        _ib_ready()
+        from ib_insync import Option as IBOption
+
+        old_timeout = getattr(ib, "RequestTimeout", None)
+        try:
+            ib.RequestTimeout = int(max(8, min(float(timeout), 30.0)))
+        except Exception:
+            pass
+
+        expiry_ib = _ib_expiry_compact(expiry)
+        opt = IBOption(sym, expiry_ib, float(strike), r, "SMART", currency="USD")
+        qualified = ib.qualifyContracts(opt)
+        if not qualified:
+            return {"error": f"Kontrakt {sym} {expiry} ${strike} {r} nenájdený"}
+        opt = qualified[0]
+
+        per_pass = max(2.5, float(timeout) / 4.0)
+        got = False
+        for snapshot in (True, False):
+            for mdt in (1, 3, 2, 4):
+                ib.reqMarketDataType(mdt)
+                t_obj = ib.reqMktData(opt, "101", snapshot, False)
+                deadline = time.time() + per_pass
+                while time.time() < deadline and not _tick_ok(t_obj):
+                    ib.sleep(0.12)
+                ib.cancelMktData(opt)
+                if _tick_ok(t_obj):
+                    _fill_from_ticker(t_obj, result)
+                    got = True
+                    break
+            if got:
+                break
+
+        if not got:
+            result.update({
+                "ticker": sym,
+                "expiry": expiry,
+                "strike": float(strike),
+                "right": r,
+                "bid": None,
+                "ask": None,
+                "last": None,
+                "mid": None,
+                "realized_fill_price": None,
+                "spread_pct_mid": None,
+                "open_interest": None,
+                "iv": None,
+                "theta": None,
+                "und_price": None,
+                "error": "Žiadna cena (bid/ask/last) — skús iný typ dát v TWS alebo kontrakt",
+            })
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        if old_timeout is not None:
+            try:
+                ib.RequestTimeout = old_timeout
+            except Exception:
+                pass
+        if prev_loop is not None and not getattr(prev_loop, "is_closed", lambda: False)():
+            try:
+                asyncio.set_event_loop(prev_loop)
+            except Exception:
+                pass
+
+    return result
 
 
 def _parse_ib_margin_value(v) -> Optional[float]:
@@ -1542,6 +1843,7 @@ def fetch_fills() -> dict:
                 "contracts": int(abs(ex.shares)),
                 "leg_type": "Long" if side == "BOT" else "Short",
                 "entry_price": ex.price,
+                "realized_fill_price": ex.price,
                 "entry_date": (ex.time.strftime("%Y-%m-%d") if hasattr(ex.time, "strftime") else str(ex.time)[:10]) if ex.time else datetime.today().strftime("%Y-%m-%d"),
                 "exec_id": ex.execId,
                 "side": side,

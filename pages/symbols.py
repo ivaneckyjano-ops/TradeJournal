@@ -4,6 +4,7 @@ from datetime import date
 
 from core import database as db
 from core.page_context import set_tradejournal_page
+from core.yahoo_symbol_sync import YAHOO_SYMBOL_SYNC_SETTING_KEY, sync_all_symbols_from_yahoo
 
 db.init_db()
 set_tradejournal_page("symbols")
@@ -43,7 +44,8 @@ def _parse_date(s: str | None):
 st.title("📌 Symboly")
 st.caption(
     "Centrálna správa tickerov — definuj symboly raz a vyberaj ich z dropdownu "
-    "v celom denníku (Trade Log, Roll Simulátor, Kalendár, Dashboard)."
+    "v celom denníku (Trade Log, Roll Simulátor, Kalendár, Dashboard). "
+    "Spot, sektor a IV vieš pravidelne dopĺňať cez **Yahoo Finance** (záložka Prehľad)."
 )
 
 tab_add, tab_manage = st.tabs(["Pridať symbol", "Prehľad a úprava"])
@@ -195,20 +197,96 @@ with tab_manage:
                 "Názov": s.get("company_name") or "—",
                 "Typ": s.get("asset_type") or "—",
                 "Sektor": s.get("sector") or "—",
+                "Spot $": s.get("spot"),
+                "IV %": s.get("iv_pct"),
                 "IV Rank (%)": s.get("iv_rank"),
+                "IV R 13t": s.get("iv_rank_13w"),
+                "IV R 52t": s.get("iv_rank_52w"),
+                "Sync": (s.get("market_synced_at") or "")[:16] or "—",
                 "Earnings termíny": earn_dates or "—",
                 "IR": "🔗" if s.get("ir_url") else "—",
                 "Otv. pozície": open_count,
                 "Všetky obchody": trade_count,
             })
         df_sym = pd.DataFrame(rows)
+        st.caption(
+            "**IV %** = implied volatility v **percentách** (napr. 35 = 35 %), typicky ATM call z Yahoo. "
+            "**IV Rank** u nás **nie je** presne brokerovský „52‑týždňový“ rank: je to percentil aktuálneho IV % "
+            "voči **min/max z histórie denných snapshotov** v DB (až ~252 starších dní po jednom behu denne). "
+            "Kým história nemá aspoň 5 bodov, rank môže chýbať."
+        )
         st.dataframe(
             df_sym, hide_index=True, use_container_width=True,
             column_config={
-                "IV Rank (%)": st.column_config.NumberColumn(format="%.1f %%"),
+                "Spot $": st.column_config.NumberColumn(format="$%.2f"),
+                "IV %": st.column_config.NumberColumn(
+                    format="%.1f %%",
+                    help="Ukladá sa ako percentá (35 = 35 %). Hodnoty ako 0.2 alebo 0.8 sú často omylom zlomok (20 % / 80 %) — oprav tlačidlom nižšie.",
+                ),
+                "IV Rank (%)": st.column_config.NumberColumn(
+                    format="%.1f %%",
+                    help="Percentil z vlastnej histórie IV % v DB, nie kalendárny rok od brokera.",
+                ),
+                "IV R 13t": st.column_config.NumberColumn(
+                    format="%.0f %%",
+                    help="Manuálne z TWS (13t IV Rank), pre skener kalendára.",
+                ),
+                "IV R 52t": st.column_config.NumberColumn(
+                    format="%.0f %%",
+                    help="Manuálne z TWS (52t IV Rank).",
+                ),
                 "Otv. pozície": st.column_config.NumberColumn(),
                 "Všetky obchody": st.column_config.NumberColumn(),
             },
+        )
+        if st.button("Opraviť IV %: zlomok → percentá (×100)", key="iv_pct_normalize_btn"):
+            n_sym, n_sn = db.normalize_symbols_iv_pct_fraction_scale()
+            st.success(f"Upravené riadky: symbols {n_sym}, história snapshotov {n_sn}.")
+            st.rerun()
+
+        st.divider()
+        st.subheader("Obnova z Yahoo Finance")
+        _yh_last = db.get_setting(YAHOO_SYMBOL_SYNC_SETTING_KEY, "")
+        st.caption(
+            "Stiahne **spot**, **názov**, **sektor**, **industry**, **IV %** (ATM call, yfinance; v **percentách**) "
+            "a **IV rank** ako percentil aktuálneho IV % voči min/max z **predchádzajúcich** denných snapshotov "
+            "(nie fixný kalendárny rok brokera). Po pár dňoch/týždňoch pravidelného behu je rank použiteľnejší. "
+            "Neprepisuje earnings ani IR URL."
+        )
+        st.caption(f"Posledný hromadný beh: **{_yh_last or '—'}**")
+        yh_pause = st.number_input(
+            "Pauza medzi tickerom (s)",
+            min_value=0.2,
+            max_value=4.0,
+            value=0.65,
+            step=0.05,
+            key="yh_pause_s",
+            help="Šetrí rate limity Yahoo; pri chybách skús zvýšiť.",
+        )
+        yh_pick = st.multiselect(
+            "Len vybrané tickery (prázdne = všetky v tabuľke)",
+            options=[s["ticker"] for s in symbols],
+            default=[],
+            key="yh_subset",
+        )
+        if st.button("Stiahnuť a uložiť do DB", type="primary", key="yh_sync_btn"):
+            with st.spinner("Yahoo Finance (môže trvať podľa počtu symbolov)…"):
+                _rep = sync_all_symbols_from_yahoo(
+                    yh_pick if yh_pick else None,
+                    pause_s=float(yh_pause),
+                )
+            _bad = [r for r in _rep if not r.get("ok")]
+            st.success(f"Spracované: {len(_rep) - len(_bad)} / {len(_rep)}")
+            if _bad:
+                st.warning(
+                    "Zlyhania: "
+                    + " · ".join(f"{b.get('ticker')}: {b.get('error', '')[:80]}" for b in _bad[:15])
+                )
+            st.rerun()
+
+        st.caption(
+            "Automaticky (cron): z koreňa projektu spusti `python core/yahoo_symbol_sync.py` "
+            "(voliteľne zoznam tickerov ako argumenty)."
         )
 
         st.divider()
@@ -266,6 +344,27 @@ with tab_manage:
                             "IV Rank (%)", min_value=0.0, max_value=100.0,
                             value=float(sym.get("iv_rank") or 0.0), step=0.5,
                             key=f"siv_{sym['id']}"
+                        )
+
+                    ivh1, ivh2 = st.columns(2)
+                    with ivh1:
+                        e_iv13 = st.number_input(
+                            "IV Rank 13 týžd. (%) — z TWS",
+                            min_value=0.0,
+                            max_value=100.0,
+                            value=float(sym.get("iv_rank_13w") or 0.0),
+                            step=0.5,
+                            key=f"siv13_{sym['id']}",
+                            help="Pre Steady Yields skener: kontext či môžeš čakať na rast IV na dlhej nohe.",
+                        )
+                    with ivh2:
+                        e_iv52 = st.number_input(
+                            "IV Rank 52 týžd. (%) — z TWS",
+                            min_value=0.0,
+                            max_value=100.0,
+                            value=float(sym.get("iv_rank_52w") or 0.0),
+                            step=0.5,
+                            key=f"siv52_{sym['id']}",
                         )
 
                     # ── Investor Relations URL ─────────────────────────────────
@@ -326,6 +425,10 @@ with tab_manage:
                         earnings_date_4=new_earn[3],
                         ir_url=e_ir.strip() or None,
                         iv_rank=e_iv if e_iv > 0 else None,
+                        spot=sym.get("spot"),
+                        iv_pct=sym.get("iv_pct"),
+                        iv_rank_13w=e_iv13 if e_iv13 > 0 else None,
+                        iv_rank_52w=e_iv52 if e_iv52 > 0 else None,
                     )
                     st.success(f"Symbol **{e_ticker}** aktualizovaný.")
                     st.rerun()

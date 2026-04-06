@@ -114,107 +114,116 @@ with st.sidebar:
     if _spot_running:
         st.rerun()  # auto-refresh každý render kým beží
 
-    # ── Tabuľka: Spot / IV % / IV Rank pre všetkých 7 tickerov ─────────────
-    st.subheader("📊 Trhové dáta tickerov")
+    # ── Trhové vstupy: duplicitné voči Symboly — sidebar len skrátená úprava ──
+    st.subheader("📊 Trhové dáta pre agenta")
     st.caption(
-        "➕ Pridaj riadok | 🗑 Vymaž riadok (zaškrtni + kláves Delete) | "
-        "**Spot $** · **IV %** · **IV Rank** (< 25% = doma)."
+        "**Symboly** sú primárny zdroj (vrátane Yahoo sync). Tá istá trojica polí je tu pre rýchlu úpravu "
+        "bez opustenia stránky; hlavná tabuľka nižšie (**Otvorené skupiny**) nie je duplicita — je to prehľad pozícií."
     )
+    st.page_link("pages/symbols.py", label="Otvoriť Symboly", icon="📌")
 
-    # ── Zostav počiatočné riadky: DB (spot+iv_pct+iv_rank) + session_state ──
-    # Priorita: session_state > DB > default
-    _saved_tbl: dict = st.session_state.get("mkt_table", {})
-    _all_syms   = db.get_symbols()
-    _db_tickers = {s["ticker"]: s for s in _all_syms}
+    with st.expander("Tabuľka Spot / IV % / IV Rank (voliteľné)", expanded=False):
+        st.caption(
+            "➕ Pridaj riadok | 🗑 Vymaž riadok (Delete) | **IV Rank** < 25 % = doma. "
+            "Po úprave **Uložiť do DB**."
+        )
 
-    _base_tickers = list(dict.fromkeys(
-        list(_saved_tbl.keys()) +
-        WATCHED +
-        [s["ticker"] for s in _all_syms]   # všetky z DB
-    ))
+        # ── Zostav počiatočné riadky: DB (spot+iv_pct+iv_rank) + session_state ──
+        # Priorita: session_state > DB > default
+        _saved_tbl: dict = st.session_state.get("mkt_table", {})
+        _all_syms   = db.get_symbols()
+        _db_tickers = {s["ticker"]: s for s in _all_syms}
 
-    _tbl_rows = []
-    for tk in _base_tickers:
-        tk = tk.strip().upper()
-        if not tk:
-            continue
-        sym_data   = _db_tickers.get(tk, {})
-        # Základ z DB (spot, iv_pct, iv_rank sú teraz perzistentné)
-        saved_spot = float(sym_data.get("spot") or 0)
-        saved_iv   = float(sym_data.get("iv_pct") or 30)
-        saved_ivr  = int(sym_data.get("iv_rank") or 0)
-        # session_state prepisuje (aktuálnejšie hodnoty počas session)
-        if tk in _saved_tbl:
-            saved_spot = float(_saved_tbl[tk].get("Spot $",  saved_spot))
-            saved_iv   = float(_saved_tbl[tk].get("IV %",    saved_iv))
-            saved_ivr  = int(_saved_tbl[tk].get("IV Rank", saved_ivr))
-        _tbl_rows.append({
-            "Ticker":  tk,
-            "Spot $":  saved_spot,
-            "IV %":    saved_iv,
-            "IV Rank": saved_ivr,
-        })
+        _base_tickers = list(dict.fromkeys(
+            list(_saved_tbl.keys()) +
+            WATCHED +
+            [s["ticker"] for s in _all_syms]   # všetky z DB
+        ))
 
-    _df_tbl = pd.DataFrame(_tbl_rows) if _tbl_rows else pd.DataFrame(
-        columns=["Ticker", "Spot $", "IV %", "IV Rank"]
-    )
-
-    _edited = st.data_editor(
-        _df_tbl,
-        key="mkt_data_editor",
-        use_container_width=True,
-        hide_index=True,
-        num_rows="dynamic",          # ← povoľuje pridávanie aj mazanie riadkov
-        column_config={
-            "Ticker":  st.column_config.TextColumn(
-                "Ticker", width="small",
-                help="Ticker symbol (napr. AMZN, SPY, QQQ...)",
-            ),
-            "Spot $":  st.column_config.NumberColumn(
-                "Spot $", min_value=0, max_value=100000, step=0.5, format="$%.2f",
-            ),
-            "IV %":    st.column_config.NumberColumn(
-                "IV %",   min_value=1, max_value=200,    step=1,   format="%.0f%%",
-            ),
-            "IV Rank": st.column_config.NumberColumn(
-                "IV Rank", min_value=0, max_value=100,   step=1,   format="%.0f%%",
-                help="IV Rank 0–100. Pod 25% = nevhodné prostredie.",
-            ),
-        },
-    )
-
-    if st.button("💾 Uložiť do DB", use_container_width=True, type="primary"):
-        _new_tbl = {}
-        for _, row in _edited.iterrows():
-            tk  = str(row.get("Ticker") or "").strip().upper()
+        _tbl_rows = []
+        for tk in _base_tickers:
+            tk = tk.strip().upper()
             if not tk:
                 continue
-            ivr  = float(row.get("IV Rank") or 0)
-            iv   = float(row.get("IV %") or 30)
-            spot = float(row.get("Spot $") or 0)
-            sym  = db.get_symbol(tk)
-            if sym:
+            sym_data   = _db_tickers.get(tk, {})
+            saved_spot = float(sym_data.get("spot") or 0)
+            saved_iv   = float(sym_data.get("iv_pct") or 30)
+            saved_ivr  = int(sym_data.get("iv_rank") or 0)
+            if tk in _saved_tbl:
+                saved_spot = float(_saved_tbl[tk].get("Spot $",  saved_spot))
+                saved_iv   = float(_saved_tbl[tk].get("IV %",    saved_iv))
+                saved_ivr  = int(_saved_tbl[tk].get("IV Rank", saved_ivr))
+            _tbl_rows.append({
+                "Ticker":  tk,
+                "Spot $":  saved_spot,
+                "IV %":    saved_iv,
+                "IV Rank": saved_ivr,
+            })
+
+        _df_tbl = pd.DataFrame(_tbl_rows) if _tbl_rows else pd.DataFrame(
+            columns=["Ticker", "Spot $", "IV %", "IV Rank"]
+        )
+
+        _edited = st.data_editor(
+            _df_tbl,
+            key="mkt_data_editor",
+            use_container_width=True,
+            hide_index=True,
+            num_rows="dynamic",
+            column_config={
+                "Ticker":  st.column_config.TextColumn(
+                    "Ticker", width="small",
+                    help="Ticker symbol (napr. AMZN, SPY, QQQ...)",
+                ),
+                "Spot $":  st.column_config.NumberColumn(
+                    "Spot $", min_value=0, max_value=100000, step=0.5, format="$%.2f",
+                ),
+                "IV %":    st.column_config.NumberColumn(
+                    "IV %",   min_value=1, max_value=200,    step=1,   format="%.0f%%",
+                ),
+                "IV Rank": st.column_config.NumberColumn(
+                    "IV Rank", min_value=0, max_value=100,   step=1,   format="%.0f%%",
+                    help="IV Rank 0–100. Pod 25% = nevhodné prostredie.",
+                ),
+            },
+        )
+
+        if st.button("💾 Uložiť do DB", use_container_width=True, type="primary", key="mkt_save_db"):
+            _new_tbl = {}
+            for _, row in _edited.iterrows():
+                tk  = str(row.get("Ticker") or "").strip().upper()
+                if not tk:
+                    continue
+                ivr  = float(row.get("IV Rank") or 0)
+                iv   = float(row.get("IV %") or 30)
+                spot = float(row.get("Spot $") or 0)
+                sym  = db.get_symbol(tk)
+                if sym:
                 db.update_symbol(
                     sym["id"], sym["ticker"], sym.get("company_name", ""),
                     sym.get("sector", ""), sym.get("asset_type", "Stock"),
                     sym.get("description", ""), sym.get("earnings_date"),
                     ivr,
                     spot=spot, iv_pct=iv,
+                    iv_rank_13w=sym.get("iv_rank_13w"),
+                    iv_rank_52w=sym.get("iv_rank_52w"),
                 )
-            else:
-                db.add_symbol(tk, iv_rank=ivr)
-                sym2 = db.get_symbol(tk)
-                if sym2:
+                else:
+                    db.add_symbol(tk, iv_rank=ivr)
+                    sym2 = db.get_symbol(tk)
+                    if sym2:
                     db.update_symbol(
                         sym2["id"], tk, "", "", "Stock", "", None,
                         ivr, spot=spot, iv_pct=iv,
+                        iv_rank_13w=sym2.get("iv_rank_13w"),
+                        iv_rank_52w=sym2.get("iv_rank_52w"),
                     )
-            _new_tbl[tk] = {"Spot $": spot, "IV %": iv, "IV Rank": int(ivr)}
-        st.session_state["mkt_table"] = _new_tbl
-        st.success(f"Uložené ({len(_new_tbl)} tickerov).")
-        st.rerun()
+                _new_tbl[tk] = {"Spot $": spot, "IV %": iv, "IV Rank": int(ivr)}
+            st.session_state["mkt_table"] = _new_tbl
+            st.success(f"Uložené ({len(_new_tbl)} tickerov).")
+            st.rerun()
 
-    # Extrahuj hodnoty pre zvyšok stránky (vynechaj prázdne riadky)
+    # Extrahuj hodnoty pre zvyšok stránky (vynechaj prázdne riadky); _edited z data_editor vyššie
     _valid_rows = _edited.dropna(subset=["Ticker"])
     _valid_rows = _valid_rows[_valid_rows["Ticker"].astype(str).str.strip() != ""]
     manual_spots: dict = {
@@ -283,6 +292,33 @@ with st.sidebar:
         "pref_long_dte":    _pref_long_dte,
         "max_risk_pct":     _max_risk_pct,
     }
+
+    with st.expander("📡 IBKR predplatné — informácia pre agenta", expanded=False):
+        st.caption(
+            "Sem vlož zoznam trhových dát z **Client Portal / Account Management** (alebo skrátený výpis z TWS). "
+            "Po úprave vždy klikni **Uložiť** — ten istý text dostane agent pri **Spustiť novú analýzu** aj pri **pokračovaní v chate**. "
+            "Užitočné pri otázkach na IV, opčné reťazce, L1/L2."
+        )
+        if "agent_ibkr_market_data" not in st.session_state:
+            st.session_state["agent_ibkr_market_data"] = db.get_setting(
+                db.AGENT_IBKR_MARKET_DATA_KEY, ""
+            )
+        st.text_area(
+            "Tvoje predplatné (voľný text)",
+            height=200,
+            key="agent_ibkr_market_data",
+            placeholder=(
+                "Napr. US Equity and Options Add-On Streaming Bundle (NP) …\n"
+                "US Securities Snapshot and Futures Value Bundle …"
+            ),
+        )
+        if st.button("💾 Uložiť text pre agenta do DB", key="agent_ibkr_save"):
+            db.set_setting(
+                db.AGENT_IBKR_MARKET_DATA_KEY,
+                st.session_state.get("agent_ibkr_market_data") or "",
+            )
+            st.success("Uložené. Použije sa pri ďalšej analýze a v chate.")
+            st.rerun()
 
     st.markdown("---")
     st.subheader("💳 Margin účtu")
@@ -701,6 +737,9 @@ if _do_analyze:
                     "account":                  _acct_s,
                     "strategy_params":          _strat,
                     "open_orders":              _tws_orders or [],
+                    "ibkr_market_data_notes":   db.get_setting(
+                        db.AGENT_IBKR_MARKET_DATA_KEY, ""
+                    ),
                 }
                 result = ai_agent.analyze_portfolio(
                     portfolio_payload,
