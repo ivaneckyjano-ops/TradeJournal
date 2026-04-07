@@ -1,12 +1,13 @@
 """
 TWS Portfolio Dashboard – live stav portfólia z Interactive Brokers.
 
-Zobrazuje:
-  - P/L: Unrealized, Realized (z IBKR portfólia) + rozpad podľa tickeru
-  - Pozície podľa skupín: trend Ročný výnos (Theta); voliteľný APR z P&L (unrealized)
-  - Margin: NLV, Available Funds, Buying Power, Maintenance Margin (úroveň účtu)
-  - Greeks: Net Theta, Vega; portfólio APTR (Θ) = ΣΘ / Σ(net debet + marža) po denníkových skupinách
+Zobrazuje (poradie na stránke):
+  1. Kontrola dát (zdroje cien, rozpad marketValue z API)
+  2. Voliteľné ručné úpravy: P/L, Available Funds, Net Theta, Net Vega, JSON podľa podkladu (uložené v DB)
+  3. Celkové výsledky: P/L, podľa podkladu, Margin, Greeks (vč. ručnej Theta/Vega z kroku 2), APTR (Θ) a grafy
+  4. Detail podľa skupín: marža, Theta z TWS, na konci tlačidlo **Uložiť snímky trendových grafov** (história grafov, nie pri Načítať z TWS)
 """
+import json
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -18,6 +19,7 @@ from core import ibkr
 from core import database as db
 from core.page_context import TWS_DASHBOARD_PAGE, set_tradejournal_page
 from core.portfolio_data import (
+    PORTFOLIO_FINANCE_OVERRIDES_KEY,
     calc_dte,
     compute_portfolio_theta_aptr,
     compute_theta_annualized_yield_pct,
@@ -25,7 +27,9 @@ from core.portfolio_data import (
     group_ibkr_positions_for_dashboard,
     ibkr_aggregates_by_underlying,
     journal_group_id,
+    merge_ibkr_by_underlying_overrides,
     normalize_expiry,
+    parse_portfolio_finance_overrides,
 )
 from core.steady_yields.engine import traffic_light
 
@@ -191,11 +195,12 @@ if job_status == "done":
             "mark": "Mark",
             "close": "Close",
         }
-        _src_txt = ", ".join(
+        _price_source_summary = ", ".join(
             f"{_src_label.get(k, k)}: {v}"
             for k, v in sorted(_src_counts.items(), key=lambda x: (-x[1], x[0]))
         )
-        st.info(f"Zdroj cien pri poslednom načítaní: {_src_txt}")
+    else:
+        _price_source_summary = ""
 
     # Záloha: staršie sedenia mali objednávky None a načítali sa pri ďalšom rendri
     if _JOB.get("orders") is None and ibkr.is_connected():
@@ -236,7 +241,23 @@ if job_status == "done":
 
     unreal_pnl = sum(float(p.get("unrealized_pnl") or 0) for p in positions)
     real_pnl   = sum(float(p.get("realized_pnl")   or 0) for p in positions)
-    mkt_val    = sum(float(p.get("market_value")    or 0) for p in positions)
+
+    try:
+        _avail_base = float(avail) if avail not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        _avail_base = 0.0
+
+    _fin_ov = parse_portfolio_finance_overrides(db.get_setting(PORTFOLIO_FINANCE_OVERRIDES_KEY, "{}"))
+    _disp_unreal = unreal_pnl
+    _disp_real = real_pnl
+    _disp_avail = _avail_base
+    if _fin_ov["enabled"]:
+        if _fin_ov["unrealized_pnl"] is not None:
+            _disp_unreal = float(_fin_ov["unrealized_pnl"])
+        if _fin_ov["realized_pnl"] is not None:
+            _disp_real = float(_fin_ov["realized_pnl"])
+        if _fin_ov["available_funds"] is not None:
+            _disp_avail = float(_fin_ov["available_funds"])
 
     def _qty(p):
         return float(p.get("contracts") or 1)
@@ -255,6 +276,14 @@ if job_status == "done":
         (-1 if p.get("leg_type") == "Short" else 1)
         for p in opts if p.get("vega")
     )
+
+    _disp_theta = total_theta
+    _disp_vega = total_vega
+    if _fin_ov["enabled"]:
+        if _fin_ov["net_theta_per_day"] is not None:
+            _disp_theta = float(_fin_ov["net_theta_per_day"])
+        if _fin_ov["net_vega"] is not None:
+            _disp_vega = float(_fin_ov["net_vega"])
 
     _open_tr = db.get_open_trades()
     _all_tr = db.get_all_trades()
@@ -280,52 +309,214 @@ if job_status == "done":
             _ordered, _all_tr, _eff_grp_margins, _unmatched
         )
 
+    _by_sec_rows: list[dict] = []
+    _sec_acc: dict[str, list] = {}
+    for _p in positions:
+        _st = str(_p.get("sec_type") or "?")
+        if _st not in _sec_acc:
+            _sec_acc[_st] = [0.0, 0]
+        _sec_acc[_st][0] += float(_p.get("market_value") or 0)
+        _sec_acc[_st][1] += 1
+    for _st in sorted(_sec_acc.keys()):
+        _v, _n = _sec_acc[_st]
+        _by_sec_rows.append({"Typ (secType)": _st, "Súčet trh. hodnoty $": round(_v, 2), "Počet riadkov": _n})
+
+    _sec_types_in = sorted(set(p.get("sec_type", "?") for p in positions))
+
+    st.divider()
+    st.caption(
+        "**Postup:** **1** kontrola dát z API · **2** voliteľné ručné úpravy · "
+        "**3** súhrnné metriky a trendové grafy · **4** detail podľa skupín z denníka."
+    )
+
+    # ── 1 · Kontrola dát ─────────────────────────────────────────────────────
+    st.subheader("1 · Kontrola dát")
+    st.caption(
+        "Over, či zdroje cien a súčty z IB zodpovedajú tomu, čo vidíš v TWS — predtým, ako doplníš ručné hodnoty."
+    )
+    if _price_source_summary:
+        st.info(f"Zdroj cien pri poslednom načítaní: {_price_source_summary}")
+    elif positions:
+        st.caption("Žiadne pole `price_source` pri pozíciách — skontroluj načítanie z TWS.")
+
+    with st.expander("Rozpad súčtu trhovej hodnoty (marketValue) podľa typu nástroja (IB API)", expanded=False):
+        st.caption(
+            "Ak sa číslo nezhoduje s očakávaním, skontroluj, či TWS neukazuje **NLV** alebo **Equity with Loan Value** — appka tu sčítava **iba** `PortfolioItem.marketValue`."
+        )
+        if _by_sec_rows:
+            st.dataframe(pd.DataFrame(_by_sec_rows), use_container_width=True, hide_index=True)
+        else:
+            st.caption("Žiadne pozície.")
+
     st.divider()
 
-    # ── P/L sekcia ────────────────────────────────────────────────────────────
-    st.subheader("📈 P/L")
+    # ── 2 · Ručné úpravy ──────────────────────────────────────────────────────
+    st.subheader("2 · Ručné úpravy (voliteľné)")
+    st.caption(
+        "Po **Uložiť** sa zmeny prejavia v **metrikách P/L a tabuľke „Podľa podkladu“** v kroku **3**. "
+        "**Portfólio APTR** ostáva z IB + denníka + marží (krok **4**) — polia P/L a Available Funds ho nemenia. "
+        "**Net Theta / Net Vega** v tomto formulári (po zapnutí a uložení) menia **iba dve metriky** v kroku **3**, nie výpočet APTR. "
+        "**Marža skupiny** a **Theta z TWS** v kroku **4** ovplyvňujú ročný výnos Θ a **grafy**; snímky grafov uložíš tlačidlom na konci kroku **4**."
+    )
+    with st.expander("✏️ Ručné súčty P/L a podľa podkladu (verný obraz oproti TWS)", expanded=_fin_ov.get("enabled", False)):
+        st.caption(
+            "API sa môže líšiť od TWS (filter účtu, zdroj ceny, Mark vs. Unrealized). "
+            "Po zapnutí a **Uložiť** sa zobrazia v kroku **3** metriky P/L, Available Funds, **Net Theta**, **Net Vega** a tabuľka podľa podkladu. "
+            "**Portfólio APTR** a výnos Θ po skupinách ostávajú na IB + denníku + maržách (krok **4**)."
+        )
+        _by_sym_default = _fin_ov.get("by_symbol") or {}
+        _by_sym_txt = json.dumps(_by_sym_default, indent=2, ensure_ascii=False) if _by_sym_default else (
+            '{\n  "AMZN": {\n    "unreal": -157.74,\n    "mkt": 2250.5,\n    "abs_mkt": 3228.24\n  }\n}'
+        )
+        with st.form("portfolio_finance_overrides_form"):
+            _f_en = st.checkbox(
+                "Použiť uložené ručné hodnoty namiesto súčtov z API (P/L, Available Funds, Theta, Vega + tabuľka podľa podkladu)",
+                value=bool(_fin_ov.get("enabled")),
+            )
+            fc1, fc2, fc3 = st.columns(3)
+            with fc1:
+                _f_ue = st.number_input(
+                    "Unrealized P/L ($) — celkom",
+                    value=float(_fin_ov["unrealized_pnl"] if _fin_ov["unrealized_pnl"] is not None else unreal_pnl),
+                    step=0.01,
+                    format="%.2f",
+                    help="Nechaj zodpovedať súčtu z TWS pre tento účet.",
+                )
+            with fc2:
+                _f_re = st.number_input(
+                    "Realized P/L session ($) — celkom",
+                    value=float(_fin_ov["realized_pnl"] if _fin_ov["realized_pnl"] is not None else real_pnl),
+                    step=0.01,
+                    format="%.2f",
+                )
+            with fc3:
+                _f_af = st.number_input(
+                    "Volný kapitál (Available Funds) — celkom",
+                    value=float(
+                        _fin_ov["available_funds"]
+                        if _fin_ov["available_funds"] is not None
+                        else _avail_base
+                    ),
+                    step=0.01,
+                    format="%.2f",
+                    help="Hodnota z TWS / Account — Available Funds (nie súčet trhovej hodnoty pozícií).",
+                )
+            fth1, fth2 = st.columns(2)
+            with fth1:
+                _f_th = st.number_input(
+                    "Net Theta ($/deň) — celé portfólio",
+                    value=float(
+                        _fin_ov["net_theta_per_day"]
+                        if _fin_ov["net_theta_per_day"] is not None
+                        else total_theta
+                    ),
+                    step=0.25,
+                    format="%.2f",
+                    help="Súčet z TWS (Portfolio → Theta) alebo vlastná korekcia. Zobrazí sa v kroku 3 pri zapnutých ručných hodnotách.",
+                )
+            with fth2:
+                _f_vg = st.number_input(
+                    "Net Vega ($ na 1 % IV)",
+                    value=float(
+                        _fin_ov["net_vega"] if _fin_ov["net_vega"] is not None else total_vega
+                    ),
+                    step=0.25,
+                    format="%.2f",
+                    help="Súčet Vegy z TWS alebo korekcia — rovnaká škála ako metrika v kroku 3.",
+                )
+            _f_json = st.text_area(
+                "Úpravy podľa podkladu (JSON, voliteľné)",
+                value=_by_sym_txt,
+                height=220,
+                help='Pre každý ticker: "unreal", "mkt", "abs_mkt" (všetko voliteľné). Kľúč = symbol ako v stĺpci Podklad.',
+            )
+            _sub_fin = st.form_submit_button("💾 Uložiť ručné súčty do databázy")
+        if _sub_fin:
+            _parsed_sym: dict = {}
+            try:
+                _pj = json.loads(_f_json or "{}")
+                if isinstance(_pj, dict):
+                    _parsed_sym = _pj
+            except json.JSONDecodeError as e:
+                st.error(f"Neplatný JSON v tabuľke podľa podkladu: {e}")
+            else:
+                _payload = {
+                    "enabled": bool(_f_en),
+                    "unrealized_pnl": float(_f_ue),
+                    "realized_pnl": float(_f_re),
+                    "available_funds": float(_f_af),
+                    "net_theta_per_day": float(_f_th),
+                    "net_vega": float(_f_vg),
+                    "by_symbol": _parsed_sym,
+                }
+                db.set_setting(PORTFOLIO_FINANCE_OVERRIDES_KEY, json.dumps(_payload, ensure_ascii=False))
+                st.success("Uložené. Obnovenie stránky aplikuje hodnoty.")
+                st.rerun()
+
+    st.divider()
+
+    # ── 3 · Celkové výsledky (súhrn + graf trendu) ──────────────────────────────
+    st.subheader("3 · Celkové výsledky")
+    st.caption(
+        "Súhrn po načítaní z TWS a po prípadných úpravách z kroku **2**. "
+        "**História grafov** (APTR a výnos Θ po skupinách) sa **neukladá** pri obnovení z TWS — po úprave marží a Thety v kroku **4** použi tlačidlo **Uložiť snímky trendových grafov** (na konci kroku **4**)."
+    )
+
+    st.markdown("##### 📈 P/L")
     c1, c2, c3 = st.columns(3)
     with c1:
         st.metric(
             "Unrealized P/L",
-            f"${unreal_pnl:+,.2f}",
+            f"${_disp_unreal:+,.2f}",
             delta_color="normal",
         )
     with c2:
         st.metric(
             "Realized P/L (session)",
-            f"${real_pnl:+,.2f}",
+            f"${_disp_real:+,.2f}",
             delta_color="normal",
         )
     with c3:
         st.metric(
-            "Market Value (celé portfólio)",
-            f"${mkt_val:,.2f}",
+            "Volný kapitál (Available Funds)",
+            f"{cur_sym} {_disp_avail:,.2f}",
+            help="Available Funds z účtu IBKR (ako v TWS) — voľný kapitál na obchodovanie, nie súčet trhovej hodnoty pozícií.",
         )
 
-    _sec_types_in = sorted(set(p.get("sec_type", "?") for p in positions))
-    st.caption(
-        f"Unrealized P/L je súčet zo **všetkých** pozícií z API (typy: {', '.join(_sec_types_in) or '—'}). "
-        "Ak TWS ukazuje iný súčet, skontroluj filter účtu a stĺpec *Unrealized P&L* (nie Mark alebo P&L%)."
-    )
+    if _fin_ov.get("enabled"):
+        st.caption(
+            "ℹ️ **Ručné súčty zapnuté** — metriky P/L, Available Funds, Net Theta, Net Vega a „Podľa podkladu“ môžu byť z **uložených úprav**. "
+            f"Z API (orientačné): Unreal **${unreal_pnl:+,.2f}** · Avail. **{cur_sym} {_avail_base:,.2f}** · "
+            f"Theta **${total_theta:+.2f}**/deň · Vega **${total_vega:+.2f}**."
+        )
+    else:
+        st.caption(
+            f"Unrealized P/L je súčet zo **všetkých** pozícií z API (typy: {', '.join(_sec_types_in) or '—'}). "
+            "Ak TWS ukazuje iný súčet, skontroluj filter účtu a stĺpec *Unrealized P&L* (nie Mark alebo P&L%), alebo použi **Ručné súčty** v kroku **2**."
+        )
 
-    st.subheader("Podľa podkladu (IBKR)")
+    if not _fin_ov.get("enabled"):
+        st.caption(
+            "**Volný kapitál** vyššie = **Available Funds** z účtu (ako v TWS Account). "
+            "**NLV** je v bloku Margin nižšie. Rozpad súčtu `marketValue` z API podľa typu nástroja je v kroku **1** (expander)."
+        )
+
+    st.markdown("##### Podľa podkladu (IBKR)")
     st.caption(
         "**Σ abs trh. hodn.** = súčet absolútnych trhových hodnôt nôh pod symbolom — ukáže „hmotnosť“ pozície. "
         "**Nie je to marža brokera:** `PortfolioItem` v API neobsahuje maintenance margin po nôhach. "
         "Presné marže po spreadoch: v TWS *Portfolio* → pravý klik na spread/balík → *Margin Impact*, prípadne *Account* okno."
     )
     _by_under = ibkr_aggregates_by_underlying(positions)
+    if _fin_ov.get("enabled") and _fin_ov.get("by_symbol"):
+        _by_under = merge_ibkr_by_underlying_overrides(_by_under, _fin_ov["by_symbol"])
     if _by_under:
         st.table(pd.DataFrame(_by_under))
     else:
         st.caption("Žiadne riadky.")
 
-    st.divider()
-
-    # ── Margin / Account sekcia ───────────────────────────────────────────────
     from_tws = bool(account and any(k != "_currency" for k in account))
-    st.subheader(f"💳 Margin a hodnota účtu {'(TWS live)' if from_tws else '(manuálne)'}")
+    st.markdown(f"##### 💳 Margin a hodnota účtu {'(TWS live)' if from_tws else '(manuálne)'}")
     if acct_currency:
         st.caption(f"Mena účtu: **{acct_currency}**")
     m1, m2, m3, m4 = st.columns(4)
@@ -343,20 +534,20 @@ if job_status == "done":
 
     st.divider()
 
-    # ── Greeks sekcia ─────────────────────────────────────────────────────────
-    st.subheader("🔢 Portfolio Greeks (opcie)")
+    # ── Greeks (súčasť kroku 3) ───────────────────────────────────────────────
+    st.markdown("##### 🔢 Portfolio Greeks (opcie)")
     g1, g2, g3 = st.columns(3)
     with g1:
         st.metric(
             "Net Theta (celé portfólio)",
-            f"${total_theta:+.2f}/deň" if total_theta else "—",
-            help="Denný čas. rozpad všetkých opčných nôh (Short nogy záporné → kladný príspevok).",
+            f"${_disp_theta:+.2f}/deň" if (opts or _fin_ov.get("enabled")) else "—",
+            help="Denný čas. rozpad opčných nôh z IB (Short záporné → kladný príspevok), alebo ručná hodnota z kroku 2.",
         )
     with g2:
         st.metric(
             "Net Vega",
-            f"${total_vega:+.2f}" if total_vega else "—",
-            help="Citlivosť portfólia na 1% zmenu IV.",
+            f"${_disp_vega:+.2f}" if (opts or _fin_ov.get("enabled")) else "—",
+            help="Citlivosť portfólia na 1 % zmenu IV z IB, alebo ručná hodnota z kroku 2.",
         )
     with g3:
         st.metric(
@@ -439,17 +630,6 @@ if job_status == "done":
         if _pf_theta_aptr.get("incomplete_theta"):
             st.caption("⚠️ Niektorým opciám chýba Theta z IB — APTR môže byť neúplný.")
 
-        if do_refresh:
-            db.append_group_apr_snapshot(
-                db.PORTFOLIO_APTR_SNAPSHOT_GROUP_ID,
-                datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                "theta",
-                float(_pf_theta_aptr["yield_pct"]),
-                float(_pf_theta_aptr["theta_per_day"]),
-                float(_pf_theta_aptr["capital_basis_usd"]),
-                0,
-                float(_pf_theta_aptr["theta_per_day"]),
-            )
         _hist_pf = db.get_group_apr_snapshots(
             db.PORTFOLIO_APTR_SNAPSHOT_GROUP_ID,
             limit=120,
@@ -462,22 +642,28 @@ if job_status == "done":
             _chpf = _hpf.set_index("Čas")[["apr_pct"]].rename(
                 columns={"apr_pct": "Portfólio APTR Θ %"}
             )
-            st.caption("Trend **Portfólio APTR (Θ)** — každý bod = jedno **Načítať z TWS** (zmena marží / skupín môže skočiť krivku).")
+            st.caption(
+                "**Graf:** každý bod = jedno uloženie tlačidlom **Uložiť snímky trendových grafov** v kroku **4** (po maržiach a Thete z TWS). "
+                "Zmena marží alebo zloženia skupín môže krivku posunúť."
+            )
             _plotly_line_trend(
                 _chpf.iloc[:, 0],
                 chart_key="tj_plot_portfolio_aptr_theta",
                 height=200,
             )
         elif len(_hist_pf) == 1:
-            st.caption("Po ďalšom **Načítať z TWS** uvidíš graf vývoja portfólio APTR.")
+            st.caption(
+                "Zatiaľ jeden záznam — po ďalšom **uložení snímok** v kroku **4** uvidíš čiarový graf."
+            )
 
     st.divider()
 
-    # ── Pozície podľa skupín (denník), marža, APR ──────────────────────────────
-    st.subheader("📋 Pozície podľa skupín (denník ↔ TWS)")
+    # ── 4 · Detail podľa skupín ────────────────────────────────────────────────
+    st.subheader("4 · Detail podľa skupín (denník ↔ TWS)")
     st.info(
-        "**Hlavná metrika: Ročný výnos z Θ** — nezávisí od trhovej ceny, počíta sa z IB Theta a vstupného net debetu z denníka. "
-        "Trhové ceny a P/L v tabuľke sú **IB mark** (orientačné, môžu sa líšiť od TWS Last)."
+        "**Hlavná metrika: Ročný výnos z Θ** — z IB Theta a vstupného net debetu z denníka. "
+        "Trhové ceny v tabuľke sú **IB mark** (orientačné). "
+        "**Grafy trendu** doplníš tlačidlom **Uložiť snímky trendových grafov** pod expandermi (až po úprave marží a Thety z TWS), nie pri **Načítať z TWS**."
     )
 
     def _row_from_ib_position(p: dict) -> dict:
@@ -575,17 +761,6 @@ if job_status == "done":
                         st.caption(
                             "⚠️ Aspoň jedna opčná noha v TWS nemá Theta — zadaj hodnotu manuálne vyššie."
                         )
-                    if do_refresh:
-                        db.append_group_apr_snapshot(
-                            _gid,
-                            datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                            "theta",
-                            float(_theta_y["yield_pct"]),
-                            float(_theta_y["theta_per_day"]),
-                            float(_theta_y["capital_basis_usd"]),
-                            0,
-                            float(_theta_y["theta_per_day"]),
-                        )
                     _hist_t = db.get_group_apr_snapshots(_gid, limit=120, basis_kind="theta")
                     if len(_hist_t) >= 2:
                         _ht = pd.DataFrame(_hist_t)
@@ -594,14 +769,18 @@ if job_status == "done":
                         _cht = _ht.set_index("Čas")[["apr_pct"]].rename(
                             columns={"apr_pct": "Ročný výnos Θ %"}
                         )
-                        st.caption("Trend **Ročný výnos (Theta)** — každý bod = jedno **Načítať z TWS**.")
+                        st.caption(
+                            "**Graf skupiny:** nový bod pridáš tlačidlom **Uložiť snímky trendových grafov** pod expandermi skupín."
+                        )
                         _plotly_line_trend(
                             _cht.iloc[:, 0],
                             chart_key=f"tj_plot_grp_theta_{_wk}",
                             height=200,
                         )
                     elif len(_hist_t) == 1:
-                        st.caption("Po ďalšom **Načítať z TWS** uvidíš čiarový graf vývoja Theta výnosu.")
+                        st.caption(
+                            "Jeden záznam — po ďalšom **uložení snímok** (tlačidlo pod skupinami) uvidíš graf."
+                        )
                 else:
                     st.caption(
                         "Ročný výnos (Theta) teraz nie je: skontroluj **Open** nohy s **Entry** v Trade Logu, "
@@ -632,6 +811,61 @@ if job_status == "done":
                     _mnew[_gid2] = float(st.session_state[_w])
             db.set_group_maint_margins(_mnew)
             st.success("Marže uložené do databázy (zlúčené; 0 = zruší uloženú maržu pre danú skupinu).")
+
+        st.caption(
+            "Keď sú **marže** a **Theta z TWS** v skupinách nastavené, ulož **jeden spoločný bod** do všetkých grafov (portfólio APTR + každá skupina s výpočtom Θ). "
+            "Tým sa vyhneš uloženiu nesprávnych hodnôt hneď po surovom načítaní z API."
+        )
+        if st.button(
+            "💾 Uložiť snímky trendových grafov (portfólio APTR + skupiny)",
+            type="primary",
+            use_container_width=True,
+            key="pf_save_apr_snapshots",
+        ):
+            _ts_snap = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            _n_snap = 0
+            if _pf_theta_aptr is not None:
+                db.append_group_apr_snapshot(
+                    db.PORTFOLIO_APTR_SNAPSHOT_GROUP_ID,
+                    _ts_snap,
+                    "theta",
+                    float(_pf_theta_aptr["yield_pct"]),
+                    float(_pf_theta_aptr["theta_per_day"]),
+                    float(_pf_theta_aptr["capital_basis_usd"]),
+                    0,
+                    float(_pf_theta_aptr["theta_per_day"]),
+                )
+                _n_snap += 1
+            for _gid_s, _plist_s in _ordered:
+                _legs_s = [t for t in _all_tr if journal_group_id(t) == _gid_s]
+                _open_s = [t for t in _legs_s if t.get("status") == "Open"]
+                _wk_s = dashboard_group_margin_widget_key(_gid_s)
+                _mm_s = float(st.session_state.get(_wk_s, 0) or 0)
+                _twk_s = f"pf_dash_theta_override_{_gid_s}"
+                _tov_s = float(st.session_state.get(_twk_s, 0.0) or 0.0)
+                _ty_s = compute_theta_annualized_yield_pct(
+                    _open_s,
+                    _plist_s,
+                    maintenance_margin_usd=_mm_s,
+                    theta_override_usd=_tov_s,
+                )
+                if _ty_s is not None:
+                    db.append_group_apr_snapshot(
+                        _gid_s,
+                        _ts_snap,
+                        "theta",
+                        float(_ty_s["yield_pct"]),
+                        float(_ty_s["theta_per_day"]),
+                        float(_ty_s["capital_basis_usd"]),
+                        0,
+                        float(_ty_s["theta_per_day"]),
+                    )
+                    _n_snap += 1
+            if _n_snap == 0:
+                st.warning("Neuložená žiadna snímka — chýba portfólio APTR aj výpočet výnosu Θ pre skupiny.")
+            else:
+                st.success(f"Uložené **{_n_snap}** snímok do histórie grafov (časová pečiatka: jedna pre celú dávku).")
+            st.rerun()
 
         _csv_rows = [_row_from_ib_position(p) for p in positions]
         _df_all = pd.DataFrame(_csv_rows)

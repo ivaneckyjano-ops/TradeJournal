@@ -1,7 +1,7 @@
 import json
 import os
 import sqlite3
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "journal.db")
@@ -94,6 +94,7 @@ def init_db() -> None:
     _migrate_steady_yields(get_connection())
     _migrate_steady_yields_alerts(get_connection())
     _migrate_symbol_market_snapshots(get_connection())
+    _migrate_symbol_ib_option_snapshots(get_connection())
     with get_connection() as conn:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_events_date ON events (date)")
         conn.commit()
@@ -1192,6 +1193,107 @@ def _migrate_symbol_market_snapshots(conn: sqlite3.Connection) -> None:
     )
     conn.commit()
     conn.close()
+
+
+SYMBOL_IB_OPTION_REFRESH_KEY = "symbol_ib_option_last_refresh_utc"
+
+
+def _migrate_symbol_ib_option_snapshots(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS symbol_ib_option_snapshots (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker          TEXT NOT NULL,
+            category        TEXT NOT NULL,
+            expiry          TEXT NOT NULL,
+            strike          REAL NOT NULL,
+            right           TEXT NOT NULL,
+            bid             REAL,
+            ask             REAL,
+            iv              REAL,
+            theta           REAL,
+            gamma           REAL,
+            vega            REAL,
+            und_price       REAL,
+            recorded_at     TEXT NOT NULL,
+            source          TEXT DEFAULT 'ibkr',
+            error           TEXT
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sym_ib_opt_t_rec "
+        "ON symbol_ib_option_snapshots (ticker, category, recorded_at)"
+    )
+    conn.commit()
+
+
+def insert_symbol_ib_option_snapshot(
+    ticker: str,
+    category: str,
+    expiry: str,
+    strike: float,
+    right: str,
+    *,
+    bid: Optional[float] = None,
+    ask: Optional[float] = None,
+    iv: Optional[float] = None,
+    theta: Optional[float] = None,
+    gamma: Optional[float] = None,
+    vega: Optional[float] = None,
+    und_price: Optional[float] = None,
+    recorded_at: str = "",
+    source: str = "ibkr",
+    error: Optional[str] = None,
+) -> int:
+    tk = (ticker or "").strip().upper()
+    cat = (category or "").strip()
+    if cat not in ("open_position", "watched_only"):
+        cat = "watched_only"
+    exp = str(expiry or "").strip()
+    rr = (right or "C").upper()[:1]
+    if rr not in ("C", "P"):
+        rr = "C"
+    ra = recorded_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with get_connection() as conn:
+        cur = conn.execute(
+            """INSERT INTO symbol_ib_option_snapshots
+            (ticker, category, expiry, strike, right, bid, ask, iv, theta, gamma, vega,
+             und_price, recorded_at, source, error)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                tk,
+                cat,
+                exp,
+                float(strike),
+                rr,
+                bid,
+                ask,
+                iv,
+                theta,
+                gamma,
+                vega,
+                und_price,
+                ra,
+                source or "ibkr",
+                error,
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def get_symbol_ib_option_snapshots_latest_batch() -> list[dict]:
+    """Všetky riadky z posledného behu (rovnaký ``recorded_at`` = max)."""
+    with get_connection() as conn:
+        row = conn.execute("SELECT MAX(recorded_at) AS m FROM symbol_ib_option_snapshots").fetchone()
+        mx = row["m"] if row else None
+        if not mx:
+            return []
+        rows = conn.execute(
+            "SELECT * FROM symbol_ib_option_snapshots WHERE recorded_at=? "
+            "ORDER BY category, ticker, strike",
+            (mx,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def append_steady_yield_roll_event(

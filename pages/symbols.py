@@ -3,7 +3,13 @@ import pandas as pd
 from datetime import date
 
 from core import database as db
+from core import ibkr
 from core.page_context import set_tradejournal_page
+from core.symbol_ib_option_sync import (
+    REFRESH_INTERVAL_SEC,
+    run_symbol_ib_option_refresh,
+    seconds_since_last_refresh,
+)
 from core.yahoo_symbol_sync import YAHOO_SYMBOL_SYNC_SETTING_KEY, sync_all_symbols_from_yahoo
 
 db.init_db()
@@ -288,6 +294,99 @@ with tab_manage:
             "Automaticky (cron): z koreňa projektu spusti `python core/yahoo_symbol_sync.py` "
             "(voliteľne zoznam tickerov ako argumenty)."
         )
+
+        st.divider()
+        st.subheader("IBKR — opčné metriky (zoznam Symboly)")
+        st.caption(
+            "Bid / ask, impl. volatilita, Theta, Gamma (a Vega) z **Interactive Brokers** — len pre **underlying** "
+            "v tejto tabuľke. **Otvorená pozícia** = skutočný opčný kontrakt v portfóliu; **Len sledovaný** = ATM call: "
+            "expirácie podľa DTE — ak najbližšia > **21** dní, základ je prvá, inak druhá; potom **+3** expirácie v poradí; "
+            "strike = vždy **najbližší k spotu**. Obnova **najviac raz za hodinu** pri otvorenej stránke, ak je TWS pripojené."
+        )
+        _ib_last = db.get_setting(db.SYMBOL_IB_OPTION_REFRESH_KEY, "") or "—"
+        _ib_elapsed = seconds_since_last_refresh()
+        _ib_next = ""
+        if _ib_elapsed is not None and _ib_elapsed < REFRESH_INTERVAL_SEC:
+            _m = int((REFRESH_INTERVAL_SEC - _ib_elapsed) // 60)
+            _ib_next = f" Ďalšia automatická obnova o ~**{_m}** min."
+        st.caption(f"Posledný beh IB opcií: **{_ib_last}**.{_ib_next}")
+
+        _ib_pause = st.number_input(
+            "Pauza medzi požiadavkami IB (s)",
+            min_value=0.05,
+            max_value=2.0,
+            value=0.22,
+            step=0.05,
+            key="sym_ib_pause",
+            help="Šetrí pacing API; pri chybe 100/101 zvýš.",
+        )
+
+        if ibkr.is_connected() and symbols:
+            _auto_el = seconds_since_last_refresh()
+            if _auto_el is None or _auto_el >= REFRESH_INTERVAL_SEC:
+                with st.spinner("IBKR: sťahujem opčné metriky pre symboly zo zoznamu (môže trvať podľa počtu tickerov)…"):
+                    _ib_rep = run_symbol_ib_option_refresh(pause_s=float(_ib_pause))
+                if _ib_rep.get("errors"):
+                    st.warning(
+                        "Čiastočné chyby: "
+                        + " · ".join(str(e)[:120] for e in _ib_rep["errors"][:12])
+                    )
+                else:
+                    st.success(
+                        f"IB opcie: **{_ib_rep.get('open_rows', 0)}** otvorených kontraktov, "
+                        f"**{_ib_rep.get('watched_rows', 0)}** sledovaných ATM."
+                    )
+        elif not ibkr.is_connected():
+            st.info("Pre IB opčné metriky pripoj **TWS / IB Gateway** (Dashboard → Pripojenie).")
+        if st.button("Obnoviť IB opcie teraz", type="secondary", key="sym_ib_force_btn"):
+            if not ibkr.is_connected():
+                st.error("Nie je pripojenie na IBKR.")
+            else:
+                with st.spinner("IBKR opcie (ručný beh)…"):
+                    _ib_man = run_symbol_ib_option_refresh(pause_s=float(_ib_pause))
+                if _ib_man.get("errors"):
+                    st.warning(" · ".join(str(e)[:100] for e in _ib_man["errors"][:10]))
+                st.success(
+                    f"Hotovo: **{_ib_man.get('open_rows', 0)}** otvorené, **{_ib_man.get('watched_rows', 0)}** sledované."
+                )
+                st.rerun()
+
+        _ib_rows = db.get_symbol_ib_option_snapshots_latest_batch()
+        if _ib_rows:
+            _cat_label = {"open_position": "Otvorená pozícia", "watched_only": "Len sledovaný (ATM call)"}
+            _df_ib = pd.DataFrame(
+                {
+                    "Kategória": [_cat_label.get(r.get("category"), r.get("category")) for r in _ib_rows],
+                    "Underlying": [r.get("ticker") for r in _ib_rows],
+                    "Exp": [r.get("expiry") or "—" for r in _ib_rows],
+                    "K": [r.get("strike") for r in _ib_rows],
+                    "P/C": [r.get("right") or "—" for r in _ib_rows],
+                    "Bid": [r.get("bid") for r in _ib_rows],
+                    "Ask": [r.get("ask") for r in _ib_rows],
+                    "IV": [r.get("iv") for r in _ib_rows],
+                    "Theta": [r.get("theta") for r in _ib_rows],
+                    "Gamma": [r.get("gamma") for r in _ib_rows],
+                    "Vega": [r.get("vega") for r in _ib_rows],
+                    "Podklad $": [r.get("und_price") for r in _ib_rows],
+                    "Chyba": [(r.get("error") or "")[:40] for r in _ib_rows],
+                }
+            )
+            st.dataframe(
+                _df_ib,
+                hide_index=True,
+                use_container_width=True,
+                column_config={
+                    "Bid": st.column_config.NumberColumn(format="$%.2f"),
+                    "Ask": st.column_config.NumberColumn(format="$%.2f"),
+                    "IV": st.column_config.NumberColumn(format="%.4f"),
+                    "Theta": st.column_config.NumberColumn(format="%.5f"),
+                    "Gamma": st.column_config.NumberColumn(format="%.6f"),
+                    "Vega": st.column_config.NumberColumn(format="%.4f"),
+                    "Podklad $": st.column_config.NumberColumn(format="$%.2f"),
+                },
+            )
+        else:
+            st.caption("Zatiaľ žiadne uložené snímky — po pripojení IB a obnove sa tabuľka doplní.")
 
         st.divider()
         st.subheader("Editácia")

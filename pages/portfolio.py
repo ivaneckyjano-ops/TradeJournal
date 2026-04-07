@@ -187,6 +187,14 @@ with st.expander("Parametre výpočtu (spot, IV, filter)", expanded=True):
         for _j, _tk in enumerate(_row_tickers):
             _sk_spot = f"pf_spot_{_tk}" if _tk else "pf_spot"
             _sk_iv   = f"pf_iv_{_tk}"   if _tk else "pf_iv"
+            # Spot z IB musí ísť do session_state PRED number_input (inak StreamlitAPIException:
+            # po vytvorení widgetu s key nie je možné ten istý kľúč prepísať v tom istom behu).
+            if _tk and ibkr.is_connected():
+                if float(st.session_state.get(_sk_spot, 0) or 0) == 0:
+                    with st.spinner(f"Načítavam spot pre {_tk}..."):
+                        _res = ibkr.fetch_underlying(_tk)
+                    if not _res.get("error") and _res.get("price"):
+                        st.session_state[_sk_spot] = float(_res["price"])
             with _row_cols[_j * 2]:
                 _sp = st.number_input(
                     f"Spot {_tk}" if _tk else "Spot ($)",
@@ -201,13 +209,6 @@ with st.expander("Parametre výpočtu (spot, IV, filter)", expanded=True):
                     value=float(st.session_state.get(_sk_iv, 0.45)),
                     key=_sk_iv,
                 )
-            # Načítaj Spot z IBKR ak je 0 a ticker je zadaný
-            if _sp == 0 and _tk and ibkr.is_connected():
-                with st.spinner(f"Načítavam spot pre {_tk}..."):
-                    _res = ibkr.fetch_underlying(_tk)
-                if not _res.get("error") and _res.get("price"):
-                    _sp = _res["price"]
-                    st.session_state[_sk_spot] = _sp
             _spot_iv_map[_tk] = (_sp, _iv)
 
 # Spätná kompatibilita — globálny spot/iv pre jednoticker alebo fallback

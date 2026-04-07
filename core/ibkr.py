@@ -764,6 +764,24 @@ def fetch_option_scan_metrics(ticker: str, expiry: str, strike: float, right: st
                     th = round(tf, 5)
             except (TypeError, ValueError):
                 pass
+        ga_raw = getattr(greeks, "gamma", None) if greeks is not None else None
+        ve_raw = getattr(greeks, "vega", None) if greeks is not None else None
+        gam = None
+        if ga_raw is not None:
+            try:
+                gf = float(ga_raw)
+                if not math.isnan(gf):
+                    gam = round(gf, 6)
+            except (TypeError, ValueError):
+                pass
+        veg = None
+        if ve_raw is not None:
+            try:
+                vf = float(ve_raw)
+                if not math.isnan(vf):
+                    veg = round(vf, 5)
+            except (TypeError, ValueError):
+                pass
         out.update({
             "ticker": sym,
             "expiry": expiry,
@@ -778,6 +796,8 @@ def fetch_option_scan_metrics(ticker: str, expiry: str, strike: float, right: st
             "open_interest": oi,
             "iv": _sf(iv_raw),
             "theta": th,
+            "gamma": gam,
+            "vega": veg,
             "und_price": _sf(und_price),
             "error": None if (bid or ask or last) else "Žiadna cena (trh/market data)",
         })
@@ -844,6 +864,8 @@ def fetch_option_scan_metrics(ticker: str, expiry: str, strike: float, right: st
                 "open_interest": None,
                 "iv": None,
                 "theta": None,
+                "gamma": None,
+                "vega": None,
                 "und_price": None,
                 "error": "Žiadna cena (bid/ask/last) — skús iný typ dát v TWS alebo kontrakt",
             })

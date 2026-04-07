@@ -9,6 +9,7 @@ Obsahuje:
   - match_greeks                 – nájde Greeks v IBKR cache pre nohu z DB (groups.py)
   - compute_simple_apr           – orientačná ročná výnosová miera (%) pre skupinu / portfólio
   - ibkr_aggregates_by_underlying / ibkr_summary_by_journal_group – súčty P/L podľa tickeru / skupiny
+  - parse_portfolio_finance_overrides / merge_ibkr_by_underlying_overrides – ručné úpravy súčtov P/L (Portfolio Dashboard)
   - group_ibkr_positions_for_dashboard – IB pozície podľa group_id z denníka
   - compute_group_apr_on_maint_margin – APR skupiny voči ručnej udržiavacej marži
   - compute_theta_annualized_yield_pct – ročný výnos z Theta: (Θ×365 / (net debet + marža)) × 100
@@ -19,8 +20,12 @@ Obsahuje:
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import date, datetime
-from typing import Optional
+from typing import Any, Optional
+
+# Portfolio Dashboard — ručné súčty P/L (uložené v settings DB)
+PORTFOLIO_FINANCE_OVERRIDES_KEY = "portfolio_finance_overrides"
 
 from core.greeks import bs_greeks
 
@@ -670,6 +675,98 @@ def ibkr_aggregates_by_underlying(ib_positions: list[dict]) -> list[dict]:
             "Trh. hodnota $": round(v["mkt"], 2),
             "Σ abs trh.hodn. $": round(v["abs_mkt"], 2),
         })
+    return out
+
+
+def parse_portfolio_finance_overrides(raw: str) -> dict[str, Any]:
+    """
+    JSON z db.get_setting(PORTFOLIO_FINANCE_OVERRIDES_KEY):
+    {
+      "enabled": true,
+      "unrealized_pnl": -157.74 | null,
+      "realized_pnl": 0.0 | null,
+      "available_funds": 12345.0 | null,
+      "net_theta_per_day": -12.5 | null,
+      "net_vega": 3.2 | null,
+      "by_symbol": { "AMZN": { "unreal": ..., "mkt": ..., "abs_mkt": ... } }
+    }
+    (Starý kľúč ``market_value`` sa pri načítaní ignoruje — nahradený voľným kapitálom.)
+    Ak je kľúč null alebo chýba, použije sa hodnota z API / účtu.
+    """
+    default: dict[str, Any] = {
+        "enabled": False,
+        "unrealized_pnl": None,
+        "realized_pnl": None,
+        "available_funds": None,
+        "net_theta_per_day": None,
+        "net_vega": None,
+        "by_symbol": {},
+    }
+    try:
+        o = json.loads(raw or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return default.copy()
+    if not isinstance(o, dict):
+        return default.copy()
+    out = default.copy()
+    out["enabled"] = bool(o.get("enabled"))
+    for k in (
+        "unrealized_pnl",
+        "realized_pnl",
+        "available_funds",
+        "net_theta_per_day",
+        "net_vega",
+    ):
+        if k not in o or o[k] is None or o[k] == "":
+            continue
+        try:
+            out[k] = float(o[k])
+        except (TypeError, ValueError):
+            pass
+    bs = o.get("by_symbol")
+    if isinstance(bs, dict):
+        clean: dict[str, dict[str, float]] = {}
+        for sym, row in bs.items():
+            if not isinstance(row, dict):
+                continue
+            u = str(sym).strip().upper()
+            if not u:
+                continue
+            entry: dict[str, float] = {}
+            for ak, dk in (("unreal", "unreal"), ("mkt", "mkt"), ("abs_mkt", "abs_mkt")):
+                if ak in row and row[ak] is not None:
+                    try:
+                        entry[dk] = float(row[ak])
+                    except (TypeError, ValueError):
+                        pass
+            if entry:
+                clean[u] = entry
+        out["by_symbol"] = clean
+    return out
+
+
+def merge_ibkr_by_underlying_overrides(
+    rows: list[dict],
+    by_symbol: dict[str, dict[str, float]],
+) -> list[dict]:
+    """Nahradí stĺpce v riadkoch z ibkr_aggregates_by_underlying podľa by_symbol (kľúč = ticker)."""
+    if not by_symbol:
+        return rows
+    out: list[dict] = []
+    for row in rows:
+        sym = str(row.get("Podklad") or "").strip().upper()
+        ovr = by_symbol.get(sym)
+        if not ovr:
+            out.append(dict(row))
+            continue
+        new = dict(row)
+        if "unreal" in ovr:
+            new["Unreal. P/L $"] = round(float(ovr["unreal"]), 4)
+        if "mkt" in ovr:
+            new["Trh. hodnota $"] = round(float(ovr["mkt"]), 4)
+        if "abs_mkt" in ovr:
+            new["Σ abs trh.hodn. $"] = round(float(ovr["abs_mkt"]), 4)
+        out.append(new)
     return out
 
 
