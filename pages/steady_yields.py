@@ -4,6 +4,9 @@ Steady Yields — APR z realizovaných tokov, monitoring shortu (delta/DTE), ske
 from __future__ import annotations
 
 import json
+import math
+import time
+from collections import defaultdict
 from datetime import date
 
 import pandas as pd
@@ -15,6 +18,7 @@ from core import ibkr
 from core.expiration_catalog import format_expiry_select_options, get_catalog_expiries
 from core.page_context import set_tradejournal_page
 from core.portfolio_data import calc_dte, normalize_expiry
+from core.steady_yields.apr import annualized_apr_pct
 from core.steady_yields import (
     DEFAULT_MAX_IV_RANK_ENTRY,
     DEFAULT_MAX_SPREAD_PCT_MID,
@@ -23,6 +27,7 @@ from core.steady_yields import (
     apply_sector_caps,
     build_roll_up_and_out_suggestion,
     build_yield_summary,
+    trades_for_group,
     efficiency_credit_delta,
     efficiency_theta_delta,
     estimate_roll_net_credit,
@@ -51,7 +56,11 @@ st.caption(
     "(vrátane prahu profit alertu a zapnutia semafor alertov), `steady_yield_alert_events` (história upozornení)."
 )
 
-tab_yield, tab_mon, tab_scan = st.tabs(["Yield a APR", "Monitoring a roll", "Skener"])
+gids = sorted(db.list_steady_yield_group_ids_from_trades())
+
+tab_sy_monitor, tab_yield, tab_mon, tab_scan = st.tabs(
+    ["Monitor", "Yield a APR", "Monitoring a roll", "Skener"]
+)
 
 
 def _pick_rich_chain(chains: list[dict]) -> dict | None:
@@ -209,13 +218,24 @@ def _render_sy_scan_plotly(df: pd.DataFrame) -> None:
     cols = list(df.columns)
     n_rows = len(df)
     n_cols = len(cols)
-    bg_k = "#e3f2fd"
-    bg_d = "#e8f5e9"
+    bg_pass = "#e8f5e9"
+    bg_warn = "#fff3e0"
+    bg_fail = "#ffebee"
     bg_neutral = "#ffffff"
     bg_header = "#263238"
 
     row_fill: list[str] = []
     for _, row in df.iterrows():
+        row_state = str(row.get("row_state") or "").strip().lower()
+        if row_state in ("pass", "ok", "green"):
+            row_fill.append(bg_pass)
+            continue
+        if row_state in ("warn", "orange"):
+            row_fill.append(bg_warn)
+            continue
+        if row_state in ("fail", "red"):
+            row_fill.append(bg_fail)
+            continue
         if "noha" not in df.columns:
             row_fill.append(bg_neutral)
             continue
@@ -223,13 +243,7 @@ def _render_sy_scan_plotly(df: pd.DataFrame) -> None:
         if pd.isna(n):
             row_fill.append(bg_neutral)
             continue
-        s = str(n).strip()
-        if s == "Krátka":
-            row_fill.append(bg_k)
-        elif s == "Dlhá":
-            row_fill.append(bg_d)
-        else:
-            row_fill.append(bg_neutral)
+        row_fill.append(bg_neutral)
 
     cell_vals = [[_sy_scan_cell_str(x) for x in df[c].tolist()] for c in cols]
     fill_by_col = [list(row_fill) for _ in range(n_cols)]
@@ -306,9 +320,13 @@ def _sy_scan_blocked_row(
         "strike": strike if strike is not None else "—",
         "C/P": cp if cp else "—",
         "IV %": None,
+        "|Δ|": None,
         "sprd %": None,
         "Θ/deň": None,
         "OI": None,
+        "Cieľ |Δ|": "—",
+        "K @ cieľ": "—",
+        "|Δ|@K": "—",
         "R13": r13d,
         "R52": r52d,
         "kontext": hint,
@@ -350,9 +368,598 @@ def _sy_persist_scan_pick(pick: list[str]) -> None:
         pass
 
 
+def _sy_trade_option_right(trade: dict) -> str:
+    opt = str(trade.get("option_type") or "").strip().lower()
+    return "P" if opt.startswith("p") else "C"
+
+
+def _sy_trade_metric_key(trade: dict) -> str:
+    tk = str(trade.get("ticker") or "").strip().upper()
+    exp = normalize_expiry(str(trade.get("expiry") or ""))
+    try:
+        strike = float(trade.get("strike") or 0)
+    except (TypeError, ValueError):
+        strike = 0.0
+    return f"{tk}|{strike:.4f}|{exp}|{_sy_trade_option_right(trade)}"
+
+
+def _sy_compact_option_metrics(res: dict) -> dict:
+    """Necháme len metriky, ktoré Steady Yields skutočne používa."""
+    if not isinstance(res, dict):
+        return {}
+    keep = ("bid", "ask", "last", "mid", "iv", "delta", "theta", "open_interest", "spread_pct_mid", "error")
+    out = {k: res.get(k) for k in keep if k in res}
+    if res.get("source"):
+        out["source"] = res.get("source")
+    return out
+
+
+def _sy_fetch_historical_option(ticker: str, expiry: str, strike: float, right: str, spot: float) -> dict:
+    """
+    Načíta historickú close cenu z predchádzajúceho dňa a dopočíta IV/Delta/Theta cez BS.
+    Spoľahlivejšie než live ticky pre informačný sken.
+    """
+    from core.probability import bs_price, calc_iv_from_price, calc_greeks
+
+    result: dict = {
+        "bid": None, "ask": None, "last": None, "mid": None,
+        "iv": None, "delta": None, "theta": None,
+        "open_interest": None, "spread_pct_mid": None, "error": None,
+    }
+
+    spot_hist = ibkr.fetch_underlying_previous_close(ticker, timeout=10.0)
+    spot_eff = spot
+    if spot_hist.get("price") is not None and float(spot_hist["price"]) > 0:
+        spot_eff = float(spot_hist["price"])
+
+    hist = ibkr.fetch_option_historical_last(ticker, expiry, strike, right, timeout=12.0)
+    last_px = hist.get("last")
+    source_bits: list[str] = []
+    if spot_hist.get("source"):
+        source_bits.append(str(spot_hist["source"]))
+    if hist.get("source"):
+        source_bits.append(str(hist["source"]))
+
+    if last_px is None or last_px <= 0:
+        # Ak historická cena opcie chýba, skúsime teoretickú cenu z IBKR IV.
+        iv_pkt = ibkr.fetch_iv(ticker, expiry, strike, right)
+        iv_eff = iv_pkt.get("iv")
+        if iv_eff is not None and float(iv_eff) > 0 and spot_eff is not None and spot_eff > 0:
+            dte = calc_dte(normalize_expiry(str(expiry)))
+            if dte is None or dte <= 0:
+                dte = 1
+            r = (right or "C")[:1].upper()
+            if r not in ("C", "P"):
+                r = "C"
+            theo = bs_price(float(spot_eff), float(strike), int(dte), float(iv_eff), r)
+            if theo is not None and theo > 0:
+                last_px = float(theo)
+                source_bits.append("IBKR IV model")
+                result["iv"] = round(float(iv_eff), 6)
+                greeks = calc_greeks(float(spot_eff), float(strike), int(dte), float(iv_eff), r)
+                if greeks:
+                    result["delta"] = greeks.get("delta")
+                    result["theta"] = greeks.get("theta")
+        if last_px is None or last_px <= 0:
+            # Posledná záchrana: live quote
+            live = _sy_compact_option_metrics(
+                ibkr.fetch_option_scan_metrics(ticker, expiry, strike, right, timeout=18.0)
+            )
+            live_last = live.get("mid") or live.get("last") or live.get("ask") or live.get("bid")
+            if live_last is not None and float(live_last) > 0:
+                last_px = float(live_last)
+                if live.get("bid") is not None:
+                    result["bid"] = live.get("bid")
+                if live.get("ask") is not None:
+                    result["ask"] = live.get("ask")
+                if live.get("open_interest") is not None:
+                    result["open_interest"] = live.get("open_interest")
+                if live.get("spread_pct_mid") is not None:
+                    result["spread_pct_mid"] = live.get("spread_pct_mid")
+                source_bits.append("live option fallback")
+            else:
+                result["error"] = hist.get("error") or iv_pkt.get("error") or live.get("error") or "Historická cena nedostupná"
+                result["und_price"] = spot_eff
+                return result
+
+    result["last"] = last_px
+    result["mid"] = last_px
+    result["und_price"] = spot_eff
+    if source_bits:
+        result["source"] = " + ".join(source_bits)
+
+    dte = calc_dte(normalize_expiry(str(expiry)))
+    if dte is None or dte <= 0:
+        dte = 1
+
+    r = (right or "C")[:1].upper()
+    if r not in ("C", "P"):
+        r = "C"
+
+    try:
+        iv_raw = calc_iv_from_price(float(last_px), float(spot_eff), float(strike), int(dte), r)
+        if iv_raw is not None and iv_raw > 0:
+            result["iv"] = round(iv_raw, 6)
+            greeks = calc_greeks(float(spot_eff), float(strike), int(dte), iv_raw, r)
+            if greeks:
+                result["delta"] = greeks.get("delta")
+                result["theta"] = greeks.get("theta")
+    except Exception:
+        pass
+
+    return result
+
+
+def _sy_fill_proxy_metrics_from_peer(
+    target_met: dict,
+    peer_met: dict,
+    *,
+    spot: float,
+    target_expiry: str,
+    peer_expiry: str,
+    target_strike: float,
+    right: str,
+) -> dict:
+    """Keď IBKR pre jednu nohu nedá nič, dopočíta ju orientačne z IV druhej nohy."""
+    if not isinstance(target_met, dict):
+        target_met = {}
+    if not isinstance(peer_met, dict):
+        peer_met = {}
+
+    target_has = any(target_met.get(k) is not None for k in ("iv", "delta", "theta", "mid", "last"))
+    peer_iv = peer_met.get("iv")
+    if target_has or peer_iv is None or spot is None or spot <= 0:
+        return target_met
+
+    try:
+        from core.probability import bs_price, calc_greeks
+
+        tdte = max(1, int(calc_dte(normalize_expiry(str(target_expiry))) or 1))
+        pdte = max(1, int(calc_dte(normalize_expiry(str(peer_expiry))) or 1))
+        rr = (right or "C")[:1].upper()
+        if rr not in ("C", "P"):
+            rr = "C"
+
+        iv_ref = float(peer_iv)
+        if pdte < tdte:
+            iv_eff = iv_ref * 0.95
+        elif pdte > tdte:
+            iv_eff = iv_ref * 1.05
+        else:
+            iv_eff = iv_ref
+        iv_eff = max(0.01, min(iv_eff, 5.0))
+
+        theo = bs_price(float(spot), float(target_strike), tdte, iv_eff, rr)
+        greeks = calc_greeks(float(spot), float(target_strike), tdte, iv_eff, rr)
+        if theo is None or theo <= 0:
+            return target_met
+
+        out = dict(target_met)
+        out["last"] = round(float(theo), 4)
+        out["mid"] = round(float(theo), 4)
+        out["iv"] = round(float(iv_eff), 6)
+        if greeks:
+            out["delta"] = greeks.get("delta")
+            out["theta"] = greeks.get("theta")
+        out["error"] = None
+        src = str(out.get("source") or "").strip()
+        proxy_src = "peer IV proxy"
+        out["source"] = f"{src} + {proxy_src}".strip(" +") if src else proxy_src
+        return out
+    except Exception:
+        return target_met
+
+
+def _sy_find_strike_for_target_delta(
+    strikes: list,
+    *,
+    spot: float,
+    expiry: str,
+    right: str,
+    target_abs_delta: float,
+    iv_hint: float | None,
+) -> tuple[float | None, float | None]:
+    """Nájde strike s teoretickou |Δ| najbližšie k cieľu."""
+    if not strikes or spot is None or spot <= 0 or iv_hint is None or iv_hint <= 0:
+        return None, None
+    try:
+        from core.probability import calc_greeks
+
+        rr = (right or "C")[:1].upper()
+        if rr not in ("C", "P"):
+            rr = "C"
+        dte = max(1, int(calc_dte(normalize_expiry(str(expiry))) or 1))
+        target = max(0.01, min(float(target_abs_delta), 0.99))
+
+        best_k = None
+        best_d = None
+        best_gap = None
+        for k in strikes or []:
+            try:
+                kf = float(k)
+            except (TypeError, ValueError):
+                continue
+            g = calc_greeks(float(spot), kf, dte, float(iv_hint), rr)
+            dv = g.get("delta") if g else None
+            if dv is None:
+                continue
+            adv = abs(float(dv))
+            gap = abs(adv - target)
+            if best_gap is None or gap < best_gap:
+                best_gap = gap
+                best_k = kf
+                best_d = adv
+        return best_k, best_d
+    except Exception:
+        return None, None
+
+
+def _sy_match_live_position(trade: dict, live_positions: list[dict]) -> dict | None:
+    tk = str(trade.get("ticker") or "").strip().upper()
+    exp = normalize_expiry(str(trade.get("expiry") or ""))
+    try:
+        strike = float(trade.get("strike") or 0)
+    except (TypeError, ValueError):
+        strike = 0.0
+    right = _sy_trade_option_right(trade)
+    for p in live_positions or []:
+        if p.get("sec_type") not in ("OPT", "FOP"):
+            continue
+        if str(p.get("ticker") or "").strip().upper() != tk:
+            continue
+        if normalize_expiry(str(p.get("expiry") or "")) != exp:
+            continue
+        if abs(float(p.get("strike") or -1) - strike) > 0.01:
+            continue
+        p_right = "P" if str(p.get("option_type") or "").lower().startswith("p") else "C"
+        if p_right != right:
+            continue
+        return p
+    return None
+
+
+def _sy_leg_mark_usd_from_position(trade: dict, pos: dict) -> float | None:
+    """Trhová hodnota jednej nohy z IB pozície (+ Long, − Short pri fallback z mid)."""
+    mv = pos.get("market_value")
+    if mv is not None:
+        try:
+            fv = float(mv)
+            if fv == fv and not math.isnan(fv):
+                return fv
+        except (TypeError, ValueError):
+            pass
+    mp = pos.get("market_price")
+    c = int(trade.get("contracts") or 1)
+    if mp is None or c <= 0:
+        return None
+    try:
+        mpf = float(mp)
+        if mpf <= 0 or math.isnan(mpf):
+            return None
+    except (TypeError, ValueError):
+        return None
+    notional = mpf * c * 100.0
+    return notional if trade.get("leg_type") == "Long" else -notional
+
+
+def _sy_group_open_options_mtm_usd(
+    group_trades: list[dict],
+    live_positions: list[dict],
+) -> dict[str, float | int | None]:
+    """
+    Trhová hodnota otvorených opcií v skupine (Long + Short), párovanie s IB.
+
+    - ``long_usd``: súčet hodnôt Long nôh (spravidla kladné).
+    - ``short_usd``: súčet hodnôt Short nôh (spravidla záporné — záväzok).
+    - ``net_usd``: long_usd + short_usd (čistá trhová hodnota opčnej časti skupiny).
+    """
+    open_opts = [
+        t
+        for t in group_trades or []
+        if t.get("status") == "Open"
+        and t.get("leg_type") in ("Long", "Short")
+        and t.get("ticker")
+        and t.get("strike") not in (None, "", 0)
+        and str(t.get("option_type") or "").strip()
+    ]
+    long_usd = 0.0
+    short_usd = 0.0
+    n_match = 0
+    for t in open_opts:
+        pos = _sy_match_live_position(t, live_positions)
+        if not pos:
+            continue
+        v = _sy_leg_mark_usd_from_position(t, pos)
+        if v is None:
+            continue
+        n_match += 1
+        if t.get("leg_type") == "Long":
+            long_usd += v
+        else:
+            short_usd += v
+    net_usd = long_usd + short_usd
+    if n_match == 0:
+        return {
+            "long_usd": None,
+            "short_usd": None,
+            "net_usd": None,
+            "n_match": 0,
+            "n_open": len(open_opts),
+        }
+    return {
+        "long_usd": round(long_usd, 2),
+        "short_usd": round(short_usd, 2),
+        "net_usd": round(net_usd, 2),
+        "n_match": n_match,
+        "n_open": len(open_opts),
+    }
+
+
+def _sy_build_direct_quote_cache(trades: list[dict], *, pause_s: float = 0.1) -> dict[str, dict]:
+    """
+    Priame IBKR market-data + modelGreeks pre otvorené opcie.
+    Vracia cache podľa kľúča `_sy_trade_metric_key(trade)`.
+    """
+    cache: dict[str, dict] = {}
+    if not ibkr.is_connected():
+        return cache
+    for tr in trades or []:
+        if tr.get("status") != "Open":
+            continue
+        if not tr.get("ticker") or not tr.get("expiry") or tr.get("strike") in (None, "", 0):
+            continue
+        if not str(tr.get("option_type") or "").strip():
+            continue
+        key = _sy_trade_metric_key(tr)
+        try:
+            res = _sy_compact_option_metrics(
+                ibkr.fetch_option_scan_metrics(
+                    str(tr.get("ticker") or "").strip().upper(),
+                    str(tr.get("expiry") or ""),
+                    float(tr.get("strike") or 0),
+                    _sy_trade_option_right(tr),
+                    timeout=12.0,
+                )
+            )
+        except Exception as exc:
+            res = {"error": str(exc)}
+        res["source"] = "IB direct"
+        cache[key] = res
+        if pause_s > 0:
+            time.sleep(pause_s)
+    return cache
+
+
+def _sy_style_monitor_df(df: pd.DataFrame):
+    """Zvýrazní riadky podľa zdroja: IB direct vs BS fallback."""
+    if df.empty or "Zdroj" not in df.columns:
+        return df
+
+    def _row_style(row):
+        src = str(row.get("Zdroj") or "").strip()
+        if src == "IB direct":
+            return ["background-color: #e3f2fd;"] * len(row)
+        if src == "BS fallback":
+            return ["background-color: #fff3e0;"] * len(row)
+        return [""] * len(row)
+
+    return df.style.apply(_row_style, axis=1)
+
+
+# ─── Tab: Monitor (prehľad SY podľa skupín) ───────────────────────────────────
+with tab_sy_monitor:
+    st.subheader("Monitor otvorených pozícií")
+    st.caption(
+        "Otvorené nohy z **Trade Logu** zoskupené podľa **Group ID** — otvorené opcie sa ťahajú **priamo z IBKR** "
+        "(bid/ask, IV, Δ, Θ). Keď IB nedá odpoveď, použije sa BS fallback z ceny v portfóliu. "
+        "Pravidlá semafora sú v záložke **Monitoring a roll**."
+    )
+
+    if not ibkr.is_connected():
+        st.info("Pre **IBKR Greeks** pripoj TWS / IB Gateway. DTE a údaje z denníka fungujú aj bez IB.")
+
+    st.checkbox(
+        "Historický Last (1 min) ako BS fallback, ak IB direct nič nepošle",
+        value=bool(st.session_state.get("sy_ib_pos_use_hist", False)),
+        key="sy_ib_pos_use_hist",
+        help="Použije sa len keď direct IB quote zlyhá. Predvolene je rýchlejší market snapshot.",
+    )
+    _use_hist = bool(st.session_state.get("sy_ib_pos_use_hist", False))
+    _open_trade_rows = [t for t in db.get_open_trades() if (t.get("group_id") or "").strip()]
+    _direct_quotes = st.session_state.get("sy_direct_option_quotes") or {}
+    direct_quotes = _direct_quotes
+
+    m1, m2 = st.columns([1, 3])
+    with m1:
+        if ibkr.is_connected() and st.button("Načítať pozície z IB", key="sy_monitor_ib_refresh", type="primary"):
+            with st.spinner(
+                "IBKR direct quotes + snapshot + BS fallback…"
+                if not _use_hist
+                else "IBKR direct quotes + historické ceny + BS fallback (môže trvať)…"
+            ):
+                _rmon = ibkr.fetch_positions(
+                    with_greeks=True,
+                    use_mkt_snapshot=True,
+                    use_historical_last=_use_hist,
+                )
+                _direct_quotes = _sy_build_direct_quote_cache(_open_trade_rows, pause_s=0.1)
+            if _rmon.get("error"):
+                st.error(_rmon["error"])
+            else:
+                st.session_state["live_positions"] = _rmon.get("positions") or []
+                st.session_state["sy_direct_option_quotes"] = _direct_quotes
+                st.success("Pozície v cache.")
+                st.rerun()
+    with m2:
+        st.caption(
+            "Direct IB data idú na otvorené opcie. BS fallback potrebuje v účte aj podkladovú **akciu (STK)**."
+        )
+
+    if "sy_th_dg" not in st.session_state:
+        st.session_state["sy_th_dg"] = float(DELTA_GREEN_MAX)
+    if "sy_th_dr" not in st.session_state:
+        st.session_state["sy_th_dr"] = float(DELTA_RED_MIN)
+    if "sy_th_rd" not in st.session_state:
+        st.session_state["sy_th_rd"] = int(ROLL_DTE_TRIGGER)
+
+    _mon_dg = float(st.session_state.get("sy_th_dg", DELTA_GREEN_MAX))
+    _mon_dr = float(st.session_state.get("sy_th_dr", DELTA_RED_MIN))
+    _mon_rd = int(st.session_state.get("sy_th_rd", ROLL_DTE_TRIGGER))
+
+    live_mon = st.session_state.get("live_positions") or []
+
+    by_gid: dict[str, list] = defaultdict(list)
+    for tr in db.get_open_trades():
+        gid0 = (tr.get("group_id") or "").strip()
+        if gid0:
+            by_gid[gid0].append(tr)
+
+    if not by_gid:
+        st.warning(
+            "Žiadne **otvorené** obchody s vyplneným **Group ID**. Priraď skupinu v **Trade Log** pre PMCC / short overlay."
+        )
+    else:
+        for _ix, _gid in enumerate(sorted(by_gid.keys())):
+            _legs = by_gid[_gid]
+            _prof = db.get_steady_yield_group_profile(_gid)
+            _pt = None
+            if _prof and _prof.get("profit_target_pct") is not None:
+                _pv = float(_prof["profit_target_pct"])
+                if _pv > 0:
+                    _pt = _pv
+
+            _shorts_n = sum(1 for x in _legs if x.get("leg_type") == "Short")
+            with st.expander(
+                f"**{_gid}** · {len(_legs)} otvorených nôh · {_shorts_n} short",
+                expanded=(_ix == 0),
+            ):
+                _rows_m: list[dict] = []
+                for t in sorted(
+                    _legs,
+                    key=lambda x: (
+                        0 if x.get("leg_type") == "Short" else 1,
+                        str(x.get("ticker") or ""),
+                    ),
+                ):
+                    tk = (t.get("ticker") or "").upper()
+                    lt = t.get("leg_type") or "—"
+                    strat = (t.get("strategy") or "—")[:28]
+                    opt = t.get("option_type") or "—"
+                    strike = t.get("strike")
+                    exp = normalize_expiry(str(t.get("expiry") or ""))
+                    dte = calc_dte(exp)
+                    kc = t.get("contracts") or 1
+
+                    quote = direct_quotes.get(_sy_trade_metric_key(t)) or {}
+                    live_p = _sy_match_live_position(t, live_mon)
+                    has_direct = any(
+                        quote.get(k) is not None
+                        for k in ("bid", "ask", "last", "mid", "iv", "delta", "theta")
+                    )
+
+                    ad = None
+                    th_ib = None
+                    ivp_v = None
+                    mark_px = None
+                    data_src = "—"
+                    if has_direct:
+                        data_src = "IB direct"
+                        if quote.get("delta") is not None:
+                            ad = abs(float(quote["delta"]))
+                        if quote.get("theta") is not None:
+                            th_ib = float(quote["theta"])
+                        ivp_v = _iv_to_display_pct(quote.get("iv"))
+                        mark_px = quote.get("mid") or quote.get("last") or quote.get("ask") or quote.get("bid")
+                    elif live_p:
+                        data_src = "BS fallback"
+                        if live_p.get("delta") is not None:
+                            ad = abs(float(live_p["delta"]))
+                        if live_p.get("theta") is not None:
+                            th_ib = float(live_p["theta"])
+                        if live_p.get("iv") is not None:
+                            ivp_v = _iv_to_display_pct(live_p["iv"])
+                        mark_px = live_p.get("market_price")
+
+                    tl_lv = ""
+                    tl_em = "—"
+                    sy_txt = ""
+                    if lt == "Short":
+                        _tlm = traffic_light(
+                            abs_delta=ad,
+                            dte=dte,
+                            delta_green_max=_mon_dg,
+                            delta_red_min=_mon_dr,
+                            roll_dte_trigger=_mon_rd,
+                        )
+                        tl_lv = _tlm.level
+                        tl_em = {"green": "🟢", "orange": "🟠", "red": "🔴"}.get(
+                            _tlm.level, "⚪"
+                        )
+                        sy_txt = "; ".join(_tlm.reasons[:2]) if _tlm.reasons else ""
+
+                    prem_txt = "—"
+                    if (
+                        lt == "Short"
+                        and _pt is not None
+                        and mark_px is not None
+                        and t.get("entry_price") is not None
+                    ):
+                        ent_m = float(t.get("entry_price") or 0)
+                        if ent_m > 0:
+                            spp_m = short_premium_profit_pct(ent_m, float(mark_px))
+                            if spp_m is not None:
+                                prem_txt = f"{spp_m:.0f}% / cieľ {_pt:.0f}%"
+                                if spp_m >= _pt:
+                                    prem_txt = "✓ " + prem_txt
+
+                    _rows_m.append(
+                        {
+                            "Noha": lt,
+                            "Ticker": tk,
+                            "Stratégia": strat,
+                            "C/P": opt,
+                            "Strike": strike,
+                            "Exp": exp or "—",
+                            "DTE": dte if dte is not None else "—",
+                            "Ks": kc,
+                            "Bid": quote.get("bid") if has_direct else None,
+                            "Ask": quote.get("ask") if has_direct else None,
+                            "IV %": ivp_v,
+                            "|Δ|": round(ad, 3) if ad is not None else "—",
+                            "Θ": round(th_ib, 4) if th_ib is not None else "—",
+                            "Zdroj": data_src,
+                            "Semafor": f"{tl_em} {tl_lv}".strip() if tl_lv else "—",
+                            "SY (semafor)": (sy_txt[:100] + "…") if len(sy_txt) > 100 else sy_txt or "—",
+                            "Prémia %": prem_txt,
+                        }
+                    )
+
+                _df_m = pd.DataFrame(_rows_m)
+                st.dataframe(
+                    _sy_style_monitor_df(_df_m),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Bid": st.column_config.NumberColumn(format="$%.2f"),
+                        "Ask": st.column_config.NumberColumn(format="$%.2f"),
+                        "IV %": st.column_config.NumberColumn(format="%.1f %%"),
+                        "|Δ|": st.column_config.NumberColumn(format="%.3f"),
+                        "Θ": st.column_config.NumberColumn(format="%.4f"),
+                        "Zdroj": st.column_config.TextColumn(
+                            help="IB direct = priame IBKR market data; BS fallback = dopočítané z ceny/opcie."
+                        ),
+                    },
+                )
+                if _prof:
+                    st.caption(
+                        f"Profil skupiny: očak. APR {_prof.get('expected_apr_pct', '—')} % · "
+                        f"profit target short {_prof.get('profit_target_pct', '—')} % · "
+                        f"semafor alerty: {_prof.get('alert_semafor_enabled', '—')}"
+                    )
+
+
 # ─── Tab: Yield a APR ─────────────────────────────────────────────────────────
 with tab_yield:
-    gids = sorted(db.list_steady_yield_group_ids_from_trades())
 
     c1, c2 = st.columns([2, 1])
     with c1:
@@ -471,11 +1078,67 @@ with tab_yield:
         m3.metric("Realiz. APR %", f"{summ['realized_apr_pct']:.1f}" if summ["realized_apr_pct"] is not None else "—")
         m4.metric("Δ očak. APR", f"{summ['apr_gap_pct']:+.1f}" if summ["apr_gap_pct"] is not None else "—")
 
+        _live_pf = st.session_state.get("live_positions") or []
+        _gt_sel = trades_for_group(trades, sel_g)
+        _mtm_b = _sy_group_open_options_mtm_usd(_gt_sel, _live_pf)
+        _long_m = _mtm_b.get("long_usd")
+        _short_m = _mtm_b.get("short_usd")
+        _net_m = _mtm_b.get("net_usd")
+        _mtm_n = int(_mtm_b.get("n_match") or 0)
+        _open_n = int(_mtm_b.get("n_open") or 0)
+
+        _denom_mtm = None
+        if _net_m is not None and float(_net_m) > 0:
+            _denom_mtm = float(_net_m)
+        elif _long_m is not None and float(_long_m) > 0:
+            _denom_mtm = float(_long_m)
+
+        _apr_mtm = None
+        if (
+            _denom_mtm is not None
+            and _denom_mtm > 0
+            and summ.get("total_credits_used_usd") is not None
+            and summ.get("span_days")
+        ):
+            _apr_mtm = annualized_apr_pct(
+                float(summ["total_credits_used_usd"]),
+                _denom_mtm,
+                max(1, int(summ["span_days"])),
+            )
+
+        m5, m6, m7 = st.columns(3)
+        m5.metric(
+            "Trh. Long $",
+            f"{_long_m:+,.0f}" if _long_m is not None else "—",
+            help="Súčet market value Long opcií v skupine (IB; alebo mid×100×ks).",
+        )
+        m6.metric(
+            "Trh. Short $",
+            f"{_short_m:+,.0f}" if _short_m is not None else "—",
+            help="Súčet market value Short opcií (spravidla záporný — záväzok). Pripočítava sa do čistej hodnoty.",
+        )
+        m7.metric(
+            "Čistá trh. hodnota opcií $",
+            f"{_net_m:+,.0f}" if _net_m is not None else "—",
+            help="Long + Short podľa IB (čistá trhová hodnota celej opčnej časti skupiny).",
+        )
+
+        st.metric(
+            "Realiz. APR % (voči čistej trh.)",
+            f"{_apr_mtm:.1f}" if _apr_mtm is not None else "—",
+            help="Kredity delené čistou trhovou hodnotou opcií (Long + Short z IB). Ak čistá nie je kladná, použije sa len Long.",
+        )
+
         st.caption(
             f"Roll udalosti: {summ['roll_event_count']} · Dni v okne: {summ['span_days']} · "
             f"Kredity z roll tabuľky: {summ['credits_from_roll_events_usd']:+,.0f} · "
             f"Uzavreté shorty (Log): {summ['credits_from_closed_shorts_usd']:+,.0f}"
         )
+        if _open_n > 0:
+            st.caption(
+                f"Otvorené opčné nohy v skupine: {_open_n} · spárovaných s IB: {_mtm_n}. "
+                "**Realiz. APR %** hore = voči vstupnej báze LEAPS. **Voči čistej trh.** zahŕňa aj **trhovú hodnotu shortu**."
+            )
 
         st.subheader("Efficiency (posledné udalosti)")
         rows_ef = []
@@ -504,8 +1167,22 @@ with tab_mon:
     if not ibkr.is_connected():
         st.warning("Pripoj **TWS / Gateway** pre live delty a sken kontraktov.")
     if ibkr.is_connected() and st.button("Obnoviť pozície s Greeks", key="sy_refresh_greeks"):
-        with st.spinner("IBKR portfolio + BS Greeks…"):
-            _rpos = ibkr.fetch_positions(with_greeks=True, use_historical_last=False)
+        _uh = bool(st.session_state.get("sy_ib_pos_use_hist", False))
+        with st.spinner(
+            "IBKR direct quotes + snapshot + BS fallback…"
+            if not _uh
+            else "IBKR direct quotes + historické ceny + BS fallback…"
+        ):
+            _rpos = ibkr.fetch_positions(
+                with_greeks=True,
+                use_mkt_snapshot=True,
+                use_historical_last=_uh,
+            )
+            _open_trades_mon = [t for t in db.get_open_trades() if (t.get("group_id") or "").strip()]
+            st.session_state["sy_direct_option_quotes"] = _sy_build_direct_quote_cache(
+                _open_trades_mon,
+                pause_s=0.1,
+            )
         if _rpos.get("error"):
             st.error(_rpos["error"])
         else:
@@ -513,6 +1190,7 @@ with tab_mon:
             st.success("Pozície aktualizované.")
             st.rerun()
     live = st.session_state.get("live_positions") or []
+    direct_quotes = st.session_state.get("sy_direct_option_quotes") or {}
 
     gid_m = st.selectbox(
         "Skupina na párovanie s pozíciami",
@@ -593,13 +1271,28 @@ with tab_mon:
 
                 ad = None
                 th = None
-                if pos:
+                quote = direct_quotes.get(_sy_trade_metric_key(t)) or {}
+                has_direct = any(
+                    quote.get(k) is not None
+                    for k in ("bid", "ask", "last", "mid", "iv", "delta", "theta")
+                )
+                mark_px = None
+                if has_direct:
+                    dv = quote.get("delta")
+                    if dv is not None:
+                        ad = abs(float(dv))
+                    tv = quote.get("theta")
+                    if tv is not None:
+                        th = float(tv)
+                    mark_px = quote.get("mid") or quote.get("last") or quote.get("ask") or quote.get("bid")
+                elif pos:
                     dv = pos.get("delta")
                     if dv is not None:
                         ad = abs(float(dv))
                     tv = pos.get("theta")
                     if tv is not None:
                         th = float(tv)
+                    mark_px = pos.get("market_price")
 
                 tl = traffic_light(
                     abs_delta=ad,
@@ -613,17 +1306,22 @@ with tab_mon:
                     st.markdown(f"#### {color} {tk} short {opt} K{strike:g} exp {exp} · DTE {dte}")
                     for line in tl.reasons:
                         st.caption(line)
-                    if pos:
-                        st.caption(f"Live Δ {pos.get('delta')} · Θ {pos.get('theta')}")
+                    if has_direct:
+                        st.caption(
+                            f"Zdroj: **IB direct** · Δ {quote.get('delta')} · Θ {quote.get('theta')} · "
+                            f"IV {quote.get('iv')} · Bid {quote.get('bid')} · Ask {quote.get('ask')}"
+                        )
+                    elif pos:
+                        st.caption(f"Zdroj: **BS fallback** · Δ {pos.get('delta')} · Θ {pos.get('theta')}")
                     else:
                         st.caption("Live pozícia v cache nenájdená — skús **TWS Dashboard** načítať alebo auto-sync.")
 
                     tid = t.get("id")
                     _tid = int(tid) if tid is not None else None
-                    if pt_alert and pos and pos.get("market_price") is not None:
+                    if pt_alert and mark_px is not None:
                         ent = t.get("entry_price")
                         if ent is not None and float(ent) > 0:
-                            mk = float(pos["market_price"])
+                            mk = float(mark_px)
                             spp = short_premium_profit_pct(float(ent), mk)
                             if spp is not None and spp >= pt_alert:
                                 pmsg = profit_target_message(
@@ -749,8 +1447,8 @@ with tab_mon:
             ctr = int(shorts[0].get("contracts") or 1)
             if st.button("Načítať bid/ask a vypočítať", key="sy_roll_btn") and ibkr.is_connected():
                 with st.spinner("IBKR…"):
-                    o1 = ibkr.fetch_option_scan_metrics(t_old.upper(), e_old.replace("-", ""), k_old, r_old)
-                    o2 = ibkr.fetch_option_scan_metrics(t_old.upper(), e_new.replace("-", ""), k_new, r_new)
+                    o1 = _sy_compact_option_metrics(ibkr.fetch_option_scan_metrics(t_old.upper(), e_old.replace("-", ""), k_old, r_old))
+                    o2 = _sy_compact_option_metrics(ibkr.fetch_option_scan_metrics(t_old.upper(), e_new.replace("-", ""), k_new, r_new))
                 if o1.get("error"):
                     st.error(f"Starý kontrakt: {o1['error']}")
                 if o2.get("error"):
@@ -853,7 +1551,7 @@ with tab_scan:
     with s2:
         max_sp = st.number_input("Max. spread % mid", value=float(DEFAULT_MAX_SPREAD_PCT_MID), step=0.1)
     with s3:
-        max_iv = st.number_input("Max. IV rank % (stĺpec Symboly)", value=float(DEFAULT_MAX_IV_RANK_ENTRY), step=1.0)
+        max_iv = st.number_input("Max. aktuálna IV % (short)", value=float(DEFAULT_MAX_IV_RANK_ENTRY), step=1.0)
     with s4:
         max_sec = st.number_input("Max. tickerov / sektor", value=float(DEFAULT_MAX_TICKERS_PER_SECTOR), step=1.0)
 
@@ -936,6 +1634,22 @@ with tab_scan:
         format_func=lambda x: "Call (C)" if x == "C" else "Put (P)",
         help="IBKR: `fetch_option_scan_metrics` + `fetch_iv` pre obe expirácie, rovnaký strike.",
     )
+    use_historical = st.checkbox(
+        "Použiť **historické dáta** (close z predchádzajúceho dňa) — spoľahlivejšie pre informačný sken",
+        value=True,
+        key="sy_scan_hist",
+        help="Namiesto live tickov (ktoré často chýbajú) načíta settlement cenu z posledného obchodného dňa. IV/Delta/Theta sa dopočítajú cez BS.",
+    )
+    target_long_delta = st.number_input(
+        "Hľadaná |Δ| pre dlhú nohu (napr. 0,80)",
+        min_value=0.05,
+        max_value=0.99,
+        value=0.80,
+        step=0.05,
+        format="%.2f",
+        key="sy_target_long_delta",
+        help="Zobrazí sa v tabuľke ako **Cieľ |Δ|** a stĺpec **K @ cieľ** ukáže strike z mriežky najbližší tejto delte (BS, rovnaká IV ako pri výpočte).",
+    )
     require_iv_term = st.checkbox(
         "Vyžadovať vyššiu impl. vol na **krátkej** než na dlhej (IV krátka > IV dlhá)",
         value=True,
@@ -1016,14 +1730,14 @@ with tab_scan:
             "Min. DTE **dlhej** exp by mal byť **väčší** ako min. DTE krátkej — inak sú heuristiky príliš blízko a výber môže byť menej zmysluplný."
         )
 
-    with st.expander("Logika: dve expirácie + IV rank 13t / 52t", expanded=False):
+    with st.expander("Logika: dve expirácie + aktuálna IV / IV rank 13t / 52t", expanded=False):
         st.markdown(
             """
 1. **Krátka exp:** auto = prvá exp z IBKR reťazca s DTE ≥ min. krátkej; manuálne = dátum z **centrálneho katalógu** (DB, ako Spread Builder) alebo vlastný YYYYMMDD — musí sedieť s reťazcom IBKR.
 2. **Dlhá exp:** auto = prvá exp **neskôr** ako krátka s DTE ≥ min. dlhej; manuálne = rovnako katalóg alebo YYYYMMDD.
 3. **Strike:** jeden ATM strike (najbližší k spotu) pre obe nohy.
-4. **IV % v tabuľke:** impl. vol. konkrétnej nohy — `fetch_iv` + tick 101, prípadne BS z mid; **nie je to** IV rank zo Symboly.
-5. **Rozsah impl. IV % (od–do)** pre krátku a dlhú nohu — napr. krátka 40–60 %, dlhá 15–30 %; voliteľne **IV krátka > IV dlhá**.
+4. **IV % v tabuľke:** aktuálna impl. vol. konkrétnej nohy — `fetch_iv` + tick 101, prípadne BS z mid; **nie je to** IV rank zo Symboly.
+5. **Rozsah impl. IV % (od–do)** pre krátku a dlhú nohu — napr. krátka 40–60 %, dlhá 15–30 %; riadky mimo rozsah sa **nezahadzujú**, len sa podfarbia na červeno. Voliteľne **IV krátka > IV dlhá**.
 6. **IV Rank 13t / 52t:** zadáš v **Symboly** (TWS) — skener ich len zobrazí a krátky text „kontext“; **automaticky ich nestiahneme** z API.
 
 Filter „Max. IV rank %“ používa stĺpec **IV Rank (%)** v Symboly (primárny rank / Yahoo história) — **iná veličina** ako impl. IV % v tabuľke.
@@ -1048,9 +1762,9 @@ Filter „Max. IV rank %“ používa stĺpec **IV Rank (%)** v Symboly (primár
             _r52 = iv_map_52.get(tkr)
             ivr = iv_map.get(tkr)
             ok_iv, msg_iv = iv_rank_passes(ivr, max_iv)
+            iv_rank_note = None
             if not ok_iv:
-                scan_log.append(f"**{tkr}** — ⏭ IV rank {ivr}% > {max_iv}% (filter)")
-                continue
+                iv_rank_note = f"IV rank {ivr}% > {max_iv}% (mimo rozsah)"
             ch = ibkr.fetch_secdef_option_params(tkr)
             if ch.get("error"):
                 scan_log.append(f"**{tkr}** — ❌ Reťazec: {ch['error']}")
@@ -1089,8 +1803,16 @@ Filter „Max. IV rank %“ používa stĺpec **IV Rank (%)** v Symboly (primár
                 )
                 continue
 
-            und = ibkr.fetch_underlying(tkr, timeout=5.0)
-            spot = float(und.get("price") or 0)
+            if use_historical:
+                und = ibkr.fetch_underlying_previous_close(tkr, timeout=8.0)
+                spot = float(und.get("price") or 0)
+                if spot <= 0:
+                    # Ak historický close podkladu chýba, skúsime aspoň posledný dostupný spot
+                    und = ibkr.fetch_underlying(tkr, timeout=5.0)
+                    spot = float(und.get("price") or 0)
+            else:
+                und = ibkr.fetch_underlying(tkr, timeout=5.0)
+                spot = float(und.get("price") or 0)
             if spot <= 0:
                 scan_log.append(f"**{tkr}** — ❌ Spot nedostupný z IBKR")
                 continue
@@ -1104,8 +1826,45 @@ Filter „Max. IV rank %“ používa stĺpec **IV Rank (%)** v Symboly (primár
                 k_long = k_short
             is_diagonal = abs(float(k_short) - float(k_long)) > 0.001
 
-            met_s = ibkr.fetch_option_scan_metrics(tkr, exp_s, k_short, right_scan)
-            met_l = ibkr.fetch_option_scan_metrics(tkr, exp_l, k_long, right_scan)
+            if use_historical:
+                # Historické dáta (settlement z predchádzajúceho dňa) — spoľahlivé
+                met_s = _sy_fetch_historical_option(tkr, exp_s, k_short, right_scan, spot)
+                met_l = _sy_fetch_historical_option(tkr, exp_l, k_long, right_scan, spot)
+            else:
+                # Live ticky (môžu chýbať pre vzdialené expirácie)
+                met_s = _sy_compact_option_metrics(ibkr.fetch_option_scan_metrics(tkr, exp_s, k_short, right_scan, timeout=14.0))
+                met_l = _sy_compact_option_metrics(ibkr.fetch_option_scan_metrics(tkr, exp_l, k_long, right_scan, timeout=18.0))
+                # Fallback: ak dlhá noha nemá bid/ask, skúsime historický tick
+                if met_l.get("bid") is None and met_l.get("ask") is None and met_l.get("last") is None:
+                    try:
+                        hist_l = ibkr.fetch_option_historical_last(tkr, exp_l, k_long, right_scan)
+                        if hist_l and hist_l.get("last"):
+                            met_l["last"] = hist_l["last"]
+                            met_l["mid"] = hist_l["last"]
+                            met_l["error"] = None
+                    except Exception:
+                        pass
+
+            # Posledná orientačná záchrana pre informačný sken:
+            # keď jedna noha ostane bez dát, dopočítaj ju z IV druhej nohy.
+            met_l = _sy_fill_proxy_metrics_from_peer(
+                met_l,
+                met_s,
+                spot=spot,
+                target_expiry=exp_l,
+                peer_expiry=exp_s,
+                target_strike=float(k_long),
+                right=right_scan,
+            )
+            met_s = _sy_fill_proxy_metrics_from_peer(
+                met_s,
+                met_l,
+                spot=spot,
+                target_expiry=exp_s,
+                peer_expiry=exp_l,
+                target_strike=float(k_short),
+                right=right_scan,
+            )
             err_s = met_s.get("error")
             err_l = met_l.get("error")
 
@@ -1142,46 +1901,90 @@ Filter „Max. IV rank %“ používa stĺpec **IV Rank (%)** v Symboly (primár
             dte_l = calc_dte(normalize_expiry(str(exp_l)))
             _ds = max(1, int(dte_s or 1))
             _dl = max(1, int(dte_l or 1))
+            try:
+                _dls = met_s.get("delta")
+                _ths = met_s.get("theta")
+                _dll = met_l.get("delta")
+                _thl = met_l.get("theta")
+                _dlsf = abs(float(_dls)) if _dls is not None and _dls == _dls else None
+                _dllf = abs(float(_dll)) if _dll is not None and _dll == _dll else None
+                _thsf = float(_ths) if _ths is not None and _ths == _ths else None
+                _thlf = float(_thl) if _thl is not None and _thl == _thl else None
+            except (TypeError, ValueError):
+                _dlsf, _dllf, _thsf, _thlf = None, None, None, None
 
             ivr_s = ibkr.fetch_iv(tkr, exp_s, k_short, right_scan)
             ivr_l = ibkr.fetch_iv(tkr, exp_l, k_long, right_scan)
             ivp_s = _resolve_scan_iv_pct(ivr_s, met_s, spot, _ds, k_short, right_scan)
             ivp_l = _resolve_scan_iv_pct(ivr_l, met_l, spot, _dl, k_long, right_scan)
+            _iv_hint_long = (
+                met_l.get("iv")
+                or met_s.get("iv")
+                or ivr_l.get("iv")
+                or ivr_s.get("iv")
+            )
+            k_long_target, d_long_target = _sy_find_strike_for_target_delta(
+                all_strikes,
+                spot=float(spot),
+                expiry=str(exp_l),
+                right=right_scan,
+                target_abs_delta=float(target_long_delta),
+                iv_hint=float(_iv_hint_long) if _iv_hint_long is not None else None,
+            )
             term_ok = ivp_s is not None and ivp_l is not None and ivp_s > ivp_l
+            row_warn = False
 
             ok_ims, msg_ims = _impl_iv_pct_leg_filter(ivp_s, float(min_impl_iv_s), float(max_impl_iv_s))
             ok_iml, msg_iml = _impl_iv_pct_leg_filter(ivp_l, float(min_impl_iv_l), float(max_impl_iv_l))
+            fail_count = 0
             if not ok_ims:
-                scan_log.append(f"**{tkr}** — ⏭ Impl. IV krátka: {msg_ims}")
-                continue
+                row_warn = True
+                fail_count += 1
+                scan_log.append(f"**{tkr}** — ⚠ Impl. IV krátka: {msg_ims}")
             if not ok_iml:
-                scan_log.append(f"**{tkr}** — ⏭ Impl. IV dlhá: {msg_iml}")
-                continue
+                row_warn = True
+                fail_count += 1
+                scan_log.append(f"**{tkr}** — ⚠ Impl. IV dlhá: {msg_iml}")
 
             if require_iv_term and ivp_s is not None and ivp_l is not None and not term_ok:
-                scan_log.append(
-                    f"**{tkr}** — ⏭ IV term filter: krátka {ivp_s}% ≤ dlhá {ivp_l}%"
-                )
-                continue
+                row_warn = True
+                fail_count += 1
+                scan_log.append(f"**{tkr}** — ⚠ IV term filter: krátka {ivp_s:.1f}% ≤ dlhá {ivp_l:.1f}%")
+            if not ok_iv:
+                row_warn = True
+                fail_count += 1
+                scan_log.append(f"**{tkr}** — ⚠ IV rank {ivr}% > {max_iv}% (filter)")
+
+            if ivp_s is None or ivp_l is None:
+                fail_count += 1
+
+            if fail_count <= 0:
+                row_state = "pass"
+            elif fail_count <= 2:
+                row_state = "warn"
+            else:
+                row_state = "fail"
 
             ir13 = iv_map_13.get(tkr)
             ir52 = iv_map_52.get(tkr)
             hint = _rank_hint(ir13, ir52)
+            ivp_s_txt = f"{ivp_s:.1f}%" if ivp_s is not None else "—"
+            ivp_l_txt = f"{ivp_l:.1f}%" if ivp_l is not None else "—"
             if ivr is None:
-                _iv_rank_detail = "IV rank (Symboly) neznámy — filter max. % preskočený"
+                _iv_rank_detail = (
+                    f"aktuálna IV krátka {ivp_s_txt} · dlhá {ivp_l_txt} | "
+                    "IV rank (Symboly) neznámy — filter max. % preskočený"
+                )
             else:
-                _iv_rank_detail = f"IV rank (Symboly) {float(ivr):.1f}% ≤ max {float(max_iv):.1f}%"
+                _iv_rank_detail = (
+                    f"aktuálna IV krátka {ivp_s_txt} · dlhá {ivp_l_txt} | "
+                    f"IV rank (Symboly) {float(ivr):.1f}% ≤ max {float(max_iv):.1f}%"
+                )
             success_iv_notes.append((tkr, _iv_rank_detail))
-            try:
-                _ths = met_s.get("theta")
-                _thl = met_l.get("theta")
-                _thsf = float(_ths) if _ths is not None and _ths == _ths else None
-                _thlf = float(_thl) if _thl is not None and _thl == _thl else None
-            except (TypeError, ValueError):
-                _thsf, _thlf = None, None
             theta_breakdown.append((tkr, _thsf, _thlf))
 
             stav_parts = []
+            stav_parts.append("✓R" if ok_iv else "×R")
             stav_parts.append("✓K" if ok_s else "×K")
             stav_parts.append("✓D" if ok_l else "×D")
             if ivp_s is not None and ivp_l is not None:
@@ -1195,26 +1998,44 @@ Filter „Max. IV rank %“ používa stĺpec **IV Rank (%)** v Symboly (primár
                 "exp": exp_s, "DTE": dte_s if dte_s is not None else "—",
                 "strike": k_short, "C/P": _cp_lbl,
                 "IV %": ivp_s,
+                "|Δ|": _dlsf,
                 "sprd %": met_s.get("spread_pct_mid"),
                 "Θ/deň": met_s.get("theta"),
                 "OI": met_s.get("open_interest"),
+                "Cieľ |Δ|": "—",
+                "K @ cieľ": "—",
+                "|Δ|@K": "—",
                 "R13": ir13 if ir13 is not None else "—",
                 "R52": ir52 if ir52 is not None else "—",
                 "kontext": hint,
                 "stav": stav_text,
+                "row_state": row_state,
             })
             out_rows.append({
                 "ticker": "", "typ": "", "noha": "Dlhá",
                 "exp": exp_l, "DTE": dte_l if dte_l is not None else "—",
                 "strike": k_long, "C/P": _cp_lbl,
                 "IV %": ivp_l,
+                "|Δ|": _dllf,
                 "sprd %": met_l.get("spread_pct_mid"),
                 "Θ/deň": met_l.get("theta"),
                 "OI": met_l.get("open_interest"),
+                "Cieľ |Δ|": round(float(target_long_delta), 2),
+                "K @ cieľ": (
+                    round(float(k_long_target), 2)
+                    if k_long_target is not None
+                    else "—"
+                ),
+                "|Δ|@K": (
+                    round(float(d_long_target), 3)
+                    if d_long_target is not None
+                    else "—"
+                ),
                 "R13": ir13 if ir13 is not None else "—",
                 "R52": ir52 if ir52 is not None else "—",
                 "kontext": hint,
                 "stav": stav_text,
+                "row_state": row_state,
             })
 
             if not ok_s:
@@ -1227,8 +2048,12 @@ Filter „Max. IV rank %“ používa stĺpec **IV Rank (%)** v Symboly (primár
         _df_scan = pd.DataFrame(out_rows)
         if not _df_scan.empty:
             st.caption(
-                "Modrá = krátka noha · zelená = dlhá · ticker len pri krátkej. "
-                "Stĺpec IV % = impl. volatilita danej nohy (nie IV rank zo Symboly). "
+                "Zelená = všetko prešlo · oranžová = riadok je mimo časti filtrov, ale zobrazí sa · červená = kritický fail. "
+                "Stĺpec IV % = aktuálna impl. volatilita danej nohy (nie IV rank zo Symboly). "
+                "**Cieľ |Δ|** = hľadaná absolútna delta (napr. 0,80) pre dlhú nohu. "
+                "**K @ cieľ** = strike z IBKR mriežky, ktorý je k tejto delte najbližší (BS). "
+                "**|Δ|@K** = teoretická |Δ| pri tom striku. Krátka noha má v týchto stĺpcoch „—“. "
+                "|Δ| = aktuálna absolútna delta nohy v riadku. "
                 "Θ/deň = theta na akciu za deň (IBKR, modelGreeks); sprd % = šírka spreadu voči mid."
             )
             _render_sy_scan_plotly(_df_scan)
@@ -1253,7 +2078,7 @@ Filter „Max. IV rank %“ používa stĺpec **IV Rank (%)** v Symboly (primár
                     st.markdown(f"- **{_tt}:** krátka Θ/deň = {_sk} · dlhá Θ/deň = {_sl}")
 
         if success_iv_notes:
-            st.markdown("### Úspešné (IV rank zo Symboly)")
+            st.markdown("### Prehľad (aktuálna IV %)")
             for _t, _d in success_iv_notes:
                 st.markdown(f"- **{_t}:** {_d}")
 

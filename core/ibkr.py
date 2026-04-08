@@ -388,13 +388,22 @@ def fetch_underlying(ticker: str, timeout: float = 10.0) -> dict:
                 continue
 
         # 2) Historický fallback (často funguje aj keď snapshot nie)
-        for dur, what in [("300 S", "TRADES"), ("300 S", "MIDPOINT"), ("1 D", "TRADES"), ("1 D", "MIDPOINT")]:
+        for dur, what, bar_size in [
+            ("300 S", "TRADES", "1 min"),
+            ("300 S", "MIDPOINT", "1 min"),
+            ("1 D", "TRADES", "1 min"),
+            ("1 D", "MIDPOINT", "1 min"),
+            ("2 D", "TRADES", "1 day"),
+            ("2 D", "MIDPOINT", "1 day"),
+            ("5 D", "TRADES", "1 day"),
+            ("5 D", "MIDPOINT", "1 day"),
+        ]:
             try:
                 bars = ib.reqHistoricalData(
                     stock,
                     endDateTime="",
                     durationStr=dur,
-                    barSizeSetting="1 min",
+                    barSizeSetting=bar_size,
                     whatToShow=what,
                     useRTH=False,
                     formatDate=1,
@@ -418,6 +427,77 @@ def fetch_underlying(ticker: str, timeout: float = 10.0) -> dict:
             pass
 
         return {"price": None, "ticker": ticker, "error": "Spot nedostupný (snapshot aj historical bez dát)"}
+    finally:
+        if prev_loop is not None and not getattr(prev_loop, "is_closed", lambda: False)():
+            try:
+                asyncio.set_event_loop(prev_loop)
+            except Exception:
+                pass
+
+
+def fetch_underlying_previous_close(ticker: str, timeout: float = 10.0) -> dict:
+    """
+    Vráti uzatváraciu cenu podkladu z posledného ukončeného dňa.
+    Používa historické dáta, nie live snapshot.
+    """
+    ib = get_ib()
+    if not ib or not ib.isConnected():
+        return {"price": None, "ticker": ticker, "error": "Nie je pripojenie na IBKR"}
+
+    ib_loop = getattr(ib, "_loop", None) or _MAIN_LOOP
+    if ib_loop is None or getattr(ib_loop, "is_closed", lambda: False)():
+        return {"price": None, "ticker": ticker, "error": "Chýba IB event loop (odpoj/pripoj TWS)"}
+
+    prev_loop = None
+    try:
+        prev_loop = asyncio.get_event_loop()
+    except RuntimeError:
+        prev_loop = None
+
+    asyncio.set_event_loop(ib_loop)
+    try:
+        _, Stock, _ = _ib_ready()
+        stock = Stock((ticker or "").strip().upper(), "SMART", "USD")
+        q = ib.qualifyContracts(stock)
+        if not q:
+            return {"price": None, "ticker": ticker, "error": f"Underlying {ticker} nenájdený"}
+        stock = q[0]
+
+        def _valid(v) -> float | None:
+            try:
+                f = float(v)
+                return f if f and not math.isnan(f) and f > 0 else None
+            except Exception:
+                return None
+
+        for dur, what, bar_size in [
+            ("2 D", "TRADES", "1 day"),
+            ("2 D", "MIDPOINT", "1 day"),
+            ("5 D", "TRADES", "1 day"),
+            ("5 D", "MIDPOINT", "1 day"),
+            ("10 D", "TRADES", "1 day"),
+            ("10 D", "MIDPOINT", "1 day"),
+            ("2 D", "TRADES", "1 hour"),
+            ("2 D", "MIDPOINT", "1 hour"),
+        ]:
+            try:
+                bars = ib.reqHistoricalData(
+                    stock,
+                    endDateTime="",
+                    durationStr=dur,
+                    barSizeSetting=bar_size,
+                    whatToShow=what,
+                    useRTH=True,
+                    formatDate=1,
+                    timeout=min(max(float(timeout), 6.0), 20.0),
+                )
+                if bars:
+                    px = _valid(getattr(bars[-1], "close", None))
+                    if px:
+                        return {"price": float(px), "ticker": ticker, "error": None, "source": f"prev_close {what.lower()}"}
+            except Exception:
+                continue
+        return {"price": None, "ticker": ticker, "error": "Historický close podkladu nedostupný"}
     finally:
         if prev_loop is not None and not getattr(prev_loop, "is_closed", lambda: False)():
             try:
@@ -742,6 +822,7 @@ def fetch_option_scan_metrics(ticker: str, expiry: str, strike: float, right: st
         iv_raw = getattr(greeks, "impliedVol", None) if greeks is not None else None
         und_price = getattr(greeks, "undPrice", None) if greeks is not None else None
         theta_raw = getattr(greeks, "theta", None) if greeks is not None else None
+        delta_raw = getattr(greeks, "delta", None) if greeks is not None else None
         oi = getattr(t_obj, "openInterest", None)
         if oi is not None:
             try:
@@ -762,6 +843,14 @@ def fetch_option_scan_metrics(ticker: str, expiry: str, strike: float, right: st
                 tf = float(theta_raw)
                 if not math.isnan(tf):
                     th = round(tf, 5)
+            except (TypeError, ValueError):
+                pass
+        dl = None
+        if delta_raw is not None:
+            try:
+                df = float(delta_raw)
+                if not math.isnan(df):
+                    dl = round(df, 6)
             except (TypeError, ValueError):
                 pass
         ga_raw = getattr(greeks, "gamma", None) if greeks is not None else None
@@ -795,6 +884,7 @@ def fetch_option_scan_metrics(ticker: str, expiry: str, strike: float, right: st
             "spread_pct_mid": spread_pct,
             "open_interest": oi,
             "iv": _sf(iv_raw),
+            "delta": dl,
             "theta": th,
             "gamma": gam,
             "vega": veg,
@@ -863,6 +953,7 @@ def fetch_option_scan_metrics(ticker: str, expiry: str, strike: float, right: st
                 "spread_pct_mid": None,
                 "open_interest": None,
                 "iv": None,
+                "delta": None,
                 "theta": None,
                 "gamma": None,
                 "vega": None,
@@ -884,6 +975,86 @@ def fetch_option_scan_metrics(ticker: str, expiry: str, strike: float, right: st
                 pass
 
     return result
+
+
+def fetch_option_historical_last(ticker: str, expiry: str, strike: float, right: str, timeout: float = 10.0) -> dict:
+    """
+    Fallback: historický bar pre opčný kontrakt.
+    Skúša viac kombinácií (intraday aj denné bary), aby fungoval aj tam,
+    kde IBKR nevracia 1-min históriu.
+    Vracia {"last": float} alebo {"error": str}.
+    """
+    ib = get_ib()
+    if not ib or not ib.isConnected():
+        return {"error": "Nie je pripojenie na IBKR"}
+    sym = (ticker or "").strip().upper()
+    r = (right or "C").upper()[:1]
+    if r not in ("C", "P"):
+        r = "C"
+
+    ib_loop = getattr(ib, "_loop", None) or _MAIN_LOOP
+    if ib_loop is None or getattr(ib_loop, "is_closed", lambda: False)():
+        return {"error": "Chýba IB event loop"}
+
+    prev_loop = None
+    try:
+        prev_loop = asyncio.get_event_loop()
+    except RuntimeError:
+        prev_loop = None
+
+    asyncio.set_event_loop(ib_loop)
+    try:
+        _ib_ready()
+        from ib_insync import Option as IBOption
+
+        expiry_ib = _ib_expiry_compact(expiry)
+        opt = IBOption(sym, expiry_ib, float(strike), r, "SMART", currency="USD")
+        qualified = ib.qualifyContracts(opt)
+        if not qualified:
+            return {"error": f"Kontrakt {sym} {expiry} ${strike} {r} nenájdený"}
+        opt = qualified[0]
+
+        for dur, what, bar_size in [
+            ("300 S", "TRADES", "1 min"),
+            ("300 S", "MIDPOINT", "1 min"),
+            ("300 S", "BID_ASK", "1 min"),
+            ("1 D", "TRADES", "1 min"),
+            ("1 D", "MIDPOINT", "1 min"),
+            ("1 D", "BID_ASK", "1 min"),
+            ("2 D", "TRADES", "1 day"),
+            ("2 D", "MIDPOINT", "1 day"),
+            ("2 D", "BID_ASK", "1 day"),
+            ("5 D", "TRADES", "1 day"),
+            ("5 D", "MIDPOINT", "1 day"),
+            ("5 D", "BID_ASK", "1 day"),
+        ]:
+            try:
+                bars = ib.reqHistoricalData(
+                    opt,
+                    endDateTime="",
+                    durationStr=dur,
+                    barSizeSetting=bar_size,
+                    whatToShow=what,
+                    useRTH=False,
+                    formatDate=1,
+                    timeout=min(max(float(timeout), 5.0), 15.0),
+                )
+                if bars:
+                    last_bar = bars[-1]
+                    close_px = getattr(last_bar, "close", None)
+                    if close_px is not None and not math.isnan(close_px) and close_px > 0:
+                        return {"last": round(float(close_px), 4)}
+            except Exception:
+                continue
+        return {"error": "Historické dáta nedostupné"}
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        if prev_loop is not None and not getattr(prev_loop, "is_closed", lambda: False)():
+            try:
+                asyncio.set_event_loop(prev_loop)
+            except Exception:
+                pass
 
 
 def _parse_ib_margin_value(v) -> Optional[float]:
