@@ -802,6 +802,8 @@ GROUP_MAINT_MARGIN_KEY = "group_maintenance_margin"
 
 # Voľný text: IBKR predplatné trhových dát — portfóliový agent (analýza + follow-up chat)
 AGENT_IBKR_MARKET_DATA_KEY = "agent_ibkr_market_data"
+# Archív hotových sedení portfóliového agenta (JSON pole; v UI posledných ~90 dní)
+PORTFOLIO_AGENT_EVAL_ARCHIVE_KEY = "portfolio_agent_eval_archive"
 
 
 def get_group_maint_margins() -> dict[str, float]:

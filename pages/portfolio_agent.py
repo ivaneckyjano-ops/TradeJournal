@@ -2,6 +2,11 @@
 Portfolio Agent – prehľad a AI analýza celého portfólia call diagonalov.
 Pokrýva: AMZN, AAPL, GOOGL, MSFT, TSLA, NVDA, META
 """
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta, timezone
+
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -20,6 +25,8 @@ WATCHED          = ai_agent.WATCHED_TICKERS
 BETA             = ai_agent.TICKER_BETA
 SHORT_DTE_ALERT  = 14
 MIN_THETA_GROUP  = 0.0
+# Archív vyhodnotení agenta v DB (približne posledné 3 mesiace)
+_AGENT_ARCHIVE_DAYS = 90
 MIN_THETA_TOTAL  = 10.0
 DELTA_BW_MIN     = 50
 DELTA_BW_MAX     = 150
@@ -199,25 +206,25 @@ with st.sidebar:
                 spot = float(row.get("Spot $") or 0)
                 sym  = db.get_symbol(tk)
                 if sym:
-                db.update_symbol(
-                    sym["id"], sym["ticker"], sym.get("company_name", ""),
-                    sym.get("sector", ""), sym.get("asset_type", "Stock"),
-                    sym.get("description", ""), sym.get("earnings_date"),
-                    ivr,
-                    spot=spot, iv_pct=iv,
-                    iv_rank_13w=sym.get("iv_rank_13w"),
-                    iv_rank_52w=sym.get("iv_rank_52w"),
-                )
+                    db.update_symbol(
+                        sym["id"], sym["ticker"], sym.get("company_name", ""),
+                        sym.get("sector", ""), sym.get("asset_type", "Stock"),
+                        sym.get("description", ""), sym.get("earnings_date"),
+                        ivr,
+                        spot=spot, iv_pct=iv,
+                        iv_rank_13w=sym.get("iv_rank_13w"),
+                        iv_rank_52w=sym.get("iv_rank_52w"),
+                    )
                 else:
                     db.add_symbol(tk, iv_rank=ivr)
                     sym2 = db.get_symbol(tk)
                     if sym2:
-                    db.update_symbol(
-                        sym2["id"], tk, "", "", "Stock", "", None,
-                        ivr, spot=spot, iv_pct=iv,
-                        iv_rank_13w=sym2.get("iv_rank_13w"),
-                        iv_rank_52w=sym2.get("iv_rank_52w"),
-                    )
+                        db.update_symbol(
+                            sym2["id"], tk, "", "", "Stock", "", None,
+                            ivr, spot=spot, iv_pct=iv,
+                            iv_rank_13w=sym2.get("iv_rank_13w"),
+                            iv_rank_52w=sym2.get("iv_rank_52w"),
+                        )
                 _new_tbl[tk] = {"Spot $": spot, "IV %": iv, "IV Rank": int(ivr)}
             st.session_state["mkt_table"] = _new_tbl
             st.success(f"Uložené ({len(_new_tbl)} tickerov).")
@@ -667,6 +674,75 @@ with st.expander("🔗 Korelačná matica (aproximácia)", expanded=False):
 
 st.divider()
 
+
+def _agent_parse_at(iso_s: str) -> datetime | None:
+    if not iso_s:
+        return None
+    try:
+        s = str(iso_s).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _agent_load_eval_archive() -> list[dict]:
+    raw = db.get_setting(db.PORTFOLIO_AGENT_EVAL_ARCHIVE_KEY, "")
+    if not raw.strip():
+        return []
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _agent_save_eval_archive(sessions: list[dict]) -> None:
+    try:
+        db.set_setting(db.PORTFOLIO_AGENT_EVAL_ARCHIVE_KEY, json.dumps(sessions))
+    except Exception:
+        pass
+
+
+def _agent_prune_eval_archive(sessions: list[dict]) -> list[dict]:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=_AGENT_ARCHIVE_DAYS)
+    out: list[dict] = []
+    for s in sessions:
+        dt = _agent_parse_at(s.get("at") or "")
+        if dt is not None and dt >= cutoff:
+            out.append(s)
+    return out
+
+
+def _agent_archive_current_session(question: str) -> None:
+    hist = st.session_state.get("portfolio_chat") or []
+    if not hist:
+        return
+    arch = _agent_prune_eval_archive(_agent_load_eval_archive())
+    arch.append({
+        "at": datetime.now(timezone.utc).isoformat(),
+        "question": (question or "")[:800],
+        "messages": hist,
+    })
+    _agent_save_eval_archive(_agent_prune_eval_archive(arch))
+
+
+def _agent_render_chat_messages(messages: list) -> None:
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        content = msg.get("content") or ""
+        if role == "assistant":
+            with st.chat_message("assistant", avatar="🤖"):
+                st.markdown(content)
+        elif role == "user":
+            with st.chat_message("user", avatar="👤"):
+                st.markdown(content)
+
+
 # ── AI Portfolio Analýza + Chat ───────────────────────────────────────────────
 st.subheader("🤖 AI Portfóliový Agent")
 st.caption(
@@ -676,19 +752,17 @@ st.caption(
 
 # Inicializuj históriu chatu – načítaj z DB ak session_state je prázdny
 if "portfolio_chat" not in st.session_state:
-    import json as _json
     try:
         _raw_chat = db.get_setting("portfolio_chat")
-        st.session_state["portfolio_chat"] = _json.loads(_raw_chat) if _raw_chat else []
+        st.session_state["portfolio_chat"] = json.loads(_raw_chat) if _raw_chat else []
     except Exception:
         st.session_state["portfolio_chat"] = []
 
 
 def _save_chat(history: list) -> None:
     """Uloží chat históriu do DB."""
-    import json as _json
     try:
-        db.set_setting("portfolio_chat", _json.dumps(history))
+        db.set_setting("portfolio_chat", json.dumps(history))
     except Exception:
         pass
 
@@ -746,6 +820,8 @@ if _do_analyze:
                     question=q_portfolio,
                     model=st.session_state.get("selected_claude_model"),
                 )
+                # Pred resetom ulož predchádzajúcu session do archívu (max. ~90 dní)
+                _agent_archive_current_session(q_portfolio)
                 # Nová analýza = nový chat (resetuj históriu)
                 _new_hist = [{"role": "assistant", "content": result}]
                 st.session_state["portfolio_chat"] = _new_hist
@@ -756,18 +832,16 @@ if _do_analyze:
             except Exception as e:
                 st.error(f"Chyba AI agenta: {e}")
 
-# ── Zobraz históriu chatu ─────────────────────────────────────────────────────
+# ── Zobraz históriu chatu + archív vyhodnotení ────────────────────────────────
 chat_history = st.session_state.get("portfolio_chat", [])
+
+_arch_raw = _agent_prune_eval_archive(_agent_load_eval_archive())
+_arch_sorted = list(reversed(_arch_raw))
 
 if chat_history:
     st.markdown("---")
-    for msg in chat_history:
-        if msg["role"] == "assistant":
-            with st.chat_message("assistant", avatar="🤖"):
-                st.markdown(msg["content"])
-        else:
-            with st.chat_message("user", avatar="👤"):
-                st.markdown(msg["content"])
+    with st.expander("📋 Aktuálne vyhodnotenie a chat — rozbaľ / zbaľ", expanded=True):
+        _agent_render_chat_messages(chat_history)
 
     # ── Vstup pre follow-up otázky ────────────────────────────────────────────
     st.markdown("**💬 Pokračuj v diskusii:**")
@@ -789,6 +863,21 @@ if chat_history:
             except Exception as e:
                 st.error(f"Chyba: {e}")
         st.rerun()
+
+if _arch_sorted:
+    st.markdown("---")
+    st.subheader(f"📚 Archív vyhodnotení (posledných {_AGENT_ARCHIVE_DAYS} dní)")
+    st.caption(
+        "Pri **Spustiť novú analýzu** sa predchádzajúca diskusia uloží sem. Najnovšie sú hore; záznamy staršie ako tri mesiace sa odstránia."
+    )
+    for sess in _arch_sorted:
+        _at = sess.get("at") or ""
+        _at_disp = _at[:19].replace("T", " ") if len(_at) >= 19 else (_at or "—")
+        _q = (sess.get("question") or "").strip() or "bez úvodnej otázky"
+        _prev = _q[:72] + ("…" if len(_q) > 72 else "")
+        with st.expander(f"**{_at_disp}** · {_prev}", expanded=False):
+            st.caption(_q)
+            _agent_render_chat_messages(sess.get("messages") or [])
 
 st.divider()
 
