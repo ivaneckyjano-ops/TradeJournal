@@ -7,7 +7,7 @@ import json
 import math
 import time
 from collections import defaultdict
-from datetime import date
+from datetime import date, datetime
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -57,10 +57,6 @@ st.caption(
 )
 
 gids = sorted(db.list_steady_yield_group_ids_from_trades())
-
-tab_sy_monitor, tab_yield, tab_mon, tab_scan = st.tabs(
-    ["Monitor", "Yield a APR", "Monitoring a roll", "Skener"]
-)
 
 
 def _pick_rich_chain(chains: list[dict]) -> dict | None:
@@ -618,6 +614,152 @@ def _sy_match_live_position(trade: dict, live_positions: list[dict]) -> dict | N
     return None
 
 
+def _sy_exp_yyyymmdd(exp: str) -> str:
+    return normalize_expiry(str(exp or "")).replace("-", "")
+
+
+# Cache v session_state (nie st.cache_data): úspešná delta ~90 s; neúspech kratšie, potom nový pokus.
+_SY_IB_METRIC_TTL_OK_S = 90.0
+_SY_IB_METRIC_TTL_FAIL_S = 22.0
+_SY_IB_METRICS_SESSION_KEY = "sy_monitor_ib_metrics_v2"
+
+
+def _sy_clear_monitor_ib_metrics_cache() -> None:
+    st.session_state.pop(_SY_IB_METRICS_SESSION_KEY, None)
+
+
+def _sy_fetch_ib_option_metrics_live(sym: str, exp_yyyymmdd: str, strike: float, right: str) -> dict:
+    """2 pokusy, dlhší timeout — IB občas vráti ticky až pri druhom volaní."""
+    last: dict = {}
+    for attempt in range(2):
+        last = _sy_compact_option_metrics(
+            ibkr.fetch_option_scan_metrics(
+                sym, exp_yyyymmdd, float(strike), right, timeout=20.0
+            )
+        )
+        if last.get("delta") is not None:
+            return last
+        if attempt == 0:
+            time.sleep(0.35)
+    return last
+
+
+def _sy_cached_ib_option_metrics(sym: str, exp_yyyymmdd: str, strike: float, right: str) -> dict:
+    """
+    Aktuálna delta/Greeks z IBKR (modelGreeks) pre jeden kontrakt.
+    Úspech cachuje ~90 s; odpoveď bez delty len ~22 s, aby sa Streamlit pri ďalšom rerune znova opýtal IB.
+    """
+    if not ibkr.is_connected():
+        return {}
+    try:
+        sk = round(float(strike), 4)
+    except (TypeError, ValueError):
+        return {}
+    key = (sym, str(exp_yyyymmdd), sk, str(right).upper()[:1])
+    now = time.time()
+    raw_cache = st.session_state.get(_SY_IB_METRICS_SESSION_KEY)
+    if not isinstance(raw_cache, dict):
+        raw_cache = {}
+        st.session_state[_SY_IB_METRICS_SESSION_KEY] = raw_cache
+    cache = raw_cache
+    hit = cache.get(key)
+    if hit is not None and isinstance(hit, tuple) and len(hit) == 2:
+        ts, data = hit
+        if isinstance(ts, (int, float)):
+            age = now - float(ts)
+            ttl = (
+                _SY_IB_METRIC_TTL_OK_S
+                if (isinstance(data, dict) and data.get("delta") is not None)
+                else _SY_IB_METRIC_TTL_FAIL_S
+            )
+            if age < ttl and isinstance(data, dict):
+                return data
+    try:
+        res = _sy_fetch_ib_option_metrics_live(sym, exp_yyyymmdd, strike, right)
+    except Exception:
+        return {}
+    if not isinstance(res, dict):
+        res = {}
+    cache[key] = (now, res)
+    return res
+
+
+def _sy_spot_for_underlying(ticker: str, live_positions: list[dict]) -> float | None:
+    u = (ticker or "").strip().upper()
+    for p in live_positions or []:
+        if str(p.get("sec_type") or "") != "STK":
+            continue
+        if str(p.get("ticker") or "").strip().upper() != u:
+            continue
+        mp = p.get("market_price")
+        try:
+            if mp is not None and float(mp) > 0:
+                return float(mp)
+        except (TypeError, ValueError):
+            pass
+    if ibkr.is_connected():
+        r = ibkr.fetch_underlying_previous_close(u, timeout=8.0)
+        px = r.get("price")
+        try:
+            if px is not None and float(px) > 0:
+                return float(px)
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _sy_dte_as_of_expiry(expiry_str: str, as_of: date) -> int | None:
+    try:
+        s = normalize_expiry(str(expiry_str or ""))
+        exp_d = datetime.strptime(s, "%Y-%m-%d").date()
+        return (exp_d - as_of).days
+    except ValueError:
+        return None
+
+
+def _sy_entry_abs_delta(trade: dict, live_positions: list[dict]) -> float | None:
+    """|Δ| pri vstupe: BS z iv_at_entry, DTE k expirácii k dňu entry_date, spot z IB (STK v portfóliu alebo posl. close)."""
+    iv = trade.get("iv_at_entry")
+    try:
+        ivf = float(iv) if iv is not None else 0.0
+    except (TypeError, ValueError):
+        ivf = 0.0
+    if ivf <= 0:
+        return None
+    ed_raw = trade.get("entry_date")
+    if not ed_raw:
+        return None
+    try:
+        as_of = datetime.strptime(str(ed_raw).strip()[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    dte = _sy_dte_as_of_expiry(str(trade.get("expiry") or ""), as_of)
+    if dte is None or dte < 1:
+        return None
+    try:
+        strike = float(trade.get("strike") or 0)
+    except (TypeError, ValueError):
+        return None
+    if strike <= 0:
+        return None
+    spot = _sy_spot_for_underlying(str(trade.get("ticker") or ""), live_positions)
+    if spot is None or spot <= 0:
+        return None
+    try:
+        from core.probability import calc_greeks
+
+        rr = _sy_trade_option_right(trade)
+        g = calc_greeks(float(spot), strike, int(dte), ivf, rr)
+        if not g:
+            return None
+        dlt = g.get("delta")
+        if dlt is None:
+            return None
+        return abs(float(dlt))
+    except Exception:
+        return None
+
+
 def _sy_leg_mark_usd_from_position(trade: dict, pos: dict) -> float | None:
     """Trhová hodnota jednej nohy z IB pozície (+ Long, − Short pri fallback z mid)."""
     mv = pos.get("market_value")
@@ -746,13 +888,19 @@ def _sy_style_monitor_df(df: pd.DataFrame):
     return df.style.apply(_row_style, axis=1)
 
 
+# Záložky musia byť hneď pred ``with tab_*`` — veľký blok ``def`` medzi ``st.tabs()`` a obsahom vie v Streamlite rozbiť prepínanie záložiek.
+tab_sy_monitor, tab_yield, tab_mon, tab_scan = st.tabs(
+    ["Monitor", "Yield a APR", "Monitoring a roll", "Skener"]
+)
+
 # ─── Tab: Monitor (prehľad SY podľa skupín) ───────────────────────────────────
 with tab_sy_monitor:
     st.subheader("Monitor otvorených pozícií")
     st.caption(
-        "Otvorené nohy z **Trade Logu** zoskupené podľa **Group ID** — otvorené opcie sa ťahajú **priamo z IBKR** "
-        "(bid/ask, IV, Δ, Θ). Keď IB nedá odpoveď, použije sa BS fallback z ceny v portfóliu. "
-        "Pravidlá semafora sú v záložke **Monitoring a roll**."
+        "Otvorené nohy z **Trade Logu** podľa **Group ID**. **|Δ| teraz** = IBKR modelGreeks (obnovuje sa ~každých 90 s); "
+        "ak API nedá delta, použije sa cache z tlačidla nižšie alebo BS z ceny v portfóliu. **|Δ| vstup** = Black‑Scholes z "
+        "**IV pri vstupe** v denníku, DTE k expirácii k **dátumu vstupu** a spotom z **STK v účte** alebo posledným close — "
+        "doplň **IV pri vstupe** pri zadávaní obchodu. Semafor: záložka **Monitoring a roll**."
     )
 
     if not ibkr.is_connected():
@@ -788,11 +936,12 @@ with tab_sy_monitor:
             else:
                 st.session_state["live_positions"] = _rmon.get("positions") or []
                 st.session_state["sy_direct_option_quotes"] = _direct_quotes
+                _sy_clear_monitor_ib_metrics_cache()
                 st.success("Pozície v cache.")
                 st.rerun()
     with m2:
         st.caption(
-            "Direct IB data idú na otvorené opcie. BS fallback potrebuje v účte aj podkladovú **akciu (STK)**."
+            "Tlačidlo nižšie doplní **live_positions** a dávkovú cache kontraktov; aktuálna delta sa pri pripojení IB načítava aj **automaticky** (cache)."
         )
 
     if "sy_th_dg" not in st.session_state:
@@ -857,28 +1006,69 @@ with tab_sy_monitor:
                         for k in ("bid", "ask", "last", "mid", "iv", "delta", "theta")
                     )
 
+                    try:
+                        strike_f = float(strike or 0)
+                    except (TypeError, ValueError):
+                        strike_f = 0.0
+
+                    api_m: dict = {}
+                    if ibkr.is_connected() and tk and strike_f > 0 and t.get("expiry"):
+                        try:
+                            api_m = _sy_cached_ib_option_metrics(
+                                tk,
+                                _sy_exp_yyyymmdd(str(t.get("expiry") or "")),
+                                strike_f,
+                                _sy_trade_option_right(t),
+                            )
+                        except Exception:
+                            api_m = {}
+
                     ad = None
-                    th_ib = None
                     ivp_v = None
                     mark_px = None
                     data_src = "—"
-                    if has_direct:
+                    if api_m.get("delta") is not None:
+                        ad = abs(float(api_m["delta"]))
+                        data_src = "IB direct"
+                        ivp_v = _iv_to_display_pct(api_m.get("iv"))
+                        mark_px = (
+                            api_m.get("mid")
+                            or api_m.get("last")
+                            or api_m.get("ask")
+                            or api_m.get("bid")
+                        )
+                    elif has_direct:
                         data_src = "IB direct"
                         if quote.get("delta") is not None:
                             ad = abs(float(quote["delta"]))
-                        if quote.get("theta") is not None:
-                            th_ib = float(quote["theta"])
                         ivp_v = _iv_to_display_pct(quote.get("iv"))
-                        mark_px = quote.get("mid") or quote.get("last") or quote.get("ask") or quote.get("bid")
+                        mark_px = (
+                            quote.get("mid")
+                            or quote.get("last")
+                            or quote.get("ask")
+                            or quote.get("bid")
+                        )
                     elif live_p:
                         data_src = "BS fallback"
                         if live_p.get("delta") is not None:
                             ad = abs(float(live_p["delta"]))
-                        if live_p.get("theta") is not None:
-                            th_ib = float(live_p["theta"])
                         if live_p.get("iv") is not None:
                             ivp_v = _iv_to_display_pct(live_p["iv"])
                         mark_px = live_p.get("market_price")
+
+                    bid_v = (quote.get("bid") if has_direct else None) or api_m.get("bid")
+                    ask_v = (quote.get("ask") if has_direct else None) or api_m.get("ask")
+                    if ivp_v is None and api_m.get("iv") is not None:
+                        ivp_v = _iv_to_display_pct(api_m.get("iv"))
+                    if mark_px is None:
+                        mark_px = (
+                            api_m.get("mid")
+                            or api_m.get("last")
+                            or api_m.get("ask")
+                            or api_m.get("bid")
+                        )
+
+                    ad_entry = _sy_entry_abs_delta(t, live_mon)
 
                     tl_lv = ""
                     tl_em = "—"
@@ -922,34 +1112,63 @@ with tab_sy_monitor:
                             "Exp": exp or "—",
                             "DTE": dte if dte is not None else "—",
                             "Ks": kc,
-                            "Bid": quote.get("bid") if has_direct else None,
-                            "Ask": quote.get("ask") if has_direct else None,
+                            "Bid": bid_v,
+                            "Ask": ask_v,
                             "IV %": ivp_v,
-                            "|Δ|": round(ad, 3) if ad is not None else "—",
-                            "Θ": round(th_ib, 4) if th_ib is not None else "—",
+                            "|Δ| vstup": round(ad_entry, 3) if ad_entry is not None else "—",
+                            "|Δ| teraz": round(ad, 3) if ad is not None else "—",
                             "Zdroj": data_src,
-                            "Semafor": f"{tl_em} {tl_lv}".strip() if tl_lv else "—",
-                            "SY (semafor)": (sy_txt[:100] + "…") if len(sy_txt) > 100 else sy_txt or "—",
+                            "Semafor": tl_em if tl_lv else "—",
                             "Prémia %": prem_txt,
+                            "_sy_detail": (
+                                f"**{tk}** {strike} {opt}: {sy_txt}"
+                                if lt == "Short" and sy_txt.strip()
+                                else ""
+                            ),
                         }
                     )
 
-                _df_m = pd.DataFrame(_rows_m)
-                st.dataframe(
-                    _sy_style_monitor_df(_df_m),
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "Bid": st.column_config.NumberColumn(format="$%.2f"),
-                        "Ask": st.column_config.NumberColumn(format="$%.2f"),
-                        "IV %": st.column_config.NumberColumn(format="%.1f %%"),
-                        "|Δ|": st.column_config.NumberColumn(format="%.3f"),
-                        "Θ": st.column_config.NumberColumn(format="%.4f"),
-                        "Zdroj": st.column_config.TextColumn(
-                            help="IB direct = priame IBKR market data; BS fallback = dopočítané z ceny/opcie."
-                        ),
-                    },
-                )
+                _df_show = pd.DataFrame(_rows_m).drop(columns=["_sy_detail"], errors="ignore")
+                _col_cfg = {
+                    "Bid": st.column_config.NumberColumn(format="$%.2f"),
+                    "Ask": st.column_config.NumberColumn(format="$%.2f"),
+                    "IV %": st.column_config.NumberColumn(format="%.1f %%"),
+                    "|Δ| vstup": st.column_config.NumberColumn(
+                        format="%.3f",
+                        help="BS z IV pri vstupe, DTE k expirácii k entry_date, spot z STK / posl. close.",
+                    ),
+                    "|Δ| teraz": st.column_config.NumberColumn(
+                        format="%.3f",
+                        help="Primárne IBKR modelGreeks (API), inak cache z tlačidla alebo BS z portfólia.",
+                    ),
+                    "Zdroj": st.column_config.TextColumn(
+                        help="IB direct = IBKR API/modelGreeks alebo dávková cache; BS fallback = z ceny v portfóliu."
+                    ),
+                    "Semafor": st.column_config.TextColumn(
+                        help="🟢/🟠/🔴 len pre short nohy. Text dôvodov je pod tabuľkou."
+                    ),
+                }
+                try:
+                    st.dataframe(
+                        _sy_style_monitor_df(_df_show),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config=_col_cfg,
+                    )
+                except Exception:
+                    st.dataframe(
+                        _df_show,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config=_col_cfg,
+                    )
+                _details = [r.get("_sy_detail") for r in _rows_m if r.get("_sy_detail")]
+                if _details:
+                    st.markdown("**Semafor — detail (short)**")
+                    st.markdown("\n".join(f"- {_d}" for _d in _details))
+                if _prof and str(_prof.get("notes") or "").strip():
+                    st.markdown("**Poznámka ku skupine**")
+                    st.markdown(str(_prof.get("notes")).strip())
                 if _prof:
                     st.caption(
                         f"Profil skupiny: očak. APR {_prof.get('expected_apr_pct', '—')} % · "

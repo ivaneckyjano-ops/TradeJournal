@@ -1,3 +1,5 @@
+from typing import Optional
+
 import streamlit as st
 import pandas as pd
 from datetime import date, datetime
@@ -68,6 +70,30 @@ STRATEGIES = [
     "Iné",
 ]
 
+# Rovnaká hodnota ako pri „Pridať obchod“ — zoznam skupín je v záložke Skupiny
+GROUP_NONE_LABEL = "— (bez skupiny) —"
+
+
+def _group_select_options(trades_for_orphans: list[dict]) -> list[str]:
+    """Skupiny z tabuľky Skupiny + prípadné group_id z obchodov, ktoré v Skupinách ešte nie sú."""
+    registered = db.get_group_names()
+    reg_set = set(registered)
+    extra = sorted(
+        {
+            (t.get("group_id") or "").strip()
+            for t in trades_for_orphans
+            if (t.get("group_id") or "").strip() and (t.get("group_id") or "").strip() not in reg_set
+        }
+    )
+    return [GROUP_NONE_LABEL] + registered + extra
+
+
+def _group_id_from_select(cell_value: str) -> Optional[str]:
+    s = (cell_value or "").strip()
+    if not s or s == GROUP_NONE_LABEL:
+        return None
+    return s
+
 st.title("Trade Log")
 
 tab_add, tab_open, tab_edit, tab_closed = st.tabs([
@@ -95,10 +121,10 @@ with tab_add:
         with c2:
             strategy = st.selectbox("Stratégia *", STRATEGIES)
         with c3:
-            group_names = ["— (bez skupiny) —"] + db.get_group_names()
+            group_names = [GROUP_NONE_LABEL] + db.get_group_names()
             group_sel = st.selectbox("Skupina (Group ID)", group_names,
                                      help="Skupiny spravuješ v záložke Skupiny")
-            group_id = group_sel if group_sel != "— (bez skupiny) —" else ""
+            group_id = group_sel if group_sel != GROUP_NONE_LABEL else ""
 
         st.markdown("**Noha (Leg)**")
         c4, c5, c6, c7 = st.columns(4)
@@ -300,10 +326,15 @@ with tab_edit:
         else:
             edit_trades_filtered = all_edit_trades
 
+        group_opts_editor = _group_select_options(edit_trades_filtered)
+        group_opts_all = _group_select_options(all_edit_trades)
+
         st.caption(f"{len(edit_trades_filtered)} záznam(ov) · Uprav priamo v tabuľke, potom klikni **Uložiť zmeny**.")
 
         edit_rows = []
         for t in edit_trades_filtered:
+            raw_gid = (t.get("group_id") or "").strip()
+            gid_cell = raw_gid if raw_gid in group_opts_editor else GROUP_NONE_LABEL
             edit_rows.append({
                 "ID": t["id"],
                 "Ticker": t["ticker"],
@@ -317,7 +348,7 @@ with tab_edit:
                 "Exit $": float(t.get("exit_price", 0.0)) if t.get("exit_price") else 0.0,
                 "Komisia $": float(t.get("commission") or 0.0),
                 "Exit Date": t.get("exit_date", ""),
-                "Group ID": t.get("group_id") or "",
+                "Skupina": gid_cell,
                 "Stratégia": t.get("strategy") or "",
             })
 
@@ -338,6 +369,11 @@ with tab_edit:
                                                             help="Celková komisia brokera (entry + exit)"),
                 "Expiry": st.column_config.TextColumn("Expiry", help="Formát: YYYYMMDD"),
                 "Exit Date": st.column_config.TextColumn("Exit Date", help="Formát: YYYY-MM-DD"),
+                "Skupina": st.column_config.SelectboxColumn(
+                    "Skupina",
+                    options=group_opts_editor,
+                    help="Zoznam zo záložky Skupiny",
+                ),
             },
             key="edit_table_v2",
         )
@@ -368,7 +404,7 @@ with tab_edit:
                 new_exit_d = (row["Exit Date"] or "").strip() or None
                 if new_exit_d != orig.get("exit_date"): updates["exit_date"] = new_exit_d
                 
-                new_group = (row["Group ID"] or "").strip() or None
+                new_group = _group_id_from_select(row["Skupina"])
                 if new_group != (orig.get("group_id") or None): updates["group_id"] = new_group
                 
                 if row["Stratégia"] != orig.get("strategy"): updates["strategy"] = row["Stratégia"]
@@ -407,17 +443,18 @@ with tab_edit:
             split_trade_obj = next((t for t in multi_trades if t["id"] == split_id), None)
             n_contracts = int(split_trade_obj.get("contracts", 2)) if split_trade_obj else 2
 
-            st.markdown(f"Rozdelí sa na **{n_contracts}** nôh po 1 kontrakte. Zadaj Group ID pre každú:")
+            st.markdown(f"Rozdelí sa na **{n_contracts}** nôh po 1 kontrakte. Vyber skupinu pre každú nohu:")
             split_group_inputs = []
             for i in range(n_contracts):
-                default_gid = split_trade_obj.get("group_id") or ""
-                g = st.text_input(
-                    f"Group ID pre nohu {i+1}",
-                    value=default_gid,
+                raw = (split_trade_obj.get("group_id") or "").strip()
+                split_default = raw if raw in group_opts_all else GROUP_NONE_LABEL
+                gsel = st.selectbox(
+                    f"Skupina — noha {i + 1}",
+                    group_opts_all,
+                    index=group_opts_all.index(split_default) if split_default in group_opts_all else 0,
                     key=f"split_gid_{i}",
-                    placeholder=f"napr. AMZN_DIA_{i+1}",
                 )
-                split_group_inputs.append(g)
+                split_group_inputs.append("" if gsel == GROUP_NONE_LABEL else gsel)
 
             if st.button("Rozdeliť pozíciu", type="primary", key="split_btn"):
                 new_ids = db.split_trade(split_id, split_group_inputs)
@@ -427,14 +464,14 @@ with tab_edit:
         st.divider()
 
         # ── 2. Rýchle hromadné Group ID ────────────────────────────────────
-        st.subheader("Rýchle hromadné priradenie Group ID")
-        st.caption("Zadaj ID nôh oddelené čiarkou a Group ID → uloží naraz.")
+        st.subheader("Rýchle hromadné priradenie skupiny")
+        st.caption("Zadaj ID nôh oddelené čiarkou a vyber skupinu zo zoznamu (záložka Skupiny).")
 
         rc1, rc2 = st.columns([2, 3])
         with rc1:
-            bulk_ids_input = st.text_input("ID nôh (napr. 1,2,3)", placeholder="1,2,3")
+            bulk_ids_input = st.text_input("ID nôh (napr. 1,2,3)", placeholder="1,2,3", key="bulk_ids_v1")
         with rc2:
-            bulk_group_input = st.text_input("Group ID", placeholder="napr. AMZN_DIA_MAR26")
+            bulk_group_input = st.selectbox("Skupina", group_opts_all, key="bulk_grp_v1")
 
         if st.button("Priradiť", type="primary", key="quick_group_btn"):
             try:
@@ -442,8 +479,10 @@ with tab_edit:
                 if not ids_list:
                     st.warning("Zadaj aspoň jedno ID.")
                 else:
-                    db.bulk_set_group_id(ids_list, bulk_group_input.strip())
-                    st.success(f"Group ID **{bulk_group_input}** priradené nohám: {ids_list}")
+                    gid_apply = "" if bulk_group_input == GROUP_NONE_LABEL else bulk_group_input.strip()
+                    db.bulk_set_group_id(ids_list, gid_apply)
+                    lbl = gid_apply or GROUP_NONE_LABEL
+                    st.success(f"Skupina **{lbl}** priradená nohám: {ids_list}")
                     st.rerun()
             except ValueError:
                 st.error("Neplatné ID — zadaj čísla oddelené čiarkou.")
@@ -451,22 +490,23 @@ with tab_edit:
         st.divider()
 
         # ── 3. Rýchla zmena Group ID ────────────────────────────────────────
-        st.subheader("Rýchle priradenie skupiny")
-        existing_groups = [""] + db.get_group_names()
+        st.subheader("Rýchle priradenie skupiny (kompaktný formulár)")
         rc1, rc2, rc3 = st.columns([2, 3, 1])
         with rc1:
-            bulk_ids_input = st.text_input("ID nôh (napr. 11,12)", placeholder="11,12,14", key="bulk_ids_v2")
+            bulk_ids_input2 = st.text_input("ID nôh (napr. 11,12)", placeholder="11,12,14", key="bulk_ids_v2")
         with rc2:
-            bulk_group_input = st.selectbox("Skupina", existing_groups, key="bulk_grp_v2")
+            bulk_group_input2 = st.selectbox("Skupina", group_opts_all, key="bulk_grp_v2")
         with rc3:
             st.write("")
             st.write("")
             if st.button("Priradiť", type="primary", key="quick_group_btn_v2", use_container_width=True):
                 try:
-                    ids_list = [int(x.strip()) for x in bulk_ids_input.split(",") if x.strip()]
-                    if ids_list and bulk_group_input:
-                        db.bulk_set_group_id(ids_list, bulk_group_input.strip())
-                        st.success(f"Skupina **{bulk_group_input}** priradená nohám: {ids_list}")
+                    ids_list = [int(x.strip()) for x in bulk_ids_input2.split(",") if x.strip()]
+                    if ids_list:
+                        gid_apply = "" if bulk_group_input2 == GROUP_NONE_LABEL else bulk_group_input2.strip()
+                        db.bulk_set_group_id(ids_list, gid_apply)
+                        lbl = gid_apply or GROUP_NONE_LABEL
+                        st.success(f"Skupina **{lbl}** priradená nohám: {ids_list}")
                         st.rerun()
                 except ValueError:
                     st.error("Neplatné ID.")
