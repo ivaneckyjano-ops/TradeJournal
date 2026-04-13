@@ -135,6 +135,8 @@ def _migrate_trades(conn: sqlite3.Connection) -> None:
     existing = {row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
     migrations = {
         "commission": "ALTER TABLE trades ADD COLUMN commission REAL DEFAULT 0.0",
+        "delta_at_entry": "ALTER TABLE trades ADD COLUMN delta_at_entry REAL",
+        "theta_at_entry": "ALTER TABLE trades ADD COLUMN theta_at_entry REAL",
     }
     for col, sql in migrations.items():
         if col not in existing:
@@ -292,8 +294,8 @@ def add_symbol(ticker: str, company_name: str = "", sector: str = "",
         )
         if cur.lastrowid:
             return cur.lastrowid
-        row = conn.execute("SELECT id FROM symbols WHERE ticker=?", (ticker,)).fetchone()
-        return row["id"] if row else -1
+        # INSERT OR IGNORE — duplicitný ticker; nevrátiť existujúce id (volajúci by mylne považoval za nový riadok)
+        return 0
 
 
 def get_symbols() -> list[dict]:
@@ -457,17 +459,19 @@ def add_trade(
     iv_at_entry: Optional[float] = None,
     pop_at_entry: Optional[float] = None,
     commission: Optional[float] = None,
+    delta_at_entry: Optional[float] = None,
+    theta_at_entry: Optional[float] = None,
 ) -> int:
     with get_connection() as conn:
         cur = conn.execute(
             """INSERT INTO trades
                (ticker, strategy, leg_type, option_type, strike, expiry,
                 contracts, entry_price, entry_date, group_id, iv_at_entry, pop_at_entry,
-                commission)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                commission, delta_at_entry, theta_at_entry)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (ticker, strategy, leg_type, option_type, strike, expiry,
              contracts, entry_price, entry_date, group_id, iv_at_entry, pop_at_entry,
-             commission or 0.0),
+             commission or 0.0, delta_at_entry, theta_at_entry),
         )
         return cur.lastrowid
 
@@ -519,6 +523,10 @@ def update_trade(
     status: Optional[str] = None,
     group_id: Optional[str] = None,
     commission: Optional[float] = None,
+    iv_at_entry: Optional[float] = None,
+    pop_at_entry: Optional[float] = None,
+    delta_at_entry: Optional[float] = None,
+    theta_at_entry: Optional[float] = None,
 ) -> None:
     """Aktualizuje akékoľvek pole obchodu."""
     with get_connection() as conn:
@@ -538,6 +546,10 @@ def update_trade(
             "status": status,
             "group_id": group_id,
             "commission": commission,
+            "iv_at_entry": iv_at_entry,
+            "pop_at_entry": pop_at_entry,
+            "delta_at_entry": delta_at_entry,
+            "theta_at_entry": theta_at_entry,
         }
         for k, v in mapping.items():
             if v is not None:
@@ -552,6 +564,20 @@ def update_trade(
             return
         values.append(trade_id)
         conn.execute(f"UPDATE trades SET {', '.join(fields)} WHERE id=?", values)
+
+
+def set_trade_entry_iv_delta_theta(
+    trade_id: int,
+    iv_at_entry: Optional[float],
+    delta_at_entry: Optional[float],
+    theta_at_entry: Optional[float],
+) -> None:
+    """Nastaví IV, Δ a Θ pri vstupe naraz (None = NULL v DB)."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE trades SET iv_at_entry=?, delta_at_entry=?, theta_at_entry=? WHERE id=?",
+            (iv_at_entry, delta_at_entry, theta_at_entry, trade_id),
+        )
 
 
 def bulk_set_group_id(trade_ids: list[int], group_id: str) -> None:
@@ -582,12 +608,14 @@ def split_trade(trade_id: int, group_ids: list[str]) -> list[int]:
                 """INSERT INTO trades
                    (ticker, strategy, leg_type, option_type, strike, expiry,
                     contracts, entry_price, entry_date, group_id, iv_at_entry,
-                    pop_at_entry, exit_price, exit_date, status)
-                   VALUES (?,?,?,?,?,?,1,?,?,?,?,?,?,?,?)""",
+                    pop_at_entry, commission, delta_at_entry, theta_at_entry,
+                    exit_price, exit_date, status)
+                   VALUES (?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?)""",
                 (
                     t["ticker"], t["strategy"], t["leg_type"], t["option_type"],
                     t["strike"], t["expiry"], t["entry_price"], t["entry_date"],
                     gid if gid else None, t["iv_at_entry"], t["pop_at_entry"],
+                    t.get("commission") or 0.0, t.get("delta_at_entry"), t.get("theta_at_entry"),
                     t["exit_price"], t["exit_date"], t["status"],
                 ),
             )
@@ -804,6 +832,7 @@ GROUP_MAINT_MARGIN_KEY = "group_maintenance_margin"
 AGENT_IBKR_MARKET_DATA_KEY = "agent_ibkr_market_data"
 # Archív hotových sedení portfóliového agenta (JSON pole; v UI posledných ~90 dní)
 PORTFOLIO_AGENT_EVAL_ARCHIVE_KEY = "portfolio_agent_eval_archive"
+SPREAD_BUILDER_AGENT_CHAT_KEY = "spread_builder_agent_chat"
 
 
 def get_group_maint_margins() -> dict[str, float]:

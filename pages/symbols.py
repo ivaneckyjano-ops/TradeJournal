@@ -114,6 +114,11 @@ with tab_add:
     if submitted:
         if not s_ticker:
             st.error("Ticker je povinný.")
+        elif db.get_symbol(s_ticker):
+            st.warning(
+                f"Symbol **{s_ticker}** už je v zozname — ten istý ticker nemôže byť dvakrát. "
+                "Uprav ho v záložke **Prehľad a úprava**."
+            )
         else:
             earn_dates = [_date_or_none(d) for d in earn_inputs]
             sid = db.add_symbol(
@@ -148,8 +153,8 @@ with tab_add:
                 st.rerun()
             else:
                 st.warning(
-                    f"Symbol **{s_ticker}** už existuje. "
-                    "Uprav ho v záložke **Prehľad a úprava**."
+                    f"Symbol **{s_ticker}** sa nepodarilo pridať (pravdepodobne už existuje). "
+                    "Skús znova alebo uprav záznam v **Prehľad a úprava**."
                 )
 
     # Rýchly prehľad existujúcich symbolov
@@ -509,36 +514,50 @@ with tab_manage:
                             "Zmazať symbol", type="secondary", use_container_width=True
                         )
 
-                if save_btn:
-                    new_earn = [_date_or_none(d) for d in e_earn_dates]
-                    db.update_symbol(
-                        symbol_id=sym["id"],
-                        ticker=e_ticker,
-                        company_name=e_company,
-                        sector=e_sector if e_sector != "—" else "",
-                        asset_type=e_type,
-                        description=e_desc,
-                        earnings_date=new_earn[0],
-                        earnings_date_2=new_earn[1],
-                        earnings_date_3=new_earn[2],
-                        earnings_date_4=new_earn[3],
-                        ir_url=e_ir.strip() or None,
-                        iv_rank=e_iv if e_iv > 0 else None,
-                        spot=sym.get("spot"),
-                        iv_pct=sym.get("iv_pct"),
-                        iv_rank_13w=e_iv13 if e_iv13 > 0 else None,
-                        iv_rank_52w=e_iv52 if e_iv52 > 0 else None,
-                    )
-                    st.success(f"Symbol **{e_ticker}** aktualizovaný.")
-                    st.rerun()
+                    # Submit logika musí byť vnútri `st.form` (inak pri viacerých formoch v slučke zlyhá).
+                    if del_btn:
+                        db.delete_symbol(sym["id"])
+                        st.warning(
+                            f"Symbol **{sym['ticker']}** zmazaný. "
+                            "Existujúce obchody s týmto tickerom ostávajú nezmenené."
+                        )
+                        st.rerun()
 
-                if del_btn:
-                    db.delete_symbol(sym["id"])
-                    st.warning(
-                        f"Symbol **{sym['ticker']}** zmazaný. "
-                        "Existujúce obchody s týmto tickerom ostávajú nezmenené."
-                    )
-                    st.rerun()
+                    if save_btn:
+                        new_earn = [_date_or_none(d) for d in e_earn_dates]
+                        if not e_ticker:
+                            st.error("Ticker je povinný.")
+                        else:
+                            _other = db.get_symbol(e_ticker)
+                            _dup = (
+                                _other is not None
+                                and int(_other["id"]) != int(sym["id"])
+                            )
+                            if _dup:
+                                st.warning(
+                                    f"Ticker **{e_ticker}** už má iný záznam v zozname — jeden symbol nemôže byť dvakrát."
+                                )
+                            else:
+                                db.update_symbol(
+                                    symbol_id=sym["id"],
+                                    ticker=e_ticker,
+                                    company_name=e_company,
+                                    sector=e_sector if e_sector != "—" else "",
+                                    asset_type=e_type,
+                                    description=e_desc,
+                                    earnings_date=new_earn[0],
+                                    earnings_date_2=new_earn[1],
+                                    earnings_date_3=new_earn[2],
+                                    earnings_date_4=new_earn[3],
+                                    ir_url=e_ir.strip() or None,
+                                    iv_rank=e_iv if e_iv > 0 else None,
+                                    spot=sym.get("spot"),
+                                    iv_pct=sym.get("iv_pct"),
+                                    iv_rank_13w=e_iv13 if e_iv13 > 0 else None,
+                                    iv_rank_52w=e_iv52 if e_iv52 > 0 else None,
+                                )
+                                st.success(f"Symbol **{e_ticker}** aktualizovaný.")
+                                st.rerun()
 
                 # Otvorené pozície pre tento symbol
                 open_trades_sym = [t for t in ticker_trades if t.get("status") == "Open"]

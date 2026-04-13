@@ -206,24 +206,43 @@ def enrich_open_orders_legs(orders: list[dict]) -> None:
 
 
 def get_ib():
-    """Vráti IB inštanciu – z module-level cache alebo session_state."""
+    """
+    Vráti IB inštanciu.
+
+    Priorita: ``st.session_state['ib']`` (zdroj pravdy pri Streamlit rerunoch),
+    potom module-level cache. Opačné poradie vedie k tomu, že sidebar v
+    ``streamlit_app.py`` beží pred ``pg.run()`` a mohol čítať zastaralý
+    singleton skôr, než sa obnovil odkaz zo session.
+    """
     global _IB_INSTANCE
+    ss_ib = st.session_state.get("ib")
+    if ss_ib is not None:
+        _IB_INSTANCE = ss_ib
+        return ss_ib
     if _IB_INSTANCE is not None:
+        try:
+            st.session_state["ib"] = _IB_INSTANCE
+        except Exception:
+            pass
         return _IB_INSTANCE
-    ib = st.session_state.get("ib")
-    if ib is not None:
-        _IB_INSTANCE = ib
-    return ib
+    return None
 
 
 def is_connected() -> bool:
     ib = get_ib()
-    if ib is None:
-        return False
+    connected = False
+    if ib is not None:
+        try:
+            connected = bool(ib.isConnected())
+        except Exception:
+            connected = False
+
+    # Udržuj jeden stabilný zdroj pravdy pre UI medzi rerunmi Streamlitu.
     try:
-        return ib.isConnected()
+        st.session_state["ib_connected"] = connected
     except Exception:
-        return False
+        pass
+    return connected
 
 
 # ─── Connect / Disconnect ─────────────────────────────────────────────────────
@@ -288,6 +307,7 @@ def connect(
                 ib._loop = util.getLoop()
             _MAIN_LOOP = ib._loop or asyncio.get_event_loop()
             st.session_state["ib"] = ib
+            st.session_state["ib_connected"] = True
             try:
                 ib.reqAccountUpdates(True)
             except Exception:
@@ -321,6 +341,7 @@ def disconnect() -> None:
     _MAIN_LOOP   = None
     clear_leg_label_cache()
     st.session_state.pop("ib", None)
+    st.session_state["ib_connected"] = False
 
 
 # ─── Market data ──────────────────────────────────────────────────────────────

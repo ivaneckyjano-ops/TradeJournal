@@ -406,7 +406,7 @@ else:
     rows = []
     for t in open_trades:
         dte_val = None
-        pop_val = t.get("pop_at_entry")
+        th_val = t.get("theta_at_entry")
 
         if t.get("expiry"):
             try:
@@ -431,7 +431,7 @@ else:
             "DTE": dte_val,
             "Kontrakty": t.get("contracts", 1),
             "Entry cena": t.get("entry_price"),
-            "PoP (entry)": f"{pop_val*100:.1f}%" if pop_val else "—",
+            "Θ (entry) $/deň": f"${float(th_val):+.3f}" if th_val is not None else "—",
             "Entry dátum": t.get("entry_date", ""),
         })
 

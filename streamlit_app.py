@@ -193,6 +193,7 @@ spread_bld     = st.Page("pages/spread_builder.py",   title="Spread Builder",   
 portfolio_agent= st.Page("pages/portfolio_agent.py",  title="Portfolio Agent",     icon=":material/smart_toy:")
 portfolio_dash = st.Page("pages/portfolio_dashboard.py", title="TWS Dashboard",    icon=":material/monitor_heart:")
 steady_yields  = st.Page("pages/steady_yields.py",     title="Steady Yields",     icon=":material/trending_up:")
+csv_variants   = st.Page("pages/csv_variants.py",      title="CSV Varianty",     icon=":material/table_view:")
 calendar       = st.Page("pages/calendar.py",         title="Kalendár",            icon=":material/calendar_month:")
 help_page      = st.Page("pages/help.py",             title="Pomocník",            icon=":material/help:")
 
@@ -200,7 +201,7 @@ pg = st.navigation(
     {
         "Prehľad":  [dashboard, portfolio, calendar],
         "Obchody":  [trade_log, groups, symbols],
-        "Analýza":  [notes, modeler, spread_bld, steady_yields, portfolio_agent, portfolio_dash],
+        "Analýza":  [notes, modeler, spread_bld, csv_variants, steady_yields, portfolio_agent, portfolio_dash],
         "Info":     [help_page],
     },
     position="sidebar",
@@ -228,11 +229,19 @@ with st.sidebar:
     )
 
     st.divider()
+    # IBKR sem patrí PRED pg.run(): widgety v sidebari volané až po vykonaní stránky
+    # dostanú iný active_script_hash (MPA v2) a frontend ich vie zobraziť zastaralé /
+    # nesúladné s hlavným obsahom (Dashboard ukazoval Pripojený, sidebar Odpojený).
     from core import ibkr
-    if ibkr.is_connected():
-        st.success("IBKR: Pripojený")
-    else:
-        st.warning("IBKR: Odpojený")
+
+    with st.container(key="tj_sidebar_ibkr_status"):
+        ib_connected = st.session_state.get("ib_connected")
+        if ib_connected is None:
+            ib_connected = ibkr.is_connected()
+        if ib_connected:
+            st.success("IBKR: Pripojený")
+        else:
+            st.warning("IBKR: Odpojený")
     st.caption("TradeJournal v1.0")
 
 pg.run()

@@ -7,7 +7,6 @@ from datetime import date, datetime
 from core import database as db
 from core import ibkr
 from core.page_context import set_tradejournal_page
-from core.probability import pop_short_call, pop_short_put, pop_long_call, pop_long_put, pop_diagonal
 
 db.init_db()
 set_tradejournal_page("trade_log")
@@ -18,7 +17,7 @@ def _build_df(trades: list[dict], show_pnl: bool = False) -> pd.DataFrame:
     rows = []
     for t in trades:
         pnl = db.compute_pnl(t) if show_pnl else None
-        pop_v = t.get("pop_at_entry")
+        th_v = t.get("theta_at_entry")
         comm = t.get("commission") or 0.0
         rows.append({
             "ID": t["id"],
@@ -34,7 +33,7 @@ def _build_df(trades: list[dict], show_pnl: bool = False) -> pd.DataFrame:
             "Exit": t.get("exit_price") if show_pnl else None,
             "Komisia": comm if show_pnl else None,
             "P&L čistý ($)": pnl,
-            "PoP (entry)": f"{pop_v*100:.1f}%" if pop_v else "—",
+            "Θ (entry) $/deň": f"${float(th_v):+.3f}" if th_v is not None else "—",
             "Entry dátum": t.get("entry_date", ""),
             "Exit dátum": t.get("exit_date", "") if show_pnl else None,
         })
@@ -42,7 +41,7 @@ def _build_df(trades: list[dict], show_pnl: bool = False) -> pd.DataFrame:
     if show_pnl:
         df = df.sort_values("Entry dátum", na_position="last").reset_index(drop=True)
         df["P&L kumulatív ($)"] = df["P&L čistý ($)"].cumsum()
-        df = df.drop(columns=["PoP (entry)"], errors="ignore")
+        df = df.drop(columns=["Θ (entry) $/deň"], errors="ignore")
     else:
         df = df.drop(columns=["Exit", "Komisia", "P&L čistý ($)", "Exit dátum"], errors="ignore")
     return df
@@ -95,6 +94,10 @@ def _group_id_from_select(cell_value: str) -> Optional[str]:
     return s
 
 st.title("Trade Log")
+st.caption(
+    "**Stratégia** pri novom obchode je v záložke *Pridať obchod* (stĺpec pri Tickeri). "
+    "Typy skupín (Calendar, Diagonal, …) nájdeš aj v **Skupiny**; šablóny spreadov (kalendár, kondor) v **Spread Builder** → expandér *Šablóna stratégie*."
+)
 
 tab_add, tab_open, tab_edit, tab_closed = st.tabs([
     "Pridať obchod", "Otvorené pozície", "Upraviť / Zoskupiť", "Uzavreté pozície"
@@ -150,13 +153,39 @@ with tab_add:
                 help="Celková komisia brokera za otvorenie (napr. 0.65 × počet kontraktov)"
             )
 
-        st.markdown("**Voliteľné — IV a PoP**")
-        c11, c12 = st.columns(2)
-        with c11:
-            iv_input = st.number_input("IV pri vstupe (napr. 0.30)", min_value=0.0, max_value=5.0,
-                                       step=0.01, value=0.0)
-        with c12:
-            spot_input = st.number_input("Spot cena pri vstupe ($)", min_value=0.0, step=0.5, value=0.0)
+        st.markdown("**Voliteľné — IV a Theta**")
+        iv_input = st.number_input(
+            "IV pri vstupe (napr. 0.30)",
+            min_value=0.0,
+            max_value=5.0,
+            step=0.01,
+            value=0.0,
+            help="Uloží sa do denníka ako desatinný zlomok (0,30 = 30 %).",
+        )
+
+        use_theta_entry = st.checkbox("Doplniť Θ pri vstupe (USD/deň za nohu, napr. z TWS)", value=False)
+        theta_entry_input = st.number_input(
+            "Theta pri vstupe ($/deň)",
+            min_value=-9999.0,
+            max_value=9999.0,
+            step=0.001,
+            format="%.3f",
+            value=0.0,
+            disabled=not use_theta_entry,
+            help="Súčet theta pre túto nohu v dolároch za deň (ako v portfóliu TWS).",
+        )
+
+        use_delta_entry = st.checkbox("Doplniť Δ pri vstupe (z TWS / vlastná poznámka)", value=False)
+        delta_entry_input = st.number_input(
+            "Delta pri vstupe (−1 … 1)",
+            min_value=-1.0,
+            max_value=1.0,
+            step=0.01,
+            format="%.4f",
+            value=0.0,
+            disabled=not use_delta_entry,
+            help="Delta kontraktu pri otvorení. Zapni checkbox vyššie, ak chceš hodnotu uložiť.",
+        )
 
         submitted = st.form_submit_button("Uložiť obchod", type="primary", use_container_width=True)
 
@@ -165,18 +194,6 @@ with tab_add:
             st.error("Vyplň: Ticker, Strike a Entry cenu.")
         else:
             expiry_str = expiry_date.strftime("%Y%m%d")
-            dte = (expiry_date - date.today()).days
-
-            pop_val = None
-            if iv_input > 0 and spot_input > 0 and dte > 0:
-                if leg_type == "Short" and option_type == "Call":
-                    pop_val = pop_short_call(spot_input, strike, dte, iv_input)
-                elif leg_type == "Short" and option_type == "Put":
-                    pop_val = pop_short_put(spot_input, strike, dte, iv_input)
-                elif leg_type == "Long" and option_type == "Call":
-                    pop_val = pop_long_call(spot_input, strike, dte, iv_input)
-                else:
-                    pop_val = pop_long_put(spot_input, strike, dte, iv_input)
 
             trade_id = db.add_trade(
                 ticker=ticker,
@@ -190,10 +207,12 @@ with tab_add:
                 entry_date=entry_date.isoformat(),
                 group_id=group_id if group_id else None,
                 iv_at_entry=iv_input if iv_input > 0 else None,
-                pop_at_entry=pop_val,
+                pop_at_entry=None,
                 commission=commission_input if commission_input > 0 else None,
+                delta_at_entry=float(delta_entry_input) if use_delta_entry else None,
+                theta_at_entry=float(theta_entry_input) if use_theta_entry else None,
             )
-            st.success(f"Obchod #{trade_id} uložený! {ticker} {leg_type} {option_type} ${strike:.0f}  |  PoP: {pop_val*100:.1f}%" if pop_val else f"Obchod #{trade_id} uložený!")
+            st.success(f"Obchod #{trade_id} uložený — {ticker} {leg_type} {option_type} ${strike:.0f}.")
             st.rerun()
 
 
@@ -253,6 +272,9 @@ with tab_open:
                             dte_val = (exp_d - datetime.now().date()).days
                         except Exception:
                             pass
+                    _iv_e = t.get("iv_at_entry")
+                    _d_e = t.get("delta_at_entry")
+                    _th_e = t.get("theta_at_entry")
                     leg_rows.append({
                         "ID": t["id"],
                         "Noha": t.get("leg_type",""),
@@ -262,8 +284,9 @@ with tab_open:
                         "DTE": dte_val,
                         "Kontr.": t.get("contracts",1),
                         "Entry $": t.get("entry_price"),
-                        "IV entry": t.get("iv_at_entry"),
-                        "PoP entry": f"{t['pop_at_entry']*100:.0f}%" if t.get("pop_at_entry") else "—",
+                        "IV entry": f"{float(_iv_e) * 100:.1f} %" if _iv_e is not None else "—",
+                        "Δ vstup": f"{float(_d_e):.4f}" if _d_e is not None else "—",
+                        "Θ vstup": f"${float(_th_e):+.3f}/deň" if _th_e is not None else "—",
                     })
                 st.dataframe(
                     pd.DataFrame(leg_rows),

@@ -75,7 +75,7 @@ def _format_leg(trade: dict, compute_pnl: Callable = None) -> str:
     dte = _calc_dte(trade.get("expiry"))
     dte_str = f"{dte} dní do exp." if dte is not None else "DTE neznámy"
     iv = trade.get("iv_at_entry")
-    pop = trade.get("pop_at_entry")
+    th_e = trade.get("theta_at_entry")
     leg_type = trade.get("leg_type", "")
     role = "PREDANÁ (prémium inkasované, chceme aby stratila hodnotu)" if leg_type == "Short" else "KÚPENÁ (prémium zaplatené, chceme aby získala hodnotu)"
     
@@ -94,7 +94,7 @@ def _format_leg(trade: dict, compute_pnl: Callable = None) -> str:
         f"rola: {role}"
         f"{greeks_text} | "
         f"IV pri vstupe: {iv if iv else 'N/A'} | "
-        f"PoP pri vstupe: {f'{pop:.0f}%' if pop else 'N/A'}"
+        f"Theta pri vstupe ($/deň): {f'{th_e:+.3f}' if th_e is not None else 'N/A'}"
     )
 
 
@@ -565,6 +565,53 @@ def chat_portfolio(history: list[dict], model: str | None = None) -> str:
             "Píš v slovenčine. Buď konkrétny a číselný. "
             "Ceny píš ako '190 USD', nikdy nepoužívaj LaTeX."
             + _sys_ibkr
+        ),
+        messages=api_messages,
+    )
+    return message.content[0].text
+
+
+def chat_spread_builder(history: list[dict], model: str | None = None) -> str:
+    """
+    Pokračovanie konverzácie o spreadi z Spread Buildera (prvá správa = analýza asistenta).
+    history: [{"role": "user"|"assistant", "content": str}, ...]
+    """
+    client = _load_client()
+    m, max_tok = _resolve_model(model)
+
+    api_messages: list[dict] = []
+    for i, msg in enumerate(history):
+        role = msg.get("role")
+        content = msg.get("content") or ""
+        if i == 0 and role == "assistant":
+            api_messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Práve si dokončil túto analýzu spreadu v Spread Builderi:\n\n"
+                        f"{content}\n\n"
+                        "Buď pripravený odpovedať na doplňujúce otázky k tomuto spreadu, "
+                        "Greeks a rizikám. Ak používateľ zmení striky v Builderi, ber do úvahy len "
+                        "text konverzácie — nemáš live dáta z UI."
+                    ),
+                }
+            )
+            api_messages.append(
+                {
+                    "role": "assistant",
+                    "content": "Rozumiem. Som pripravený na doplňujúce otázky k tomuto spreadu.",
+                }
+            )
+        else:
+            api_messages.append({"role": role, "content": content})
+
+    message = client.messages.create(
+        model=m,
+        max_tokens=max_tok,
+        system=(
+            "Si skúsený obchodník s opciami. Pokračuješ v konverzácii o jednom spreadi "
+            "(Spread Builder). Píš v slovenčine. Buď konkrétny a číselný. "
+            "Ceny ako '190 USD', bez LaTeX."
         ),
         messages=api_messages,
     )
