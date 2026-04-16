@@ -7,6 +7,7 @@ from core.csv_spread_variant import (
     calendar_legs_from_variant_row,
     norm_header,
     series_to_norm_dict,
+    underlying_ticker_from_norm,
     verbally_assess_top1,
 )
 from core.page_context import set_tradejournal_page
@@ -112,9 +113,8 @@ def _sb_iv_from_symbol(sym: dict | None) -> float:
 
 
 def _row_symbol_upper(row: pd.Series) -> str:
-    """Ticker zo stĺpcov Symbol / Ticker / Underlying (po normalizácii hlavičiek)."""
-    m = series_to_norm_dict(row)
-    return (m.get("symbol") or m.get("ticker") or m.get("underlying") or "").strip().upper()
+    """Ticker zo stĺpcov Symbol / Ticker / Underlying / … (rovnaká logika ako pri odoslaní do Buildera)."""
+    return underlying_ticker_from_norm(series_to_norm_dict(row))
 
 
 def _unique_symbols_from_df(df: pd.DataFrame) -> list[str]:
@@ -126,19 +126,17 @@ def _unique_symbols_from_df(df: pd.DataFrame) -> list[str]:
     return sorted(out)
 
 
-def _ticker_spot_iv_for_row(row: pd.Series) -> tuple[str, float, float]:
+def _ticker_spot_iv_for_row(row: pd.Series, *, manual_ticker: str = "") -> tuple[str, float, float]:
     norm = series_to_norm_dict(row)
-    tk = (
-        (norm.get("ticker") or norm.get("symbol") or norm.get("underlying") or "")
-        .strip()
-        .upper()
-    )
-    if not tk:
-        ticks = [str(t).strip().upper() for t in db.get_symbol_tickers() if str(t).strip()]
-        tk = sorted(ticks)[0] if ticks else "AMZN"
-    sym = db.get_symbol(tk)
+    tk = (manual_ticker or "").strip().upper() or underlying_ticker_from_norm(norm)
+    sym = db.get_symbol(tk) if tk else None
     spot = float(sym.get("spot") or 0) if sym else 0.0
     iv = _sb_iv_from_symbol(sym)
+    pcell = norm.get("price", "").strip()
+    if pcell:
+        pv = _parse_number(pcell)
+        if not np.isnan(pv) and float(pv) > 0:
+            spot = float(pv)
     if spot <= 0:
         for key in ("leg1_strike", "strike", "long_strike", "k"):
             v = norm.get(key, "").strip()
@@ -247,19 +245,43 @@ if not show_score:
     top = top.drop(columns=["_score"], errors="ignore")
 
 st.success(f"Načítaných {len(ranked)} variantov. Zobrazených top {len(top)}.")
+st.caption(
+    "Do Buildera: **kalendár** = jeden strike (napr. len **Leg1 Strike**); **diagonál** = dva striky "
+    "(**Leg1 Strike** + **Leg2 Strike**, alebo **Short strike** / **Long strike**)."
+)
 st.dataframe(top, use_container_width=True, hide_index=True)
 
 top1 = ranked.iloc[0]
 st.markdown("##### Top 1 — slovné zhodnotenie")
 st.info(verbally_assess_top1(top1, ranked, strategy))
 
+_sug_csv_ticker = underlying_ticker_from_norm(series_to_norm_dict(top1))
+_csv_fname = getattr(uploaded, "name", "variant") or "variant"
+_csv_tk_key = f"csv_variant_manual_ticker_{_csv_fname}"
+if _sug_csv_ticker:
+    st.caption(
+        f"Z CSV je rozpoznaný ticker **{_sug_csv_ticker}**. Ak treba iný (napr. nie je v záložke Symboly), zadaj ho nižšie — **má prednosť** pred CSV."
+    )
+else:
+    st.caption(
+        "V CSV **nie je** rozpoznateľný stĺpec s tickerom (Symbol, Ticker, Underlying, Stock, Root, …). "
+        "**Zadaj ticker podkladu** nižšie — už sa **nepoužije** prvý symbol z DB."
+    )
+st.text_input(
+    "Ticker podkladu (voliteľné doplnenie / oprava)",
+    key=_csv_tk_key,
+    placeholder=_sug_csv_ticker or "napr. MRVL",
+    help="Prepíše ticker z CSV alebo ho doplní, keď v CSV chýba. Spot vie ísť z ceny v CSV (Price~) aj bez záznamu v Symboly.",
+)
+
 if st.button(
     "Odoslať top 1 do Spread Buildera",
     type="primary",
-    help="Nastaví ticker/spot/IV z DB (Symboly) a zostaví kalendárny spread z prvého riadku rebríčka.",
+    help="Ticker = pole vyššie alebo CSV; spot z ceny v CSV alebo Symboly. Kalendárny spread z prvého riadku rebríčka.",
 ):
-    tk, spot, iv = _ticker_spot_iv_for_row(top1)
-    legs, leg_err = calendar_legs_from_variant_row(
+    _man_tk = (st.session_state.get(_csv_tk_key) or "").strip().upper()
+    tk, spot, iv = _ticker_spot_iv_for_row(top1, manual_ticker=_man_tk)
+    legs, leg_err, csv_exp_notice = calendar_legs_from_variant_row(
         top1,
         spot=spot,
         iv=iv,
@@ -267,11 +289,19 @@ if st.button(
     )
     if leg_err:
         st.error(leg_err)
-    else:
-        note = (
-            f"Načítaný **top 1** z CSV variantov ({tk}). "
-            + verbally_assess_top1(top1, ranked, strategy)
+    elif not tk:
+        st.error(
+            "Chýba **ticker podkladu**. Doplň ho v poli vyššie alebo pridaj do CSV stĺpec "
+            "**Symbol** / **Ticker** / **Underlying** / **Stock** / **Root** s kódom (napr. MRVL)."
         )
+    else:
+        _parts = [
+            f"Načítaný **top 1** z CSV variantov ({tk}).",
+            verbally_assess_top1(top1, ranked, strategy),
+        ]
+        if csv_exp_notice:
+            _parts.append(csv_exp_notice)
+        note = " ".join(_parts)
         st.session_state["_sb_pending_patch"] = {
             "op": "csv_calendar_variant",
             "ticker": tk,

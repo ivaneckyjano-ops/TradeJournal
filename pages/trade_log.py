@@ -13,6 +13,23 @@ set_tradejournal_page("trade_log")
 
 
 # ─── Helper funkcie ───────────────────────────────────────────────────────────
+def _cell_float(v, default: float = 0.0) -> float:
+    """Hodnota z data_editor (niekedy jednoprvkový list); NaN → default."""
+    if isinstance(v, (list, tuple)) and len(v) == 1:
+        v = v[0]
+    if v is None:
+        return default
+    try:
+        if pd.isna(v):
+            return default
+    except (ValueError, TypeError):
+        pass
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def _build_df(trades: list[dict], show_pnl: bool = False) -> pd.DataFrame:
     rows = []
     for t in trades:
@@ -375,8 +392,12 @@ with tab_edit:
                 "Stratégia": t.get("strategy") or "",
             })
 
+        _edit_df = pd.DataFrame(edit_rows)
+        for _num_col in ("Strike", "Entry $", "Exit $", "Komisia $"):
+            _edit_df[_num_col] = _edit_df[_num_col].astype("float64")
+
         edited_df = st.data_editor(
-            pd.DataFrame(edit_rows),
+            _edit_df,
             use_container_width=True,
             hide_index=True,
             disabled=["ID"],
@@ -385,10 +406,10 @@ with tab_edit:
                 "Noha": st.column_config.SelectboxColumn("Noha", options=["Short", "Long"]),
                 "Typ": st.column_config.SelectboxColumn("Typ", options=["Call", "Put"]),
                 "Stratégia": st.column_config.SelectboxColumn("Stratégia", options=STRATEGIES),
-                "Strike": st.column_config.NumberColumn("Strike", format="$%.2f"),
-                "Entry $": st.column_config.NumberColumn("Entry $", format="$%.2f"),
-                "Exit $": st.column_config.NumberColumn("Exit $", format="$%.2f"),
-                "Komisia $": st.column_config.NumberColumn("Komisia $", format="$%.2f",
+                "Strike": st.column_config.NumberColumn("Strike", format="$%.2f", step=0.01),
+                "Entry $": st.column_config.NumberColumn("Entry $", format="$%.2f", step=0.01),
+                "Exit $": st.column_config.NumberColumn("Exit $", format="$%.2f", step=0.01),
+                "Komisia $": st.column_config.NumberColumn("Komisia $", format="$%.2f", step=0.01,
                                                             help="Celková komisia brokera (entry + exit)"),
                 "Expiry": st.column_config.TextColumn("Expiry", help="Formát: YYYYMMDD"),
                 "Exit Date": st.column_config.TextColumn("Exit Date", help="Formát: YYYY-MM-DD"),
@@ -414,13 +435,15 @@ with tab_edit:
                 if row["Status"] != orig.get("status"): updates["status"] = row["Status"]
                 if row["Noha"] != orig.get("leg_type"): updates["leg_type"] = row["Noha"]
                 if row["Typ"] != orig.get("option_type"): updates["option_type"] = row["Typ"]
-                if float(row["Strike"]) != float(orig.get("strike", 0)): updates["strike"] = float(row["Strike"])
+                _strike = _cell_float(row["Strike"])
+                if _strike != float(orig.get("strike", 0)): updates["strike"] = _strike
                 if row["Expiry"] != orig.get("expiry"): updates["expiry"] = row["Expiry"]
                 if int(row["Kontrakty"]) != int(orig.get("contracts", 1)): updates["contracts"] = int(row["Kontrakty"])
-                if float(row["Entry $"]) != float(orig.get("entry_price", 0)): updates["entry_price"] = float(row["Entry $"])
+                _entry_p = _cell_float(row["Entry $"])
+                if _entry_p != float(orig.get("entry_price", 0)): updates["entry_price"] = _entry_p
                 
                 # Exit cena a dátum
-                new_exit_p = float(row["Exit $"])
+                new_exit_p = _cell_float(row["Exit $"])
                 if new_exit_p != float(orig.get("exit_price") or 0.0): 
                     updates["exit_price"] = new_exit_p if new_exit_p > 0 else None
                 
@@ -432,7 +455,7 @@ with tab_edit:
                 
                 if row["Stratégia"] != orig.get("strategy"): updates["strategy"] = row["Stratégia"]
 
-                new_comm = float(row.get("Komisia $") or 0.0)
+                new_comm = _cell_float(row.get("Komisia $"))
                 if new_comm != float(orig.get("commission") or 0.0):
                     updates["commission"] = new_comm if new_comm > 0 else None
 

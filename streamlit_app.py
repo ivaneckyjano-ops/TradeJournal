@@ -194,6 +194,8 @@ portfolio_agent= st.Page("pages/portfolio_agent.py",  title="Portfolio Agent",  
 portfolio_dash = st.Page("pages/portfolio_dashboard.py", title="TWS Dashboard",    icon=":material/monitor_heart:")
 steady_yields  = st.Page("pages/steady_yields.py",     title="Steady Yields",     icon=":material/trending_up:")
 csv_variants   = st.Page("pages/csv_variants.py",      title="CSV Varianty",     icon=":material/table_view:")
+greeks_db      = st.Page("pages/option_chain_greeks.py", title="DB Grékov",      icon=":material/storage:")
+delta_diag     = st.Page("pages/delta_search_diagonal.py", title="Hľadanie delty — diagonály", icon=":material/merge:")
 calendar       = st.Page("pages/calendar.py",         title="Kalendár",            icon=":material/calendar_month:")
 help_page      = st.Page("pages/help.py",             title="Pomocník",            icon=":material/help:")
 
@@ -201,7 +203,7 @@ pg = st.navigation(
     {
         "Prehľad":  [dashboard, portfolio, calendar],
         "Obchody":  [trade_log, groups, symbols],
-        "Analýza":  [notes, modeler, spread_bld, csv_variants, steady_yields, portfolio_agent, portfolio_dash],
+        "Analýza":  [notes, modeler, spread_bld, csv_variants, greeks_db, delta_diag, steady_yields, portfolio_agent, portfolio_dash],
         "Info":     [help_page],
     },
     position="sidebar",

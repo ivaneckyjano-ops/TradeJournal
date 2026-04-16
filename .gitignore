@@ -9,3 +9,9 @@ __pycache__/
 # data/journal.db je zámerne ZÁLOHOVANÉ: obsahuje obchody, kalendár (events), poznámky,
 # Spread Builder nápady, históriu portfólia atď.
 # data/journal.db
+
+# Samostatné DB reťazcov opcií (jedna na ticker); import cez scripts/import_barchart_option_chains.py
+data/option_chains/*.db
+
+# Uložené riadky z Hľadania delty — diagonály (voliteľne odstráň z .gitignore, ak chceš zálohovať v gite)
+data/saved_diagonals.db

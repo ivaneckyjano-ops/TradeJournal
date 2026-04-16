@@ -266,7 +266,7 @@ if "sb_spot" not in st.session_state:
 if "sb_iv" not in st.session_state:
     st.session_state["sb_iv"] = 0.30
 if "sb_greek_input_mode" not in st.session_state:
-    st.session_state["sb_greek_input_mode"] = "tws_share"
+    st.session_state["sb_greek_input_mode"] = "position_usd"
 if "sb_greek_input_mode_last" not in st.session_state:
     st.session_state["sb_greek_input_mode_last"] = st.session_state["sb_greek_input_mode"]
 if "sb_active_idea_id" not in st.session_state:
@@ -554,11 +554,9 @@ def _sb_clear_greek_editor_widget_keys() -> None:
                 "sb_add_leg_theta",
                 "sb_add_leg_delta",
                 "sb_add_leg_vega",
-                "sb_add_leg_gamma",
                 "sb_man_delta",
                 "sb_man_theta",
                 "sb_man_vega",
-                "sb_man_gamma",
             }
         ):
             del st.session_state[k]
@@ -619,7 +617,6 @@ def _sb_push_leg_greeks_to_widgets(sel_ix: int, leg: dict) -> None:
         f"sb_greeks_th_{sel_ix}",
         f"sb_greeks_dl_{sel_ix}",
         f"sb_greeks_vg_{sel_ix}",
-        f"sb_greeks_gm_{sel_ix}",
     ):
         st.session_state.pop(_k, None)
 
@@ -636,7 +633,6 @@ def _sb_legs_greek_fp(legs: list[dict]) -> tuple:
             round(float(l.get(_SB_GK_DELTA) or 0.0), 4),
             round(float(l.get(_SB_GK_THETA) or 0.0), 4),
             round(float(l.get(_SB_GK_VEGA) or 0.0), 4),
-            round(float(l.get(_SB_GK_GAMMA) or 0.0), 4),
         )
         for l in legs
     )
@@ -802,6 +798,118 @@ def _sb_float_any(x, default: float = 0.0) -> float:
         return default
 
 
+def _sb_cell_float(v, default: float = 0.0) -> float:
+    """Hodnota z data_editor (jednoprvkový list / NA)."""
+    if isinstance(v, (list, tuple)) and len(v) == 1:
+        v = v[0]
+    if v is None:
+        return default
+    try:
+        if pd.isna(v):
+            return default
+    except (ValueError, TypeError):
+        pass
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _sb_leg_editor_expiry_options(legs: list) -> tuple[list[str], dict[str, str]]:
+    """Štítky expirácií pre SelectboxColumn + mapa štítok → YYYYMMDD (vrátane nôh mimo katalógu)."""
+    _exps = get_catalog_expiries(months=18)
+    _lbls, _emap = format_expiry_select_options(_exps)
+    _emap = dict(_emap)
+    _lbls = list(_lbls)
+    seen_norm: set[str] = set()
+    for leg in legs:
+        cur = str(leg.get("expiry") or "").strip().replace("-", "")
+        if len(cur) == 8 and cur.isdigit():
+            seen_norm.add(cur)
+    for cur in sorted(seen_norm):
+        if cur and all(_emap[lb] != cur for lb in _lbls):
+            orphan = f"⚠ Mimo katalóg — {cur}"
+            _lbls.insert(0, orphan)
+            _emap[orphan] = cur
+    return _lbls, _emap
+
+
+def _sb_apply_legs_from_editor(
+    edited: pd.DataFrame,
+    legs: list,
+    *,
+    exp_map: dict[str, str],
+    allowed_exp: set[str],
+    global_iv: float,
+    spot: float,
+) -> tuple[bool, str]:
+    """Zapíše riadky editora do ``legs`` (in-place). Vráti (ok, chybová správa)."""
+    if len(edited) != len(legs):
+        return False, "Počet riadkov v tabuľke sa nezhoduje s počtom nôh."
+    for _, row in edited.iterrows():
+        ix = int(_sb_cell_float(row.get("#"), 0)) - 1
+        if ix < 0 or ix >= len(legs):
+            return False, f"Neplatný riadok „#“: {row.get('#')!r}."
+        leg = legs[ix]
+        ex_lbl = str(row.get("Expirácia") or "").strip()
+        ex_norm = str(exp_map.get(ex_lbl, "")).strip().replace("-", "")
+        if len(ex_norm) != 8 or not ex_norm.isdigit():
+            return False, f"Vyber platnú expiráciu (riadok #{ix + 1})."
+        try:
+            date(int(ex_norm[:4]), int(ex_norm[4:6]), int(ex_norm[6:8]))
+        except ValueError:
+            return False, f"Neplatný dátum expirácie (riadok #{ix + 1})."
+        prev_ex = str(leg.get("expiry") or "").strip().replace("-", "")
+        if ex_norm not in allowed_exp and ex_norm != prev_ex:
+            return (
+                False,
+                f"Expirácia {ex_norm} nie je v katalógu (riadok #{ix + 1}) — doplň ju v „Centrálnom katalógu“.",
+            )
+        ls = str(row.get("L/S") or "").strip()
+        if ls not in ("Long", "Short"):
+            return False, f"L/S musí byť Long alebo Short (riadok #{ix + 1})."
+        cp = str(row.get("C/P") or "").strip()
+        right = "C" if cp == "Call" else "P" if cp == "Put" else ""
+        if right not in ("C", "P"):
+            return False, f"C/P musí byť Call alebo Put (riadok #{ix + 1})."
+        n_con = max(1, int(round(_sb_cell_float(row.get("Kontr."), 1))))
+        leg["leg_type"] = ls
+        leg["right"] = right
+        leg["strike"] = max(0.01, _sb_cell_float(row.get("Strike"), 0.01))
+        leg["expiry"] = ex_norm
+        leg["contracts"] = n_con
+        leg["entry_price"] = max(0.01, _sb_cell_float(row.get("Vstup $"), 0.01))
+        leg["iv"] = max(0.01, min(5.0, _sb_cell_float(row.get("IV"), global_iv)))
+        _merge_leg_tws_quote_fields(
+            leg,
+            bid=_sb_cell_float(row.get("Bid $"), 0),
+            ask=_sb_cell_float(row.get("Ask $"), 0),
+            last=0.0,
+        )
+        _gm = _leg_greeks_bs(leg, float(spot))["gamma"]
+        _set_leg_stored_greeks(
+            leg,
+            delta_usd=_sb_cell_float(row.get("Δ $"), 0),
+            theta_per_day_usd=_sb_cell_float(row.get("Θ $/deň"), 0),
+            vega_usd=_sb_cell_float(row.get("Vega $"), 0),
+            gamma=float(_gm),
+        )
+    for j, lg in enumerate(legs):
+        lg["id"] = j + 1
+    return True, ""
+
+
+def _sb_expiry_to_date(expiry_str: str, *, fallback_days: int = 35) -> date:
+    """YYYYMMDD → date pre st.date_input; pri chybe dnes + fallback_days."""
+    s = str(expiry_str or "").strip().replace("-", "")
+    if len(s) == 8 and s.isdigit():
+        try:
+            return date(int(s[:4]), int(s[4:6]), int(s[6:8]))
+        except ValueError:
+            pass
+    return date.today() + timedelta(days=fallback_days)
+
+
 def _sb_coerce_legs_from_import(legs: list) -> list:
     """Čisté Python typy po importe (JSON / session) — bez numpy v nohách."""
     out: list[dict] = []
@@ -888,16 +996,6 @@ with st.container():
     )
     st.session_state["sb_iv"] = _iv_val
 
-    if ibkr.is_connected():
-        if st.button("📡 Načítať Spot z IBKR", key="sb_load_spot"):
-            with st.spinner(f"Načítavam spot pre {_ticker_input}..."):
-                _res = ibkr.fetch_underlying(_ticker_input, timeout=6.0)
-            if not _res.get("error") and _res.get("price"):
-                st.session_state["_sb_pending_patch"] = {"op": "spot", "spot": float(_res["price"])}
-                st.rerun()
-            else:
-                st.warning(_res.get("error", "Spot nenájdený"))
-
 # ─── Po CSV: prehľadná tabuľka + uloženie (bez scrollu cez katalóg a „Pridať nohu“) ─
 if st.session_state.get("sb_csv_quick_flow") and st.session_state.get("sb_legs"):
     st.divider()
@@ -913,6 +1011,26 @@ if st.session_state.get("sb_csv_quick_flow") and st.session_state.get("sb_legs")
     _qnote = st.session_state.pop("_sb_sync_notice", None)
     if _qnote:
         st.info(_qnote)
+    st.markdown("##### Expirácie — kalendár")
+    st.caption(
+        "Ak CSV nemalo dátumy, boli dosadené orientačné hodnoty — alebo ich môžeš kedykoľvek zmeniť tu."
+    )
+    _qcal_cols = st.columns(max(1, len(_qlegs)))
+    _qcal_dates: list[date] = []
+    for _qi, _qleg in enumerate(_qlegs):
+        with _qcal_cols[_qi % len(_qcal_cols)]:
+            _qd0 = _sb_expiry_to_date(str(_qleg.get("expiry") or ""))
+            _qlbl = f"#{_qi + 1} {_qleg.get('leg_type', '')} {_qleg.get('right', '')}"
+            _qcal_dates.append(st.date_input(_qlbl, value=_qd0, key=f"sb_csv_flow_cal_{_qi}"))
+    if st.button("Použiť tieto dátumy na nohy a zapísať do katalógu", key="sb_csv_flow_cal_apply"):
+        for _qi, _qleg in enumerate(_qlegs):
+            _qleg["expiry"] = _qcal_dates[_qi].strftime("%Y%m%d")
+        append_expiries_from_text("\n".join(d.strftime("%Y%m%d") for d in _qcal_dates), months=18)
+        for _qj, _lg in enumerate(_qlegs):
+            _lg["id"] = _qj + 1
+        _sb_clear_greek_editor_widget_keys()
+        st.success("Expirácie aktualizované.")
+        st.rerun()
     _qrows = []
     for i, leg in enumerate(_qlegs):
         g = _leg_greeks(leg, _qspot)
@@ -1293,7 +1411,7 @@ with st.expander("📋 Šablóna stratégie — predvyplnené nohy", expanded=Tr
     st.caption(
         "1) Zadaj **Ticker**, **Spot** a **IV** vyššie (pre KO napr. spot z IBKR). "
         "2) Vyber stratégiu. 3) **Nastaviť nohy** — **prepíše celý zoznam nôh**; expirácie berie z **centrálneho katalógu** (predvolene generované piatky / mesačné; vieš ho upraviť v expandéri vyššie). "
-        "Úvodné ceny nôh sú **BS odhad** — v tabuľke ich uprav podľa bid/ask z TWS."
+        "Úvodné ceny nôh sú **BS odhad** — dolu v **tabuľke nôh** ich vieš prepísať (Bid/Ask, vstup, IV, Greeks)."
     )
     _strat_lbl = st.selectbox(
         "Stratégia",
@@ -1463,11 +1581,12 @@ with st.expander("➕ Pridať nohu", expanded=len(st.session_state["sb_legs"]) =
             _spot_val,
         )
     else:
-        _add_g_prev = {"delta": 0.0, "theta": 0.0, "vega": 0.0, "gamma": 0.0}
+        _add_g_prev = {"delta": 0.0, "theta": 0.0, "vega": 0.0}
     st.caption(
-        f"Greeks pri pridávaní nohy = **{_sb_greek_input_mode_label()}**. V TWS režime sa hodnota zadaná na 1 akciu pri uložení prepočíta na celú pozíciu (×100 × kontrakty)."
+        f"Greeks pri pridávaní nohy = **{_sb_greek_input_mode_label()}** "
+        "(hlavná **tabuľka nôh** nižšie má Greeks vždy v **USD na pozíciu nohy**)."
     )
-    _ag1, _ag2, _ag3, _ag4 = st.columns(4)
+    _ag1, _ag2, _ag3 = st.columns(3)
     _add_th = _ag1.number_input(
         f"Θ $/deň ({'na 1 akciu' if _sb_greek_input_mode() == 'tws_share' else 'na pozíciu'})",
         min_value=-999999.0,
@@ -1492,21 +1611,6 @@ with st.expander("➕ Pridať nohu", expanded=len(st.session_state["sb_legs"]) =
         value=float(_sb_greek_to_input(_add_g_prev["vega"], int(_add_contr))),
         key="sb_add_leg_vega",
     )
-    _add_gm = _ag4.number_input(
-        "Gamma",
-        min_value=-999.0,
-        max_value=999.0,
-        step=0.0001,
-        format="%.4f",
-        value=float(_sb_greek_to_input(_add_g_prev["gamma"], int(_add_contr))),
-        key="sb_add_leg_gamma",
-    )
-    st.caption("**Citácie z TWS** (voliteľné; 0 = prázdne — len referencia, nie P&L graf)")
-    _at1, _at2, _at3 = st.columns(3)
-    _add_tws_bid = _at1.number_input("TWS Bid ($)", min_value=0.0, step=0.01, value=0.0, key="sb_add_tws_bid")
-    _add_tws_ask = _at2.number_input("TWS Ask ($)", min_value=0.0, step=0.01, value=0.0, key="sb_add_tws_ask")
-    _add_tws_last = _at3.number_input("TWS Last ($)", min_value=0.0, step=0.01, value=0.0, key="sb_add_tws_last")
-
     if st.button("✅ Pridať nohu", type="primary", key="sb_btn_add"):
         if not _add_exp:
             st.warning("Najprv doplni katalóg expirácií (expandér „Centrálny katalóg“).")
@@ -1521,13 +1625,12 @@ with st.expander("➕ Pridať nohu", expanded=len(st.session_state["sb_legs"]) =
                 "entry_price": _add_entry,
                 "iv":          _add_leg_iv,
             }
-            _merge_leg_tws_quote_fields(_nl, bid=_add_tws_bid, ask=_add_tws_ask, last=_add_tws_last)
             _set_leg_stored_greeks(
                 _nl,
                 delta_usd=_sb_greek_from_input(float(_add_d), int(_add_contr)),
                 theta_per_day_usd=_sb_greek_from_input(float(_add_th), int(_add_contr)),
                 vega_usd=_sb_greek_from_input(float(_add_v), int(_add_contr)),
-                gamma=_sb_greek_from_input(float(_add_gm), int(_add_contr)),
+                gamma=float(_leg_greeks_bs(_nl, _spot_val)["gamma"]),
             )
             st.session_state["sb_legs"].append(_nl)
             st.rerun()
@@ -1546,70 +1649,142 @@ if _sb_sync_note:
     st.success(_sb_sync_note)
 
 st.markdown(f"### Nohy spreadu  ({len(legs)})")
+st.caption(
+    "Jedna tabuľka — uprav **Bid / Ask**, **IV** (zlomok, napr. 0,30 = 30 %), **Δ / Θ / Vega** a **vstupnú prémiu** priamo v bunkách. "
+    "**Δ $** = „dollar delta“ pozície: približne **(delta opcie ako 0–1) × 100 × kontrakty** — teda pri **1 kontrakte** a delte **0,12** zadáš cca **12**, nie **0,12** ani **122** (122 by zodpovedalo napr. ~1,22 delty na 1 kontr.). "
+    "Greeks v tabuľke sú vždy **USD na celú nohu** (nie „na 1 akciu“). **DTE** a **BS $** sú len náhľad. "
+    "Po úprave klikni **Aplikovať zmeny z tabuľky**. Expiráciu vieš zmeniť aj **kalendárom** pod tabuľkou."
+)
 
-# Riadky tabuľky + Greeks
-_spot = st.session_state["sb_spot"]
-rows  = []
-tot   = {"delta": 0.0, "theta": 0.0, "vega": 0.0, "gamma": 0.0}
+_spot = float(st.session_state["sb_spot"])
+_iv_tbl = float(st.session_state["sb_iv"])
+_exp_lbls, _exp_map = _sb_leg_editor_expiry_options(legs)
+_allowed_exp = set(get_catalog_expiries(months=18))
+if not _exp_lbls:
+    st.error(
+        "Katalóg expirácií je prázdny a neviem zostaviť výber dátumov — v expandéri „Centrálny katalóg“ použi **Zlúčiť s generovaným**."
+    )
+    st.stop()
+
+rows = []
+tot = {"delta": 0.0, "theta": 0.0, "vega": 0.0}
 for i, leg in enumerate(legs):
     g = _leg_greeks(leg, _spot)
     for k in tot:
         tot[k] += g[k]
-    _bs_est = bs_price(_spot, leg["strike"], max(1, _dte(leg["expiry"])),
-                       leg.get("iv") or _iv_val, leg["right"]) or 0.0
-    _tb, _ta = float(leg.get("tws_bid") or 0), float(leg.get("tws_ask") or 0)
-    if _tb > 0 and _ta > 0:
-        _tws_ba = f"{_tb:.2f} / {_ta:.2f}"
-    elif _tb > 0:
-        _tws_ba = f"{_tb:.2f} / —"
-    elif _ta > 0:
-        _tws_ba = f"— / {_ta:.2f}"
-    else:
-        _tws_ba = "—"
-    _tl = float(leg.get("tws_last") or 0)
-    _tws_l = f"{_tl:.2f}" if _tl > 0 else "—"
+    _bs_est = bs_price(
+        _spot, leg["strike"], max(1, _dte(leg["expiry"])),
+        leg.get("iv") or _iv_tbl, leg["right"],
+    ) or 0.0
+    _cur_ex = str(leg.get("expiry") or "").strip().replace("-", "")
+    _exp_lbl = next(
+        (lb for lb in _exp_lbls if _exp_map.get(lb) == _cur_ex),
+        _exp_lbls[0],
+    )
     rows.append({
-        "#":             i + 1,
-        "L/S":           leg["leg_type"],
-        "C/P":           "Call" if leg["right"] == "C" else "Put",
-        "Strike":        leg["strike"],
-        "Expiry":        leg["expiry"],
-        "DTE":           _dte(leg["expiry"]),
-        "Kontr.":        leg["contracts"],
-        "Vstup $":       leg["entry_price"],
-        "BS odhad $":    round(_bs_est, 2),
-        "IV":            f"{leg.get('iv', _iv_val)*100:.1f}%",
-        "TWS bid/ask":   _tws_ba,
-        "TWS Last":      _tws_l,
-        "Theta $/deň":   round(g["theta"], 2),
-        "Delta $":       round(g["delta"], 2),
-        "Vega $":        round(g["vega"], 2),
-        "Gamma":         round(g["gamma"], 4),
+        "#": i + 1,
+        "L/S": leg["leg_type"],
+        "C/P": "Call" if leg["right"] == "C" else "Put",
+        "Strike": float(leg["strike"]),
+        "Expirácia": _exp_lbl,
+        "Kontr.": int(leg.get("contracts") or 1),
+        "Bid $": float(leg.get("tws_bid") or 0),
+        "Ask $": float(leg.get("tws_ask") or 0),
+        "Vstup $": float(leg.get("entry_price") or 0.01),
+        "IV": float(leg.get("iv") or _iv_tbl),
+        "Δ $": float(leg.get(_SB_GK_DELTA) or 0),
+        "Θ $/deň": float(leg.get(_SB_GK_THETA) or 0),
+        "Vega $": float(leg.get(_SB_GK_VEGA) or 0),
+        "DTE": int(_dte(leg["expiry"]) or 0),
+        "BS $": round(float(_bs_est), 2),
     })
 
-df_legs = pd.DataFrame(rows)
-st.dataframe(
-    df_legs, use_container_width=True, hide_index=True,
+_df_legs_edit = pd.DataFrame(rows)
+_sb_edited_legs = st.data_editor(
+    _df_legs_edit,
+    use_container_width=True,
+    hide_index=True,
+    key="sb_legs_main_editor",
+    disabled=["#", "DTE", "BS $"],
     column_config={
-        "Strike":       st.column_config.NumberColumn(format="$%.2f"),
-        "Vstup $":      st.column_config.NumberColumn(format="$%.2f"),
-        "BS odhad $":   st.column_config.NumberColumn(format="$%.2f"),
-        "Theta $/deň":  st.column_config.NumberColumn(format="$%+.2f"),
-        "Delta $":      st.column_config.NumberColumn(format="$%+.2f"),
-        "Vega $":       st.column_config.NumberColumn(format="$%+.2f"),
-        "TWS bid/ask":  st.column_config.TextColumn(),
-        "TWS Last":     st.column_config.TextColumn(),
+        "#": st.column_config.NumberColumn(format="%d"),
+        "L/S": st.column_config.SelectboxColumn("L/S", options=["Long", "Short"]),
+        "C/P": st.column_config.SelectboxColumn("C/P", options=["Call", "Put"]),
+        "Strike": st.column_config.NumberColumn(format="$%.2f", min_value=0.01, step=0.5),
+        "Expirácia": st.column_config.SelectboxColumn("Expirácia", options=_exp_lbls),
+        "Kontr.": st.column_config.NumberColumn(format="%d", min_value=1, step=1),
+        "Bid $": st.column_config.NumberColumn(format="$%.2f", min_value=0.0, step=0.01),
+        "Ask $": st.column_config.NumberColumn(format="$%.2f", min_value=0.0, step=0.01),
+        "Vstup $": st.column_config.NumberColumn(format="$%.2f", min_value=0.01, step=0.01),
+        "IV": st.column_config.NumberColumn(
+            format="%.4f",
+            min_value=0.01,
+            max_value=5.0,
+            step=0.01,
+            help="Impl. volatilita ako zlomok (0,30 = 30 %).",
+        ),
+        "Δ $": st.column_config.NumberColumn(
+            format="$%+.2f",
+            step=0.01,
+            help="≈ delta(0–1) × 100 × kontrakty. Príklad: 1 kontr., delta 0,12 → cca **12**.",
+        ),
+        "Θ $/deň": st.column_config.NumberColumn(format="$%+.2f", step=0.01),
+        "Vega $": st.column_config.NumberColumn(format="$%+.2f", step=0.01),
+        "DTE": st.column_config.NumberColumn(format="%d"),
+        "BS $": st.column_config.NumberColumn(format="$%.2f"),
     },
 )
-st.caption(
-    f"Θ / Δ / Vega / Gamma = **{_sb_greek_input_mode_label()}** pri zadávaní; v tabuľke sú potom vždy uložené ako **USD na pozíciu nohy**. "
-    "V režime TWS na 1 akciu sa hodnota pri uložení prepočíta na celú pozíciu (×100 × kontrakty). "
-    "**P&L diagram** zostáva z BS (IV + vstupná cena)."
-)
+_ap1, _ap2 = st.columns([1, 2])
+with _ap1:
+    if st.button("💾 Aplikovať zmeny z tabuľky", type="primary", key="sb_legs_editor_apply"):
+        _ok, _em = _sb_apply_legs_from_editor(
+            _sb_edited_legs,
+            legs,
+            exp_map=_exp_map,
+            allowed_exp=_allowed_exp,
+            global_iv=_iv_tbl,
+            spot=_spot,
+        )
+        if not _ok:
+            st.error(_em)
+        else:
+            _sb_clear_greek_editor_widget_keys()
+            st.rerun()
+with _ap2:
+    st.caption(
+        f"Súčty z aktuálnych uložených nôh: **Δ** ${tot['delta']:+.2f} · **Θ** ${tot['theta']:+.2f}/deň · **V** ${tot['vega']:+.2f}. "
+        f"Režim *Ako zadávaš Greeks* vyššie (**{_sb_greek_input_mode_label()}**) platí pre *Pridať nohu* a ručný net — nie pre stĺpce v tejto tabuľke."
+    )
+
+with st.expander("📅 Expirácie z kalendára (mimo rozbaľovacieho zoznamu)", expanded=False):
+    st.caption(
+        "Vyber dátum v **kalendári** pre každú nohu a zapíš do spreadu. Dátumy sa zároveň **pridajú do katalógu** expirácií, aby ich bolo vidieť v stĺpci Expirácia v tabuľke."
+    )
+    _cal_nc = max(1, len(legs))
+    _cal_cols = st.columns(min(_cal_nc, 4))
+    _picked_dates: list[date] = []
+    for i, _leg in enumerate(legs):
+        with _cal_cols[i % len(_cal_cols)]:
+            _d0 = _sb_expiry_to_date(str(_leg.get("expiry") or ""))
+            _plbl = f"#{i + 1} {_leg.get('leg_type', '')} {_leg.get('right', '')} K{_leg.get('strike', '')}"
+            _picked_dates.append(
+                st.date_input(_plbl, value=_d0, key=f"sb_full_cal_exp_{i}")
+            )
+    if st.button("Použiť kalendárne dátumy na nohy a do katalógu", key="sb_full_cal_apply"):
+        _txt = "\n".join(d.strftime("%Y%m%d") for d in _picked_dates)
+        append_expiries_from_text(_txt, months=18)
+        for i, _leg in enumerate(legs):
+            _leg["expiry"] = _picked_dates[i].strftime("%Y%m%d")
+        for j, lg in enumerate(legs):
+            lg["id"] = j + 1
+        _sb_clear_greek_editor_widget_keys()
+        st.rerun()
+
+st.caption("**P&L diagram** používa BS z **IV** a **Vstup $** na každej nohe.")
 with st.expander("ℹ️ Ako zadávať a čítať Θ (denný rozpad)", expanded=False):
     st.markdown(
         """
-### Pravidlo pre znamienko Θ (platí rovnako pre všetky Greeks)
+### Pravidlo pre znamienko Θ (podobne aj pre Δ a Vega v tabuľke)
 
 | Noha   | Znamienko v tabuľke | Čo znamená |
 |--------|---------------------|------------|
@@ -1641,7 +1816,7 @@ with st.expander("ℹ️ Ako zadávať a čítať Θ (denný rozpad)", expanded=
     )
 
 with st.expander(
-    "✏️ Upraviť nohu — ručné úpravy (strike, exp, Greeks, TWS…)",
+    "✏️ Pokročilé — jedna noha (mentor, sync páru; ceny a Greeks sú v hlavnej tabuľke)",
     expanded=False,
 ):
     _sel_ix = st.selectbox(
@@ -1669,22 +1844,20 @@ with st.expander(
     _gk_th_k = f"sb_greeks_th_{_sel_ix}"
     _gk_dl_k = f"sb_greeks_dl_{_sel_ix}"
     _gk_vg_k = f"sb_greeks_vg_{_sel_ix}"
-    _gk_gm_k = f"sb_greeks_gm_{_sel_ix}"
     for _gk_k, _gk_attr in (
         (_gk_th_k, _SB_GK_THETA),
         (_gk_dl_k, _SB_GK_DELTA),
         (_gk_vg_k, _SB_GK_VEGA),
-        (_gk_gm_k, _SB_GK_GAMMA),
     ):
         if _gk_k not in st.session_state:
             st.session_state[_gk_k] = float(_sb_greek_to_input(_Le.get(_gk_attr) or 0.0, int(_Le.get("contracts", 1))))
 
-    st.markdown(f"**Greeks (Θ / Δ / Vega / Γ)** — **{_sb_greek_input_mode_label()}**")
+    st.markdown(f"**Greeks (Θ / Δ / Vega)** — **{_sb_greek_input_mode_label()}**")
     st.caption(
-        f"Zadávaj **{_sb_greek_input_mode_label()}**. V TWS režime sa hodnota na 1 akciu pri uložení prepočíta na celú pozíciu (×100 × kontrakty). "
-        "Polia sú **mimo formulára** (Enter vo formulári vie uložiť starú hodnotu). Ulož tlačidlom nižšie alebo cez „Uložiť zmeny na tejto nohe“."
+        f"Zadávaj **{_sb_greek_input_mode_label()}** (pre túto vetvu editora). "
+        "Hlavná **tabuľka nôh** vyššie má Greeks v **USD na pozíciu** — tam je rýchlejšia úprava."
     )
-    _eg1, _eg2, _eg3, _eg4 = st.columns(4)
+    _eg1, _eg2, _eg3 = st.columns(3)
     with _eg1:
         st.number_input(
             f"Θ $/deň ({'na 1 akciu' if _sb_greek_input_mode() == 'tws_share' else 'na pozíciu'})",
@@ -1709,26 +1882,17 @@ with st.expander(
             step=0.01,
             key=_gk_vg_k,
         )
-    with _eg4:
-        st.number_input(
-            "Gamma",
-            min_value=-999.0,
-            max_value=999.0,
-            step=0.0001,
-            format="%.4f",
-            key=_gk_gm_k,
-        )
     if st.button(
-        "💾 Uložiť len Greeks (Θ/Δ/V/Γ) na túto nohu",
+        "💾 Uložiť len Greeks (Θ/Δ/V) na túto nohu",
         key=f"sb_greeks_only_save_{_sel_ix}",
-        help="Okamžite zapíše hodnoty z polí vyššie do tabuľky nôh — bez kontroly mentora a bez úpravy striku/expirácie.",
+        help="Okamžite zapíše hodnoty z polí vyššie do tabuľky nôh — bez kontroly mentora a bez úpravy striku/expirácie. Gamma sa dopočíta z BS.",
     ):
         _set_leg_stored_greeks(
             legs[_sel_ix],
             delta_usd=_sb_greek_from_input(float(st.session_state[_gk_dl_k]), int(_Le.get("contracts", 1))),
             theta_per_day_usd=_sb_greek_from_input(float(st.session_state[_gk_th_k]), int(_Le.get("contracts", 1))),
             vega_usd=_sb_greek_from_input(float(st.session_state[_gk_vg_k]), int(_Le.get("contracts", 1))),
-            gamma=_sb_greek_from_input(float(st.session_state[_gk_gm_k]), int(_Le.get("contracts", 1))),
+            gamma=float(_leg_greeks_bs(_Le, float(st.session_state["sb_spot"]))["gamma"]),
         )
         st.success(f"Greeks uložené na nohu #{_sel_ix + 1}.")
         st.rerun()
@@ -1773,7 +1937,7 @@ with st.expander(
             step=0.01,
             value=float(_Le.get("iv") or _iv_val),
         )
-        st.caption("Greeks sú **nad** formulárom — berú sa odtiaľ aj pri tomto uložení.")
+        st.caption("Greeks sú **nad** formulárom — berú sa odtiaľ aj pri tomto uložení. Bid/Ask dopĺň v **hlavnej tabuľke**.")
         st.checkbox(
             "Po uložení **zosúladiť druhú nohu** — kalendár: rovnaký strike + expirácie podľa mentora; "
             "diagonál / vertikál: zachovaný rozostup strikov (v $)",
@@ -1787,29 +1951,6 @@ with st.expander(
             help="Ak tabuľka mentora vyzerá v poriadku, ale uloženie stále zlyhá, skús vypnúť zosúladenie druhej nohy; "
             "ak problém pretrváva, zapni túto voľbu — riziko nesúladu s konzervatívnymi pravidlami berieš na seba.",
         )
-        st.markdown("**Citácie z TWS** (voliteľné; **nepoužívajú** sa v P&L grafe — len referencia). „0“ = prázdne.")
-        _tw1, _tw2, _tw3 = st.columns(3)
-        with _tw1:
-            _e_tws_bid = st.number_input(
-                "TWS Bid ($)",
-                min_value=0.0,
-                step=0.01,
-                value=float(_Le.get("tws_bid") or 0),
-            )
-        with _tw2:
-            _e_tws_ask = st.number_input(
-                "TWS Ask ($)",
-                min_value=0.0,
-                step=0.01,
-                value=float(_Le.get("tws_ask") or 0),
-            )
-        with _tw3:
-            _e_tws_last = st.number_input(
-                "TWS Last ($)",
-                min_value=0.0,
-                step=0.01,
-                value=float(_Le.get("tws_last") or 0),
-            )
         if st.form_submit_button("💾 Uložiť zmeny na tejto nohe"):
             _ex_ok = bool(_edit_lbls) and bool(_e_ex_lbl)
             _ex_norm = _edit_exp_map.get(_e_ex_lbl, "").strip().replace("-", "") if _ex_ok else ""
@@ -1858,13 +1999,7 @@ with st.expander(
                     delta_usd=_sb_greek_from_input(float(st.session_state[_gk_dl_k]), int(_e_ct)),
                     theta_per_day_usd=_sb_greek_from_input(float(st.session_state[_gk_th_k]), int(_e_ct)),
                     vega_usd=_sb_greek_from_input(float(st.session_state[_gk_vg_k]), int(_e_ct)),
-                    gamma=_sb_greek_from_input(float(st.session_state[_gk_gm_k]), int(_e_ct)),
-                )
-                _merge_leg_tws_quote_fields(
-                    _try_legs[_sel_ix],
-                    bid=_e_tws_bid,
-                    ask=_e_tws_ask,
-                    last=_e_tws_last,
+                    gamma=float(_leg_greeks_bs(_try_legs[_sel_ix], _spot)["gamma"]),
                 )
                 for _j, _lg in enumerate(_try_legs):
                     _lg["id"] = _j + 1
@@ -1949,68 +2084,6 @@ with st.expander(
                         st.session_state["_sb_sync_notice"] = "\n\n".join(_sync_msgs)
                     st.rerun()
 
-if ibkr.is_connected():
-    st.caption(
-        "Z IBKR vieš natiahnuť **mid cenu** (bid/ask alebo last) a **IV** pre každý kontrakt — potrebuješ market data na opcie a otvorené TWS/Gateway."
-    )
-    if st.button(
-        "📡 Načítať z IBKR: vstupné ceny + IV pre všetky nohy",
-        key="sb_load_legs_ibkr",
-        help="Prepíše Vstup $ a IV na každej nohe podľa snapshotu. Pri viacerých nohách to môže trvať desiatky sekúnd.",
-    ):
-        _tk_ib = (st.session_state.get("sb_ticker") or "").strip().upper()
-        if not _tk_ib:
-            st.warning("Najprv zadaj ticker hore.")
-        else:
-            _warn: list[str] = []
-            _ok = 0
-            _bar = st.progress(0.0, text="Pripravujem…")
-            _spot_ib = float(st.session_state.get("sb_spot", _spot))
-            for _idx, _leg in enumerate(st.session_state["sb_legs"]):
-                _bar.progress(
-                    (_idx) / max(1, len(st.session_state["sb_legs"])),
-                    text=f"IBKR {_tk_ib} noha {_idx + 1}/{len(st.session_state['sb_legs'])}…",
-                )
-                _od = ibkr.fetch_option_data(
-                    _tk_ib,
-                    str(_leg["expiry"]),
-                    float(_leg["strike"]),
-                    str(_leg["right"]),
-                )
-                _mid = _od.get("mid")
-                if _mid is None and _od.get("bid") and _od.get("ask"):
-                    _mid = (_od["bid"] + _od["ask"]) / 2.0
-                if _mid is not None and _mid > 0:
-                    _leg["entry_price"] = round(float(_mid), 2)
-                    _ok += 1
-                _iv_ib = _od.get("iv")
-                if _iv_ib is not None and float(_iv_ib) > 0:
-                    _leg["iv"] = float(_iv_ib)
-                if _od.get("error") and (_mid is None or _mid <= 0):
-                    _warn.append(
-                        f"#{_idx + 1} {_tk_ib} {_leg['expiry']} K{_leg['strike']}{_leg['right']}: {_od.get('error', '?')}"
-                    )
-                _g_ib = _leg_greeks_bs(_leg, _spot_ib)
-                _set_leg_stored_greeks(
-                    _leg,
-                    delta_usd=_g_ib["delta"],
-                    theta_per_day_usd=_g_ib["theta"],
-                    vega_usd=_g_ib["vega"],
-                    gamma=_g_ib["gamma"],
-                )
-            _bar.progress(1.0, text="Hotovo.")
-            if _ok:
-                st.success(
-                    f"IBKR: aktualizované ceny pre {_ok} nohu/ôh (IV tam, kde ju API vrátilo). "
-                    "Greeks na nohách sú zosúladené s BS podľa aktuálnej IV a striku."
-                )
-            if _warn:
-                st.warning("Problémy:\n" + "\n".join(_warn))
-            _sb_clear_greek_editor_widget_keys()
-            st.rerun()
-else:
-    st.caption("Pre automatické ceny a IV z brokera pripoj **TWS / IB Gateway** (rovnako ako pri načítaní spotu).")
-
 # Tlačidlá na mazanie nôh
 _del_cols = st.columns(min(len(legs), 6))
 for i, leg in enumerate(legs):
@@ -2075,79 +2148,73 @@ st.divider()
 # Po zmene nôh resetuj ručné neto-Greeks, aby neostali staré čísla po prepočte spreadu.
 _cur_net_fp = _sb_legs_greek_fp(legs)
 if st.session_state.get("_sb_net_legs_fp") != _cur_net_fp:
-    for _gk in ("delta", "theta", "vega", "gamma"):
+    for _gk in ("delta", "theta", "vega"):
         st.session_state.pop(f"sb_man_{_gk}", None)
     st.session_state["_sb_net_legs_fp"] = _cur_net_fp
 
 if "_sb_net_man_bound_idea_id" not in st.session_state:
     st.session_state["_sb_net_man_bound_idea_id"] = st.session_state.get("sb_active_idea_id")
 elif st.session_state["_sb_net_man_bound_idea_id"] != st.session_state.get("sb_active_idea_id"):
-    for _gk in ("delta", "theta", "vega", "gamma"):
+    for _gk in ("delta", "theta", "vega"):
         st.session_state.pop(f"sb_man_{_gk}", None)
     st.session_state["_sb_net_man_bound_idea_id"] = st.session_state.get("sb_active_idea_id")
 
 _mg_on = st.checkbox(
-    "Ručná úprava súčtových Greeks (Delta, Theta, Vega, Gamma)",
+    "Ručná úprava súčtových Greeks (Delta, Theta, Vega)",
     key="sb_manual_net_greeks_on",
     help="Ak je **vypnuté**, Net Greeks = jednoduchý súčet stĺpcov z tabuľky nôh. Ak je **zapnuté**, metriky / APTR / export použijú čísla z polí nižšie. Rovnaká škála platí aj tu.",
 )
 if _mg_on:
-    for _gk in ("delta", "theta", "vega", "gamma"):
+    for _gk in ("delta", "theta", "vega"):
         if f"sb_man_{_gk}" not in st.session_state:
             st.session_state[f"sb_man_{_gk}"] = _sb_greek_to_input(tot[_gk], net=True)
     if st.button("↺ Prevziať súčty z nôh do polí", key="sb_man_greeks_fill_bs"):
-        for _gk in ("delta", "theta", "vega", "gamma"):
+        for _gk in ("delta", "theta", "vega"):
             st.session_state[f"sb_man_{_gk}"] = _sb_greek_to_input(tot[_gk], net=True)
         st.rerun()
     st.caption(
         f"Ručné súčty zadávaj v režime **{_sb_greek_input_mode_label()}**. Pri TWS režime je to vždy prepočet na celý spread / neto (×100)."
     )
-    _mx1, _mx2, _mx3, _mx4 = st.columns(4)
+    _mx1, _mx2, _mx3 = st.columns(3)
     with _mx1:
         st.number_input(f"Net Delta $ ({'na 1 akciu' if _sb_greek_input_mode() == 'tws_share' else 'na pozíciu'})", step=0.01, format="%.2f", key="sb_man_delta")
     with _mx2:
         st.number_input(f"Net Theta $/deň ({'na 1 akciu' if _sb_greek_input_mode() == 'tws_share' else 'na pozíciu'})", step=0.01, format="%.2f", key="sb_man_theta")
     with _mx3:
         st.number_input(f"Net Vega $ ({'na 1 akciu' if _sb_greek_input_mode() == 'tws_share' else 'na pozíciu'})", step=0.01, format="%.2f", key="sb_man_vega")
-    with _mx4:
-        st.number_input("Net Gamma", step=0.0001, format="%.4f", key="sb_man_gamma")
     tot_eff = {
         "delta": _sb_greek_from_input(float(st.session_state["sb_man_delta"]), net=True),
         "theta": _sb_greek_from_input(float(st.session_state["sb_man_theta"]), net=True),
         "vega": _sb_greek_from_input(float(st.session_state["sb_man_vega"]), net=True),
-        "gamma": _sb_greek_from_input(float(st.session_state["sb_man_gamma"]), net=True),
     }
     st.caption("**Súčty Greeksov** = ručné hodnoty. Theta v APTR / denníku / exporte používa toto neto.")
 else:
-    for _gk in ("delta", "theta", "vega", "gamma"):
+    for _gk in ("delta", "theta", "vega"):
         st.session_state.pop(f"sb_man_{_gk}", None)
     tot_eff = dict(tot)
 
 # ─── Net Greeks + súhrn ───────────────────────────────────────────────────────
 st.markdown("### Net Greeks celého spreadu")
-_gc1, _gc2, _gc3, _gc4 = st.columns(4)
+_gc1, _gc2, _gc3 = st.columns(3)
 _gc_help_d = "O koľko sa zmení hodnota spreadu pri pohybe spotu o $1 (USD na celú pozíciu, nie TWS na akciu)"
 _gc_help_t = "Denný časový rozpad celého spreadu v USD (súčet pozičných Θ z nôh; TWS „na akciu“ treba ×100×kontrakty)"
 _gc_help_v = "Zmena hodnoty pri 1% pohybe IV (USD na pozíciu)"
-_gc_help_g = "Rýchlosť zmeny delty"
 if _mg_on:
     _gc_help_d += " (ručne)"
     _gc_help_t += " (ručne)"
     _gc_help_v += " (ručne)"
-    _gc_help_g += " (ručne)"
 _gc1.metric("Net Delta $",      f"${tot_eff['delta']:+.2f}", help=_gc_help_d)
 _gc2.metric("Net Theta $/deň",  f"${tot_eff['theta']:+.2f}", help=_gc_help_t)
 _gc3.metric("Net Vega $",       f"${tot_eff['vega']:+.2f}", help=_gc_help_v)
-_gc4.metric("Net Gamma",        f"{tot_eff['gamma']:+.4f}", help=_gc_help_g)
 
 st.caption(
     f"**Kontrola — súčet z tabuľky nôh** (priamo sčítané stĺpce, všetko v **USD na pozíciu nohy**, nie TWS „na akciu“): "
-    f"Δ ${tot['delta']:+.2f} · Θ ${tot['theta']:+.2f}/deň · Vega ${tot['vega']:+.2f} · Γ {tot['gamma']:+.4f}. "
+    f"Δ ${tot['delta']:+.2f} · Θ ${tot['theta']:+.2f}/deň · Vega ${tot['vega']:+.2f}. "
     f"Metriky vyššie = táto kontrola, ak nie je zapnutá ručná úprava súčtov."
 )
 if _mg_on:
     _man_mismatch = any(
-        abs(float(tot_eff[k]) - float(tot[k])) > 1e-4 for k in ("delta", "theta", "vega", "gamma")
+        abs(float(tot_eff[k]) - float(tot[k])) > 1e-4 for k in ("delta", "theta", "vega")
     )
     if _man_mismatch:
         st.warning(
@@ -2542,9 +2609,9 @@ if st.button("📝 Uložiť snapshot do denníka", type="primary", key="sb_save_
 {_legs_md}
 
 ### Greeks celého spreadu{" (ručné súčty — pozri Spread Builder)" if _mg_on else ""}
-| Net Delta $ | Net Theta $/deň | Net Vega $ | Net Gamma |
-|------------|-----------------|-----------|----------|
-| ${tot_eff['delta']:+.2f} | ${tot_eff['theta']:+.2f} | ${tot_eff['vega']:+.2f} | {tot_eff['gamma']:+.4f} |
+| Net Delta $ | Net Theta $/deň | Net Vega $ |
+|------------|-----------------|-----------|
+| ${tot_eff['delta']:+.2f} | ${tot_eff['theta']:+.2f} | ${tot_eff['vega']:+.2f} |
 
 ### Výsledky
 | Metrika | Hodnota |
@@ -2659,7 +2726,7 @@ PRAVIDLÁ:
 - Max loss: {ml_str}
 - Breakeven: {_be_str}
 - Net Delta: ${tot_eff['delta']:+.2f} | Net Theta: ${tot_eff['theta']:+.2f}/deň | Net Vega: ${tot_eff['vega']:+.2f}
-- Poznámka k súčtom: {"**ručné neto** (prepíše súčet z nôh)" if _mg_on else "súčet Delta/Theta/Vega/Gamma z hodnôt nôh vyššie"}
+- Poznámka k súčtom: {"**ručné neto** (prepíše súčet z nôh)" if _mg_on else "súčet Delta/Theta/Vega z hodnôt nôh vyššie"}
 {tws_text}
 {q_text}
 ---

@@ -80,6 +80,39 @@ def series_to_norm_dict(row: pd.Series) -> dict[str, str]:
     return out
 
 
+def underlying_ticker_from_norm(norm: dict[str, str]) -> str:
+    """
+    Ticker podkladu z bežných názvov stĳpcov v CSV/Exceli (po norm_header).
+    Neberie prvý ticker z DB — ak nič nenájde, vráti prázdny reťazec.
+    """
+    for key in (
+        "ticker",
+        "symbol",
+        "underlying",
+        "underlying_symbol",
+        "stock_ticker",
+        "equity_symbol",
+        "equity",
+        "root",
+        "root_symbol",
+        "stock",
+        "ul",
+        "sym",
+        "base_symbol",
+    ):
+        raw = (norm.get(key) or "").strip()
+        if not raw:
+            continue
+        first = raw.upper().split()[0]
+        tok = "".join(ch for ch in first if ch.isalnum())
+        if not tok or tok.isdigit():
+            continue
+        if len(tok) > 12:
+            continue
+        return tok
+    return ""
+
+
 def _dte_yyyymmdd(expiry_str: str) -> int:
     try:
         e = date(int(expiry_str[:4]), int(expiry_str[4:6]), int(expiry_str[6:8]))
@@ -126,6 +159,53 @@ def _infer_strike(norm: dict[str, str]) -> Optional[float]:
     return None
 
 
+def _strike_first_in_keys(norm: dict[str, str], keys: tuple[str, ...]) -> Optional[float]:
+    for key in keys:
+        v = norm.get(key, "").strip()
+        if not v:
+            continue
+        x = parse_number(v)
+        if not np.isnan(x) and float(x) > 0:
+            return float(x)
+    return None
+
+
+def _strikes_short_long_from_row(norm: dict[str, str]) -> tuple[Optional[float], Optional[float]]:
+    """
+    Striky pre krátku (Leg1 / front) a dlhú (Leg2 / back) nohu.
+    Kalendár: často len Leg1 Strike → oba rovnaké. Diagonál: Leg1 + Leg2 (alebo short/long strike).
+    """
+    s1 = _strike_first_in_keys(
+        norm,
+        (
+            "leg1_strike",
+            "leg_1_strike",
+            "short_strike",
+            "shortstrike",
+            "strike1",
+            "k1",
+            "near_strike",
+            "front_strike",
+            "strike_short",
+        ),
+    )
+    s2 = _strike_first_in_keys(
+        norm,
+        (
+            "leg2_strike",
+            "leg_2_strike",
+            "long_strike",
+            "longstrike",
+            "strike2",
+            "k2",
+            "far_strike",
+            "back_strike",
+            "strike_long",
+        ),
+    )
+    return s1, s2
+
+
 def _pick_first_expiry(norm: dict[str, str], keys: tuple[str, ...]) -> Optional[str]:
     for k in keys:
         cell = norm.get(k, "").strip()
@@ -137,9 +217,13 @@ def _pick_first_expiry(norm: dict[str, str], keys: tuple[str, ...]) -> Optional[
     return None
 
 
-def resolve_calendar_expiries(norm: dict[str, str]) -> tuple[Optional[str], Optional[str], Optional[str]]:
+def resolve_calendar_expiries(
+    norm: dict[str, str],
+) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
     """
-    Vráti (near, far, err). Near = skrátená noha (bližšia expirácia), far = dlhá.
+    Vráti (near, far, err, notice).
+    Near = skrátená noha (bližšia expirácia), far = dlhá.
+    notice = neblokujúca pripomienka (napr. dosadené predvolené dátumy).
     """
     e1 = _pick_first_expiry(
         norm,
@@ -154,6 +238,14 @@ def resolve_calendar_expiries(norm: dict[str, str]) -> tuple[Optional[str], Opti
             "near_exp",
             "front_exp",
             "predna_exp",
+            "leg1_exp",
+            "leg_1_exp",
+            "expiration_leg1",
+            "expiration_leg_1",
+            "expiry1",
+            "expiry_leg1",
+            "first_expiry",
+            "front_expiry",
         ),
     )
     e2 = _pick_first_expiry(
@@ -169,18 +261,35 @@ def resolve_calendar_expiries(norm: dict[str, str]) -> tuple[Optional[str], Opti
             "far_exp",
             "back_exp",
             "zadna_exp",
+            "leg2_exp",
+            "leg_2_exp",
+            "expiration_leg2",
+            "expiration_leg_2",
+            "expiry2",
+            "expiry_leg2",
+            "second_expiry",
+            "back_expiry",
         ),
     )
 
     if e1 and e2:
         d1, d2 = _dte_yyyymmdd(e1), _dte_yyyymmdd(e2)
         if d1 <= d2:
-            return e1, e2, None
-        return e2, e1, None
+            return e1, e2, None, None
+        return e2, e1, None, None
 
     only = e1 or e2
     if not only:
-        return None, None, "V riadku chýbajú expirácie (očakávam napr. **Exp Leg1** + **Exp Leg2** alebo jednu + katalóg)."
+        td = date.today()
+        short_exp = (td + timedelta(days=21)).strftime("%Y%m%d")
+        long_exp = (td + timedelta(days=63)).strftime("%Y%m%d")
+        return (
+            short_exp,
+            long_exp,
+            None,
+            "V CSV sa nenašli rozpoznateľné expirácie — dosadené orientačné dátumy (+21 / +63 dní od dnes). "
+            "Uprav ich **kalendárom** v Spread Builderi.",
+        )
 
     long_exp = only
     exps = get_catalog_expiries(months=18)
@@ -192,7 +301,7 @@ def resolve_calendar_expiries(norm: dict[str, str]) -> tuple[Optional[str], Opti
             candidates.append(e)
     if candidates:
         short_exp = max(candidates, key=_dte_yyyymmdd)
-        return short_exp, long_exp, None
+        return short_exp, long_exp, None, None
 
     try:
         ld_dt = datetime.strptime(long_exp, "%Y%m%d").date()
@@ -200,9 +309,69 @@ def resolve_calendar_expiries(norm: dict[str, str]) -> tuple[Optional[str], Opti
         if sd_dt <= date.today():
             sd_dt = date.today() + timedelta(days=14)
         short_exp = sd_dt.strftime("%Y%m%d")
-        return short_exp, long_exp, None
+        return short_exp, long_exp, None, None
     except Exception:
-        return None, None, "Nepodarilo sa dopočítať druhú expiráciu — doplň **Exp Leg1** a **Exp Leg2** v CSV."
+        return None, None, "Nepodarilo sa dopočítať druhú expiráciu — doplň **Exp Leg1** a **Exp Leg2** v CSV.", None
+
+
+def _first_numeric(norm: dict[str, str], *keys: str) -> Optional[float]:
+    """Prvá kladná hodnota z normovaných kľúčov (CSV čísla s čiarkou / %)."""
+    for k in keys:
+        cell = norm.get(k, "").strip()
+        if not cell:
+            continue
+        x = parse_number(cell)
+        if not np.isnan(x) and float(x) > 0:
+            return float(x)
+    return None
+
+
+def _iv_fraction_from_norm(norm: dict[str, str], *keys: str) -> Optional[float]:
+    """IV ako zlomok (0.30); vstup môže byť percentá (62.35 alebo 62.35%)."""
+    for k in keys:
+        cell = norm.get(k, "").strip()
+        if not cell:
+            continue
+        x = parse_number(cell)
+        if np.isnan(x) or x <= 0:
+            continue
+        if x > 1.0:
+            x = x / 100.0
+        return float(min(max(x, 0.01), 5.0))
+    return None
+
+
+def _apply_net_greek_scales(legs: list[dict], norm: dict[str, str], contracts: int) -> None:
+    """
+    Ak CSV má Net Delta / Net Vega / Net Theta (typicky „na akciu“ ako v Exceli),
+    preškálujeme uložené pozičné USD na nohách tak, aby ich súčet sedel s cieľom.
+
+    |hodnota| pod prahom → považujeme za agregát „na akciu“ × 100 × kontrakty.
+    """
+    n = max(1, int(contracts))
+    # theta z TWS býva malé číslo (napr. 0.07); delta/vega často < ~5 na akciu
+    specs: tuple[tuple[str, str, float], ...] = (
+        ("net_delta", _LEG_DELTA, 12.0),
+        ("net_vega", _LEG_VEGA, 12.0),
+        ("net_theta", _LEG_THETA, 1.5),
+    )
+    for nk, attr, thresh in specs:
+        cell = norm.get(nk, "").strip()
+        if not cell:
+            continue
+        raw = parse_number(cell)
+        if np.isnan(raw):
+            continue
+        if abs(float(raw)) < thresh:
+            target = float(raw) * 100.0 * n
+        else:
+            target = float(raw)
+        cur = sum(float(lg.get(attr) or 0) for lg in legs)
+        if abs(cur) < 1e-12:
+            continue
+        k = target / cur
+        for lg in legs:
+            lg[attr] = float(lg.get(attr) or 0) * k
 
 
 def _set_leg_greeks(leg: dict, spot: float) -> None:
@@ -229,10 +398,15 @@ def _make_leg(
     contracts: int,
     spot: float,
     iv: float,
+    *,
+    entry_override: Optional[float] = None,
 ) -> dict:
     dte = max(1, _dte_yyyymmdd(expiry))
-    ep = bs_price(spot, strike, dte, iv, right)
-    ep = round(max(0.01, ep or 0.5), 2)
+    if entry_override is not None and not np.isnan(entry_override) and float(entry_override) > 0:
+        ep = round(float(entry_override), 2)
+    else:
+        ep = bs_price(spot, strike, dte, iv, right)
+        ep = round(max(0.01, ep or 0.5), 2)
     leg = {
         "id": leg_id,
         "leg_type": leg_type,
@@ -253,26 +427,105 @@ def calendar_legs_from_variant_row(
     spot: float,
     iv: float,
     contracts: int = 1,
-) -> tuple[list[dict], Optional[str]]:
+) -> tuple[list[dict], Optional[str], Optional[str]]:
+    """
+    Vráti (legs, err, notice). Dve nohy: short pri **near** expirácii, long pri **far**.
+    Ak sa **Leg1 Strike** a **Leg2 Strike** (alebo long/short strike) líšia → **diagonála**;
+    inak rovnaký strike ako **kalendár**.
+    """
     norm = series_to_norm_dict(row)
-    err: Optional[str]
-    near, far, err = resolve_calendar_expiries(norm)
+    near, far, err, notice = resolve_calendar_expiries(norm)
     if err or not near or not far:
-        return [], err or "Chýbajú expirácie."
+        return [], err or "Chýbajú expirácie.", notice
 
-    strike = _infer_strike(norm)
-    if strike is None or strike <= 0:
-        return [], "V riadku chýba strike — skús stĺpec **Strike**, **Leg1 Strike** / **Leg2 Strike** alebo **K**."
+    s1, s2 = _strikes_short_long_from_row(norm)
+    shared = _infer_strike(norm)
+    if s1 is not None and s2 is not None:
+        k_short, k_long = float(s1), float(s2)
+    elif s1 is not None:
+        k_short = k_long = float(s1)
+    elif s2 is not None:
+        k_short = k_long = float(s2)
+    elif shared is not None and float(shared) > 0:
+        k_short = k_long = float(shared)
+    else:
+        return (
+            [],
+            "V riadku chýba strike — skús **Leg1 Strike** / **Leg2 Strike**, **Short/Long strike** alebo **Strike**.",
+            notice,
+        )
+
+    notice_parts: list[str] = []
+    if notice:
+        notice_parts.append(str(notice))
+    if abs(k_short - k_long) > 1e-6:
+        notice_parts.append(
+            "Striky z **Leg1** a **Leg2** sa líšia — v Buildery ide o **diagonálu** (kalendár má rovnaký strike na oboch expiráciách)."
+        )
 
     right = _infer_right(norm)
-    sp = float(spot) if float(spot) > 0 else float(strike)
+    sp = float(spot) if float(spot) > 0 else float(k_short)
+    sp_csv = _first_numeric(norm, "price", "underlying_price", "spot_px", "spot", "last")
+    if sp_csv is not None:
+        sp = sp_csv
     iv_use = float(iv) if float(iv) > 0 else 0.30
 
+    iv_short = _iv_fraction_from_norm(
+        norm,
+        "leg1_iv",
+        "short_iv",
+        "iv_leg1",
+        "iv1",
+        "front_iv",
+        "near_iv",
+    )
+    iv_long = _iv_fraction_from_norm(
+        norm,
+        "leg2_iv",
+        "long_iv",
+        "iv_leg2",
+        "iv2",
+        "back_iv",
+        "far_iv",
+    )
+    iv_s = iv_short if iv_short is not None else iv_use
+    iv_l = iv_long if iv_long is not None else iv_use
+
+    bid1 = _first_numeric(norm, "bid1", "bid_leg1", "bid_1", "short_bid", "leg1_bid")
+    ask2 = _first_numeric(norm, "ask2", "ask_leg2", "ask_2", "long_ask", "leg2_ask")
+
     legs = [
-        _make_leg(1, "Short", right, strike, near, contracts, sp, iv_use),
-        _make_leg(2, "Long", right, strike, far, contracts, sp, iv_use),
+        _make_leg(
+            1,
+            "Short",
+            right,
+            k_short,
+            near,
+            contracts,
+            sp,
+            iv_s,
+            entry_override=bid1,
+        ),
+        _make_leg(
+            2,
+            "Long",
+            right,
+            k_long,
+            far,
+            contracts,
+            sp,
+            iv_l,
+            entry_override=ask2,
+        ),
     ]
-    return legs, None
+    if bid1 is not None:
+        legs[0]["tws_bid"] = float(bid1)
+    if ask2 is not None:
+        legs[1]["tws_ask"] = float(ask2)
+
+    _apply_net_greek_scales(legs, norm, contracts)
+    notice_out = " ".join(notice_parts) if notice_parts else None
+    return legs, None, notice_out
 
 
 def csv_row_on_flag(norm: dict[str, str]) -> bool:
@@ -350,5 +603,7 @@ def verbally_assess_top1(
     else:
         parts.append(f"Vybraný režim: **{sl}**.")
 
-    parts.append("Po odoslaní do Spread Buildera skontroluj striky, expirácie a ceny oproti TWS.")
+    parts.append(
+        "Po odoslaní do Spread Buildera skontroluj striky (kalendár = rovnaký K, diagonál = Leg1/Leg2 K), expirácie a ceny."
+    )
     return " ".join(parts)

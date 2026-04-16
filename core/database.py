@@ -137,6 +137,7 @@ def _migrate_trades(conn: sqlite3.Connection) -> None:
         "commission": "ALTER TABLE trades ADD COLUMN commission REAL DEFAULT 0.0",
         "delta_at_entry": "ALTER TABLE trades ADD COLUMN delta_at_entry REAL",
         "theta_at_entry": "ALTER TABLE trades ADD COLUMN theta_at_entry REAL",
+        "delta_current": "ALTER TABLE trades ADD COLUMN delta_current REAL",
     }
     for col, sql in migrations.items():
         if col not in existing:
@@ -580,6 +581,21 @@ def set_trade_entry_iv_delta_theta(
         )
 
 
+def set_trade_portfolio_greeks(
+    trade_id: int,
+    iv_at_entry: Optional[float],
+    delta_at_entry: Optional[float],
+    theta_at_entry: Optional[float],
+    delta_current: Optional[float],
+) -> None:
+    """Portfolio: IV/Δ/Θ pri vstupe + aktuálna Δ (napr. z TWS) pre sledovanie short nohy."""
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE trades SET iv_at_entry=?, delta_at_entry=?, theta_at_entry=?, delta_current=? WHERE id=?",
+            (iv_at_entry, delta_at_entry, theta_at_entry, delta_current, trade_id),
+        )
+
+
 def bulk_set_group_id(trade_ids: list[int], group_id: str) -> None:
     """Nastaví rovnaké group_id pre viacero obchodov naraz."""
     with get_connection() as conn:
@@ -609,13 +625,14 @@ def split_trade(trade_id: int, group_ids: list[str]) -> list[int]:
                    (ticker, strategy, leg_type, option_type, strike, expiry,
                     contracts, entry_price, entry_date, group_id, iv_at_entry,
                     pop_at_entry, commission, delta_at_entry, theta_at_entry,
-                    exit_price, exit_date, status)
-                   VALUES (?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?)""",
+                    delta_current, exit_price, exit_date, status)
+                   VALUES (?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     t["ticker"], t["strategy"], t["leg_type"], t["option_type"],
                     t["strike"], t["expiry"], t["entry_price"], t["entry_date"],
                     gid if gid else None, t["iv_at_entry"], t["pop_at_entry"],
                     t.get("commission") or 0.0, t.get("delta_at_entry"), t.get("theta_at_entry"),
+                    t.get("delta_current"),
                     t["exit_price"], t["exit_date"], t["status"],
                 ),
             )

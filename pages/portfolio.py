@@ -9,7 +9,6 @@ import math
 from collections import defaultdict
 from datetime import date
 
-import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -18,6 +17,10 @@ from core.page_context import set_tradejournal_page
 
 db.init_db()
 set_tradejournal_page("portfolio")
+
+# Short noha: |Δ aktuálna| vs |Δ vstup| — či sa približuješ k dvojnásobku rizika (delta exposure)
+_SHORT_DELTA_WARN_RATIO = 1.5
+_SHORT_DELTA_ALERT_RATIO = 2.0
 
 st.title("Portfolio")
 st.caption(
@@ -51,8 +54,16 @@ def _notional_per_leg(t: dict) -> float:
 
 
 def _nan_to_none(v) -> float | None:
+    # Streamlit 1.4x občas vráti jednoprvkový list pri úprave NumberColumn
+    if isinstance(v, (list, tuple)) and len(v) == 1:
+        v = v[0]
     if v is None:
         return None
+    try:
+        if pd.isna(v):
+            return None
+    except (ValueError, TypeError):
+        pass
     try:
         x = float(v)
     except (TypeError, ValueError):
@@ -68,6 +79,18 @@ def _entry_float_eq(a: float | None, b: float | None) -> bool:
     if a is None or b is None:
         return False
     return abs(float(a) - float(b)) < 1e-9
+
+
+def _short_delta_abs_ratio(leg_type: str, entry_d: float | None, curr_d: float | None) -> float | None:
+    """Pre Short: |Δ aktuálna| / |Δ vstup|. Iné nohy — None."""
+    if str(leg_type or "").strip() != "Short":
+        return None
+    if entry_d is None or curr_d is None:
+        return None
+    ae = abs(float(entry_d))
+    if ae < 1e-12:
+        return None
+    return abs(float(curr_d)) / ae
 
 
 with st.expander("Filter", expanded=False):
@@ -143,6 +166,7 @@ for gname in _sort_keys:
             iv_e = t.get("iv_at_entry")
             dlt_e = t.get("delta_at_entry")
             th_e = t.get("theta_at_entry")
+            dlt_c = t.get("delta_current")
             rows.append(
                 {
                     "ID": tid,
@@ -156,15 +180,19 @@ for gname in _sort_keys:
                     "Kontr.": int(t.get("contracts") or 1),
                     "Entry $": float(t.get("entry_price") or 0),
                     "Entry dátum": t.get("entry_date") or "",
-                    "Θ vstup ($/deň)": np.nan if th_e is None else float(th_e),
-                    "Δ vstup": np.nan if dlt_e is None else float(dlt_e),
-                    "IV vstup": np.nan if iv_e is None else float(iv_e),
+                    "Θ vstup ($/deň)": pd.NA if th_e is None else float(th_e),
+                    "Δ vstup": pd.NA if dlt_e is None else float(dlt_e),
+                    "Δ aktuálna": pd.NA if dlt_c is None else float(dlt_c),
+                    "IV vstup": pd.NA if iv_e is None else float(iv_e),
                 }
             )
         df = pd.DataFrame(rows)
+        for _c in ("Θ vstup ($/deň)", "Δ vstup", "Δ aktuálna", "IV vstup"):
+            df[_c] = df[_c].astype("Float64")
         st.caption(
-            "Stĺpce **Θ vstup**, **Δ vstup** a **IV vstup** môžeš doplniť alebo zmeniť tu. **IV** ako zlomok (napr. **0,35** = 35 %). "
-            "**Θ** = theta pozície v **USD za deň** (ako súčet z TWS pre nohu). Prázdne bunky = nevyplnené."
+            "Stĺpce **Θ vstup**, **Δ vstup**, **Δ aktuálna** a **IV vstup** môžeš doplniť alebo zmeniť tu. **IV** ako zlomok (napr. **0,35** = 35 %). "
+            "**Θ** = theta pozície v **USD za deň** (ako z TWS). **Δ aktuálna** = aktuálna delta pozície z TWS (pre **Short** nohu pod tabuľkou uvidíš pomer k Δ vstup — varovanie pri ~2×). "
+            "Prázdne bunky = nevyplnené."
         )
         edited = st.data_editor(
             df,
@@ -189,20 +217,66 @@ for gname in _sort_keys:
                 "DTE": st.column_config.NumberColumn(format="%d dní"),
                 "Θ vstup ($/deň)": st.column_config.NumberColumn(
                     format="$%.3f",
+                    step=0.001,
                     help="Theta v USD za deň pre celú nohu (podľa brokera / vlastný zápis).",
                 ),
                 "Δ vstup": st.column_config.NumberColumn(
                     format="%.4f",
-                    help="Delta kontraktu pri otvorení (napr. z TWS), znak podľa long/short.",
+                    step=0.0001,
+                    help="Delta pozície pri otvorení (TWS), znak podľa long/short.",
+                ),
+                "Δ aktuálna": st.column_config.NumberColumn(
+                    format="%.4f",
+                    step=0.0001,
+                    help="Aktuálna delta pozície z TWS — pre short nohu porovnávaj s Δ vstup (pomer nižšie).",
                 ),
                 "IV vstup": st.column_config.NumberColumn(
                     format="%.4f",
+                    step=0.0001,
                     help="Impl. volatilita pri vstupe ako desatinný zlomok (0,30 = 30 %).",
                 ),
             },
             key=f"pf_ed_{_gkey}",
         )
-        if st.button("Uložiť Θ, Δ a IV pre túto skupinu", key=f"pf_sv_{_gkey}", type="primary"):
+        _watch_rows: list[dict] = []
+        for _, row in edited.iterrows():
+            lt = str(row.get("Noha") or "")
+            de = _nan_to_none(row["Δ vstup"])
+            dc = _nan_to_none(row["Δ aktuálna"])
+            ratio = _short_delta_abs_ratio(lt, de, dc)
+            if lt != "Short":
+                p_str, st_lbl = "—", "—"
+            elif ratio is None:
+                p_str, st_lbl = "—", "doplň Δ vstup + Δ aktuálnu"
+            elif ratio >= _SHORT_DELTA_ALERT_RATIO:
+                p_str, st_lbl = f"{ratio:.2f}×", "⛔ |Δ| ≥ 2× oproti vstupu"
+            elif ratio >= _SHORT_DELTA_WARN_RATIO:
+                p_str, st_lbl = f"{ratio:.2f}×", "⚠ blíži sa k 2×"
+            else:
+                p_str, st_lbl = f"{ratio:.2f}×", "OK"
+            _watch_rows.append(
+                {
+                    "ID": int(row["ID"]),
+                    "Ticker": row.get("Ticker") or "",
+                    "Noha": lt,
+                    "|Δ aktuál| / |Δ vstup|": p_str,
+                    "Stav": st_lbl,
+                }
+            )
+        if any(str(r.get("Noha")) == "Short" for r in _watch_rows):
+            st.markdown("##### Sledovanie delty (shortové nohy)")
+            st.caption(
+                f"Porovnanie **aktuálnej delty** (z TWS) s **deltou pri vstupe**. "
+                f"Pomer = |Δ aktuálna| ÷ |Δ vstup|. Varovanie od **{_SHORT_DELTA_WARN_RATIO}×**, "
+                f"silné upozornenie od **{_SHORT_DELTA_ALERT_RATIO}×** (typicky zvýšené riziko pri short opciách)."
+            )
+            st.dataframe(
+                pd.DataFrame(_watch_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        if st.button("Uložiť Θ, Δ, IV a Δ aktuálnu", key=f"pf_sv_{_gkey}", type="primary"):
             nchg = 0
             for _, row in edited.iterrows():
                 tid = int(row["ID"])
@@ -210,16 +284,18 @@ for gname in _sort_keys:
                 new_iv = _nan_to_none(row["IV vstup"])
                 new_d = _nan_to_none(row["Δ vstup"])
                 new_th = _nan_to_none(row["Θ vstup ($/deň)"])
+                new_dc = _nan_to_none(row["Δ aktuálna"])
                 if (
                     not _entry_float_eq(orig.get("iv_at_entry"), new_iv)
                     or not _entry_float_eq(orig.get("delta_at_entry"), new_d)
                     or not _entry_float_eq(orig.get("theta_at_entry"), new_th)
+                    or not _entry_float_eq(orig.get("delta_current"), new_dc)
                 ):
-                    db.set_trade_entry_iv_delta_theta(tid, new_iv, new_d, new_th)
+                    db.set_trade_portfolio_greeks(tid, new_iv, new_d, new_th, new_dc)
                     nchg += 1
             if nchg:
                 st.success(f"Uložené — upravených {nchg} nôh.")
                 st.rerun()
             else:
-                st.info("Žiadna zmena v Θ, Δ alebo IV.")
+                st.info("Žiadna zmena v Θ, Δ, IV ani Δ aktuálnej.")
     st.divider()
