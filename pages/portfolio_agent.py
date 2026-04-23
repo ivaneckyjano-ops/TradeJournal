@@ -15,7 +15,7 @@ from core import database as db
 from core import agent as ai_agent
 from core import ibkr
 from core import portfolio_data as pdata
-from core.page_context import set_tradejournal_page
+from core.page_context import render_ai_chat_markdown, set_tradejournal_page
 
 db.init_db()
 set_tradejournal_page("portfolio_agent")
@@ -124,7 +124,7 @@ with st.sidebar:
     # ── Trhové vstupy: duplicitné voči Symboly — sidebar len skrátená úprava ──
     st.subheader("📊 Trhové dáta pre agenta")
     st.caption(
-        "**Symboly** sú primárny zdroj (vrátane Yahoo sync). Tá istá trojica polí je tu pre rýchlu úpravu "
+        "**Symboly** sú primárny zdroj (Yahoo sync dopĺňa spot/IV/industry, **nie sektor**). Tá istá trojica polí je tu pre rýchlu úpravu "
         "bez opustenia stránky; hlavná tabuľka nižšie (**Otvorené skupiny**) nie je duplicita — je to prehľad pozícií."
     )
     st.page_link("pages/symbols.py", label="Otvoriť Symboly", icon="📌")
@@ -730,17 +730,7 @@ def _agent_archive_current_session(question: str) -> None:
 
 
 def _agent_render_chat_messages(messages: list) -> None:
-    for msg in messages or []:
-        if not isinstance(msg, dict):
-            continue
-        role = msg.get("role")
-        content = msg.get("content") or ""
-        if role == "assistant":
-            with st.chat_message("assistant", avatar="🤖"):
-                st.markdown(content)
-        elif role == "user":
-            with st.chat_message("user", avatar="👤"):
-                st.markdown(content)
+    render_ai_chat_markdown(messages)
 
 
 # ── AI Portfolio Analýza + Chat ───────────────────────────────────────────────

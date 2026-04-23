@@ -2,7 +2,8 @@
 Vrstva na prípravu portfóliových dát – bez závislosti na Streamlit.
 
 Obsahuje:
-  - calc_dte / normalize_expiry  – pomocné utility
+  - calc_dte / normalize_expiry / journal_position_key – pomocné utility a kľúč denník ↔ TWS OPT
+  - ib_opt_greeks_scaled_for_journal – BS z fetch_positions → journal mierka (Δ/Θ$/Vega za nohu)
   - greek_for_trade              – získa Greeks z IBKR cache alebo Black-Scholes
   - build_group_data             – obohatí skupiny o Greeks, DTE, net metriky
   - build_alerts                 – textové upozornenia (DTE, theta, IV rank)
@@ -46,6 +47,53 @@ def normalize_expiry(exp: str) -> str:
     if len(exp) == 8 and "-" not in exp:
         return f"{exp[:4]}-{exp[4:6]}-{exp[6:]}"
     return exp
+
+
+def journal_position_key(ticker, strike, expiry, opt_type, leg_type) -> tuple:
+    """Kľúč pre zhodu denník ↔ TWS OPT (expirácia vždy YYYYMMDD)."""
+    exp_c = normalize_expiry(str(expiry or "")).replace("-", "")
+    return (
+        str(ticker).upper(),
+        f"{float(strike or 0):.2f}",
+        exp_c,
+        str(opt_type).capitalize(),
+        str(leg_type).capitalize(),
+    )
+
+
+def ib_opt_greeks_scaled_for_journal(p: dict) -> dict[str, Optional[float]]:
+    """
+    Z per-share BS polí v riadku ``fetch_positions`` (delta, theta, vega, iv) spraví
+    hodnoty v rovnakej mierke ako stĺpce journalu: Δ a Vega za celú nohu, Θ v USD/deň.
+    """
+    if p.get("sec_type") not in ("OPT", "FOP"):
+        return {"delta": None, "theta_usd": None, "vega": None, "iv": None}
+    q = float(p.get("contracts") or 1)
+    sign = -1.0 if str(p.get("leg_type") or "") == "Short" else 1.0
+    mult = q * 100.0
+
+    def _scaled(name: str) -> Optional[float]:
+        v = p.get(name)
+        if v is None:
+            return None
+        try:
+            return float(v) * mult * sign
+        except (TypeError, ValueError):
+            return None
+
+    iv_out: Optional[float] = None
+    iv = p.get("iv")
+    if iv is not None:
+        try:
+            iv_out = float(iv)
+        except (TypeError, ValueError):
+            pass
+    return {
+        "delta": _scaled("delta"),
+        "theta_usd": _scaled("theta"),
+        "vega": _scaled("vega"),
+        "iv": iv_out,
+    }
 
 
 def calc_dte(expiry_str: Optional[str]) -> Optional[int]:

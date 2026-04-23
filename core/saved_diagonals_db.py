@@ -113,7 +113,7 @@ def list_saved(ticker: Optional[str] = None) -> pd.DataFrame:
         d = json.loads(r["row_json"])
         d["ID"] = int(r["id"])
         d["Uložené"] = r["created_at"]
-        d["Ticker uloženia"] = r["ticker"]
+        d["Ticker"] = r["ticker"]
         d["Snímka uloženia"] = r["as_of_date"]
         d["Stratégia ID"] = r["strategy_id"]
         out_rows.append(d)

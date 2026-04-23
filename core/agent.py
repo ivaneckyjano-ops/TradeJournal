@@ -618,6 +618,81 @@ def chat_spread_builder(history: list[dict], model: str | None = None) -> str:
     return message.content[0].text
 
 
+def build_diagonal_compare_analysis_prompt(
+    protocol_md: str, *, user_note: str = ""
+) -> str:
+    """
+    Prvá analýza pre sekcii „Konzultácia s agentom“ po **porovnaní 2+** uložených diagonál
+    (celý Markdown protokol, nie Jeden spread z Buildera).
+    """
+    u = (user_note or "").strip()
+    extra = f"\n## Doplňujúce pokyny od obchodníka:\n{u}\n" if u else ""
+    body = (protocol_md or "").strip() or "*(Protokol bol prázdny.)*"
+    return f"""Si skúsený obchodník s opciami (long call/put diagonaly). Dostal si **protokol** z TradeJournal: porovnanie **viacerých** uložených kandidátov (kompozit: bázové skóre + short bid), **nie** jediný rozvinutý spread z Spread Buildera.
+{extra}
+## Protokol (celý):
+{body}
+
+Odpovedaj v slovenčine, bez LaTeX, ceny ako 190 USD. Do 450 slov. Formát:
+
+## Ako čítať poradie a stĺpec Skóre
+(že **B** je min–max v sade, nie absolútna 0–100; pri veľmi malej |delta| môžu byť čísla v tabuľke vysoké; či 1. miesto vždy dáva zmysel reálne obchodovať)
+
+## Prakticky medzi týmito kandidátmi
+(vrstva likvidity / bid vs. theta, čo ešte overiť u brokera alebo v platforme)
+
+## Hlavné riziká
+(krátke, konkrétne)
+
+## Záver
+(žiadne investičné poradenstvo; 2–3 vety čo ešte skontrolovať pred prípadným výberom 1. vs. 2. miesta)
+"""
+
+
+def chat_diagonal_compare(history: list[dict], model: str | None = None) -> str:
+    """
+    Pokračovanie chatu po prvej analýze porovnania diagonál (2+ záznamy, protokol v kontexte).
+    """
+    client = _load_client()
+    m, max_tok = _resolve_model(model)
+
+    api_messages: list[dict] = []
+    for i, msg in enumerate(history):
+        role = msg.get("role")
+        content = msg.get("content") or ""
+        if i == 0 and role == "assistant":
+            api_messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Práve si dokončil túto analýzu z porovnania uložených diagonál (protokol v prvej správe z užívateľského kontextu):\n\n"
+                        f"{content}\n\n"
+                        "Buď pripravený na doplňujúce otázky k uvedenému porovnaniu, poradiu, likvidite a rizikám. "
+                        "Nemáš živé dáta z platformy, len text protokolu a konverzácie."
+                    ),
+                }
+            )
+            api_messages.append(
+                {
+                    "role": "assistant",
+                    "content": "Rozumiem. Som pripravený odpovedať na doplňujúce otázky k tomuto porovnaniu diagonál.",
+                }
+            )
+        else:
+            api_messages.append({"role": role, "content": content})
+
+    message = client.messages.create(
+        model=m,
+        max_tokens=max_tok,
+        system=(
+            "Si skúsený obchodník s opciami. Pokračuješ v konverzácii o **porovnaní viacerých uložených diagonál** (TradeJournal). "
+            "Píš v slovenčine. Buď konkrétny. Ceny ako '190 USD', bez LaTeX."
+        ),
+        messages=api_messages,
+    )
+    return message.content[0].text
+
+
 def analyze_group(
     group: dict,
     trades: list[dict],

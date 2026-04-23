@@ -66,11 +66,14 @@ def test_search_diagonal_prefers_low_delta_error_and_high_net_theta():
                 max_strikes_per_expiry=50,
             )
             assert not out.empty
-            assert "Čistá delta" in out.columns
+            assert any("čistá delta" in str(c).lower() for c in out.columns)
             assert any(c.startswith("Čistá theta") for c in out.columns)
             assert any("Debit" in c and "100" in c for c in out.columns)
             assert "Short — bid" in out.columns and "Long — ask" in out.columns
             assert "Short — DTE" in out.columns and "Long — DTE" in out.columns
+            assert any("čistá vega" in str(c).lower() for c in out.columns)
+            assert "Čistá gamma" in out.columns
+            assert "Skóre" in out.columns
         finally:
             odb.OPTION_CHAINS_DIR = old
             p = os.path.join(td, "DIAG.db")
@@ -136,6 +139,196 @@ def test_strike_band_filters_rows():
                 os.remove(p)
 
 
+def test_rank_mode_score_non_increasing_skore():
+    with tempfile.TemporaryDirectory() as td:
+        old = odb.OPTION_CHAINS_DIR
+        odb.OPTION_CHAINS_DIR = td
+        try:
+            conn = odb.get_connection("SCORE")
+            odb.init_schema(conn)
+            as_of = "2026-04-16"
+            for exp, strike, d, th in [
+                ("2026-06-01", "100", "0.50", "-0.10"),
+                ("2026-06-01", "105", "0.48", "-0.09"),
+                ("2026-09-01", "100", "0.52", "-0.04"),
+                ("2026-09-01", "105", "0.50", "-0.03"),
+            ]:
+                odb.import_merged_dataframe(
+                    conn,
+                    expiry=exp,
+                    as_of_date=as_of,
+                    merged=_merged_row(strike, d, th, "Call"),
+                    source_options_csv="o.csv",
+                    source_greeks_csv="g.csv",
+                )
+            conn.close()
+            out = dss.search_diagonal_spreads(
+                "SCORE",
+                as_of_date=as_of,
+                strategy="long_call_diagonal",
+                target_net_delta=0.0,
+                top_n=10,
+                max_strikes_per_expiry=50,
+                options=dss.DiagonalSearchOptions(rank_mode="score"),
+            )
+            assert not out.empty
+            assert "Skóre" in out.columns
+            dl_col = next(c for c in out.columns if "delta" in str(c).lower() and "čistá" in str(c).lower())
+            th_col = next(c for c in out.columns if "theta" in str(c).lower() and "čistá" in str(c).lower())
+            vg_col = next(c for c in out.columns if "vega" in str(c).lower() and "čistá" in str(c).lower())
+            assert "×100" in str(dl_col)
+            assert "×100" in str(th_col)
+            assert "×100" in str(vg_col)
+            s = pd.to_numeric(out["Skóre"], errors="coerce").dropna().tolist()
+            for i in range(len(s) - 1):
+                assert s[i] >= s[i + 1] - 1e-9
+        finally:
+            odb.OPTION_CHAINS_DIR = old
+            p = os.path.join(td, "SCORE.db")
+            if os.path.isfile(p):
+                os.remove(p)
+
+
+def test_net_theta_max_can_empty_results():
+    with tempfile.TemporaryDirectory() as td:
+        old = odb.OPTION_CHAINS_DIR
+        odb.OPTION_CHAINS_DIR = td
+        try:
+            conn = odb.get_connection("TMAX")
+            odb.init_schema(conn)
+            as_of = "2026-04-16"
+            for exp, strike, d, th in [
+                ("2026-06-01", "100", "0.50", "-0.10"),
+                ("2026-09-01", "100", "0.52", "-0.04"),
+            ]:
+                odb.import_merged_dataframe(
+                    conn,
+                    expiry=exp,
+                    as_of_date=as_of,
+                    merged=_merged_row(strike, d, th, "Call"),
+                    source_options_csv="o.csv",
+                    source_greeks_csv="g.csv",
+                )
+            conn.close()
+            broad = dss.search_diagonal_spreads(
+                "TMAX",
+                as_of_date=as_of,
+                strategy="long_call_diagonal",
+                top_n=20,
+                max_strikes_per_expiry=50,
+            )
+            narrow = dss.search_diagonal_spreads(
+                "TMAX",
+                as_of_date=as_of,
+                strategy="long_call_diagonal",
+                top_n=20,
+                max_strikes_per_expiry=50,
+                options=dss.DiagonalSearchOptions(net_theta_max=-1.0, theta_scale_contracts=False),
+            )
+            assert not broad.empty
+            assert narrow.empty
+        finally:
+            odb.OPTION_CHAINS_DIR = old
+            p = os.path.join(td, "TMAX.db")
+            if os.path.isfile(p):
+                os.remove(p)
+
+
+def test_diagonal_relax_suggestions_lists_dte_when_far_min_high():
+    opt = dss.DiagonalSearchOptions(
+        dte_far_min=90,
+        theta_scale_contracts=True,
+        net_theta_min=3.0,
+        net_vega_min=0.10,
+        short_otm_min=0.10,
+        spot=100.0,
+        min_open_interest=100,
+    )
+    md = dss.diagonal_relax_suggestions_markdown(opt)
+    assert "dte" in md.lower() and "90" in md
+    assert "širšie filtre" in md.lower()
+
+
+def test_diagonal_search_why_empty_hint_flags_strict_dte():
+    with tempfile.TemporaryDirectory() as td:
+        old = odb.OPTION_CHAINS_DIR
+        odb.OPTION_CHAINS_DIR = td
+        try:
+            conn = odb.get_connection("HINT")
+            odb.init_schema(conn)
+            as_of = "2026-04-16"
+            for exp, strike, d, th in [
+                ("2026-05-15", "100", "0.50", "-0.10"),
+                ("2026-06-15", "100", "0.48", "-0.09"),
+                ("2026-07-15", "100", "0.46", "-0.08"),
+            ]:
+                odb.import_merged_dataframe(
+                    conn,
+                    expiry=exp,
+                    as_of_date=as_of,
+                    merged=_merged_row(strike, d, th, "Call"),
+                    source_options_csv="o.csv",
+                    source_greeks_csv="g.csv",
+                )
+            conn.close()
+            strict = dss.DiagonalSearchOptions(
+                dte_near_min=0,
+                dte_near_max=500,
+                dte_far_min=95,
+                dte_far_max=400,
+            )
+            hint = dss.diagonal_search_why_empty_hint(
+                "HINT", as_of_date=as_of, strategy="long_call_diagonal", opt=strict
+            )
+            assert "Neskoršia min" in hint or "neskoršej" in hint or "DTE" in hint
+        finally:
+            odb.OPTION_CHAINS_DIR = old
+            p = os.path.join(td, "HINT.db")
+            if os.path.isfile(p):
+                os.remove(p)
+
+
+def test_min_open_interest_when_oi_missing_in_import_still_finds_rows():
+    """CSV bez OI — starý filter fillna(0) vyhodil všetko pri min. OI 100."""
+    with tempfile.TemporaryDirectory() as td:
+        old = odb.OPTION_CHAINS_DIR
+        odb.OPTION_CHAINS_DIR = td
+        try:
+            conn = odb.get_connection("NOOI")
+            odb.init_schema(conn)
+            as_of = "2026-04-16"
+            for exp, strike, d, th in [
+                ("2026-06-01", "100", "0.50", "-0.10"),
+                ("2026-06-01", "105", "0.48", "-0.09"),
+                ("2026-09-01", "100", "0.52", "-0.04"),
+                ("2026-09-01", "105", "0.50", "-0.03"),
+            ]:
+                odb.import_merged_dataframe(
+                    conn,
+                    expiry=exp,
+                    as_of_date=as_of,
+                    merged=_merged_row(strike, d, th, "Call"),
+                    source_options_csv="o.csv",
+                    source_greeks_csv="g.csv",
+                )
+            conn.close()
+            out = dss.search_diagonal_spreads(
+                "NOOI",
+                as_of_date=as_of,
+                strategy="long_call_diagonal",
+                target_net_delta=0.0,
+                top_n=10,
+                max_strikes_per_expiry=50,
+                options=dss.DiagonalSearchOptions(min_open_interest=100),
+            )
+            assert not out.empty
+        finally:
+            odb.OPTION_CHAINS_DIR = old
+            p = os.path.join(td, "NOOI.db")
+            if os.path.isfile(p):
+                os.remove(p)
+
+
 def test_list_as_of_dates_empty_chain():
     with tempfile.TemporaryDirectory() as td:
         old = odb.OPTION_CHAINS_DIR
@@ -146,5 +339,444 @@ def test_list_as_of_dates_empty_chain():
         finally:
             odb.OPTION_CHAINS_DIR = old
             p = os.path.join(td, "EMPTYCHAIN.db")
+            if os.path.isfile(p):
+                os.remove(p)
+
+
+def test_progressive_strike_band_not_reported_as_dte_gate_failure():
+    """Ak je prázdne len kvôli **úzkemu pásu strike-ov**, brána DTE nesmie hlásiť zlyhanie na DTE (dáta a DTE pás môžu inak sedieť)."""
+    with tempfile.TemporaryDirectory() as td:
+        old = odb.OPTION_CHAINS_DIR
+        odb.OPTION_CHAINS_DIR = td
+        try:
+            conn = odb.get_connection("STKBR")
+            odb.init_schema(conn)
+            as_of = "2026-04-16"
+            for exp, strike, d, th in [
+                ("2026-06-01", "100", "0.50", "-0.10"),
+                ("2026-06-01", "105", "0.48", "-0.09"),
+                ("2026-09-01", "100", "0.52", "-0.04"),
+                ("2026-09-01", "105", "0.50", "-0.03"),
+            ]:
+                odb.import_merged_dataframe(
+                    conn,
+                    expiry=exp,
+                    as_of_date=as_of,
+                    merged=_merged_row(strike, d, th, "Call"),
+                    source_options_csv="o.csv",
+                    source_greeks_csv="g.csv",
+                )
+            conn.close()
+            opt = dss.DiagonalSearchOptions(
+                dte_near_min=40,
+                dte_near_max=55,
+                dte_far_min=90,
+                dte_far_max=140,
+                delta_tolerance=2.0,
+                net_theta_min=3.0,
+                net_theta_max=8.0,
+            )
+            out, flog, _ = dss.progressive_filter_search(
+                "STKBR",
+                as_of_date=as_of,
+                strategy="long_call_diagonal",
+                top_n=10,
+                max_strikes_per_expiry=50,
+                strike_min=200.0,
+                strike_max=300.0,
+                options=opt,
+                max_relax_iterations=2,
+            )
+            assert out.empty
+            for step in flog.failure_steps or []:
+                if step.field == "dte_near_min/dte_near_max/dte_far_min/dte_far_max":
+                    raise AssertionError(
+                        "Úzky rozsah strike-ov nemal byť interpretovaný ako nevyhovujúce DTE pásma."
+                    )
+        finally:
+            odb.OPTION_CHAINS_DIR = old
+            p = os.path.join(td, "STKBR.db")
+            if os.path.isfile(p):
+                os.remove(p)
+
+
+def test_progressive_one_expiry_does_not_misblame_dte():
+    """Len **jedna** expirácia s Call — diagonál nie je; nesmie sa hneď hlásiť agregované zlyhanie na DTE."""
+    with tempfile.TemporaryDirectory() as td:
+        old = odb.OPTION_CHAINS_DIR
+        odb.OPTION_CHAINS_DIR = td
+        try:
+            conn = odb.get_connection("ONEEXP")
+            odb.init_schema(conn)
+            as_of = "2026-04-16"
+            for strike, d, th in [("100", "0.50", "-0.10"), ("105", "0.48", "-0.09")]:
+                odb.import_merged_dataframe(
+                    conn,
+                    expiry="2026-09-01",
+                    as_of_date=as_of,
+                    merged=_merged_row(strike, d, th, "Call"),
+                    source_options_csv="o.csv",
+                    source_greeks_csv="g.csv",
+                )
+            conn.close()
+            opt = dss.DiagonalSearchOptions(
+                dte_near_min=10,
+                dte_near_max=200,
+                dte_far_min=20,
+                dte_far_max=300,
+            )
+            out, flog, _ = dss.progressive_filter_search(
+                "ONEEXP",
+                as_of_date=as_of,
+                strategy="long_call_diagonal",
+                top_n=5,
+                max_strikes_per_expiry=50,
+                options=opt,
+            )
+            assert out.empty
+            for step in flog.failure_steps or []:
+                if step.field == "dte_near_min/dte_near_max/dte_far_min/dte_far_max":
+                    raise AssertionError("Pri jedinej expirácii to nie je chyba DTE pásiem.")
+        finally:
+            odb.OPTION_CHAINS_DIR = old
+            p = os.path.join(td, "ONEEXP.db")
+            if os.path.isfile(p):
+                os.remove(p)
+
+
+def test_first_calendar_dte_pair_is_earliest_two_expiries():
+    with tempfile.TemporaryDirectory() as td:
+        old = odb.OPTION_CHAINS_DIR
+        odb.OPTION_CHAINS_DIR = td
+        try:
+            conn = odb.get_connection("CAL1")
+            odb.init_schema(conn)
+            as_of = "2026-04-16"
+            for exp, strike, d, th in [
+                ("2026-08-21", "100", "0.50", "-0.10"),
+                ("2026-05-15", "100", "0.50", "-0.10"),
+                ("2026-06-18", "100", "0.52", "-0.04"),
+            ]:
+                odb.import_merged_dataframe(
+                    conn,
+                    expiry=exp,
+                    as_of_date=as_of,
+                    merged=_merged_row(strike, d, th, "Call"),
+                    source_options_csv="o.csv",
+                    source_greeks_csv="g.csv",
+                )
+            conn.close()
+            pair = dss.first_calendar_dte_pair("CAL1", as_of, "long_call_diagonal")
+            assert pair is not None
+            assert pair["expiry_near"] == "2026-05-15"
+            assert pair["expiry_far"] == "2026-06-18"
+        finally:
+            odb.OPTION_CHAINS_DIR = old
+            p = os.path.join(td, "CAL1.db")
+            if os.path.isfile(p):
+                os.remove(p)
+
+
+def test_first_dte_pair_within_bounds_returns_first_matching_pair():
+    with tempfile.TemporaryDirectory() as td:
+        old = odb.OPTION_CHAINS_DIR
+        odb.OPTION_CHAINS_DIR = td
+        try:
+            conn = odb.get_connection("PAIR1")
+            odb.init_schema(conn)
+            as_of = "2026-04-16"
+            for exp, strike, d, th in [
+                ("2026-05-15", "100", "0.50", "-0.10"),
+                ("2026-06-18", "100", "0.52", "-0.04"),
+                ("2026-08-21", "100", "0.54", "-0.03"),
+            ]:
+                odb.import_merged_dataframe(
+                    conn,
+                    expiry=exp,
+                    as_of_date=as_of,
+                    merged=_merged_row(strike, d, th, "Call"),
+                    source_options_csv="o.csv",
+                    source_greeks_csv="g.csv",
+                )
+            conn.close()
+            opt = dss.DiagonalSearchOptions(
+                dte_near_min=20,
+                dte_near_max=40,
+                dte_far_min=50,
+                dte_far_max=80,
+            )
+            pair = dss.first_dte_pair_within_bounds("PAIR1", as_of, "long_call_diagonal", opt)
+            assert pair is not None
+            assert pair["expiry_near"] == "2026-05-15"
+            assert pair["expiry_far"] == "2026-06-18"
+            assert pair["dte_near"] == 29
+            assert pair["dte_far"] == 63
+        finally:
+            odb.OPTION_CHAINS_DIR = old
+            p = os.path.join(td, "PAIR1.db")
+            if os.path.isfile(p):
+                os.remove(p)
+
+
+def test_progressive_filter_search_does_not_relax_dte_when_dte_far_min_blocks():
+    """Prvé hľadanie prázdne kvôli príliš prísnej **neskoršej** min. DTE — zjemnenie DTE sa nespúšťa (výsledok ostane prázdny)."""
+    with tempfile.TemporaryDirectory() as td:
+        old = odb.OPTION_CHAINS_DIR
+        odb.OPTION_CHAINS_DIR = td
+        try:
+            conn = odb.get_connection("PROG")
+            odb.init_schema(conn)
+            as_of = "2026-04-16"
+            for exp, strike, d, th in [
+                ("2026-06-01", "100", "0.50", "-0.10"),
+                ("2026-06-01", "105", "0.48", "-0.09"),
+                ("2026-09-01", "100", "0.52", "-0.04"),
+                ("2026-09-01", "105", "0.50", "-0.03"),
+            ]:
+                odb.import_merged_dataframe(
+                    conn,
+                    expiry=exp,
+                    as_of_date=as_of,
+                    merged=_merged_row(strike, d, th, "Call"),
+                    source_options_csv="o.csv",
+                    source_greeks_csv="g.csv",
+                )
+            conn.close()
+            strict = dss.DiagonalSearchOptions(
+                dte_near_min=0,
+                dte_near_max=500,
+                dte_far_min=200,
+                dte_far_max=500,
+            )
+            empty = dss.search_diagonal_spreads(
+                "PROG",
+                as_of_date=as_of,
+                strategy="long_call_diagonal",
+                top_n=10,
+                max_strikes_per_expiry=50,
+                options=strict,
+            )
+            assert empty.empty
+
+            out, flog, eff = dss.progressive_filter_search(
+                "PROG",
+                as_of_date=as_of,
+                strategy="long_call_diagonal",
+                top_n=10,
+                max_strikes_per_expiry=50,
+                options=strict,
+                max_relax_iterations=5,
+            )
+            assert out.empty
+            assert not flog.any_relaxed
+            assert int(eff.dte_far_min) == 200
+        finally:
+            odb.OPTION_CHAINS_DIR = old
+            p = os.path.join(td, "PROG.db")
+            if os.path.isfile(p):
+                os.remove(p)
+
+
+def test_progressive_filter_search_failure_report_lists_trace_and_criteria():
+    """Jedna expirácia — diagonál nikdy nevznikne; postupné zjemnenie zaznamená neúspechy."""
+    with tempfile.TemporaryDirectory() as td:
+        old = odb.OPTION_CHAINS_DIR
+        odb.OPTION_CHAINS_DIR = td
+        try:
+            conn = odb.get_connection("FAIL1")
+            odb.init_schema(conn)
+            as_of = "2026-04-16"
+            odb.import_merged_dataframe(
+                conn,
+                expiry="2026-09-01",
+                as_of_date=as_of,
+                merged=_merged_row("100", "0.50", "-0.10", "Call"),
+                source_options_csv="o.csv",
+                source_greeks_csv="g.csv",
+            )
+            conn.close()
+            strict = dss.DiagonalSearchOptions(
+                dte_near_min=10,
+                dte_near_max=400,
+                dte_far_min=30,
+                dte_far_max=500,
+                delta_tolerance=0.5,
+            )
+            out, flog, last_eff = dss.progressive_filter_search(
+                "FAIL1",
+                as_of_date=as_of,
+                strategy="long_call_diagonal",
+                top_n=10,
+                max_strikes_per_expiry=50,
+                options=strict,
+                max_relax_iterations=2,
+            )
+            assert out.empty
+            assert flog.failure_steps
+            md = flog.failure_report_markdown(initial_opt=strict, last_tried_opt=last_eff)
+            assert "Kde sa to zastavilo" in md
+            assert "Posledné vyskúšané" in md
+            assert "vstupné kritériá" in md.lower()
+        finally:
+            odb.OPTION_CHAINS_DIR = old
+            p = os.path.join(td, "FAIL1.db")
+            if os.path.isfile(p):
+                os.remove(p)
+
+
+def test_progressive_filter_search_no_op_when_first_search_ok():
+    with tempfile.TemporaryDirectory() as td:
+        old = odb.OPTION_CHAINS_DIR
+        odb.OPTION_CHAINS_DIR = td
+        try:
+            conn = odb.get_connection("PROG2")
+            odb.init_schema(conn)
+            as_of = "2026-04-16"
+            for exp, strike, d, th in [
+                ("2026-06-01", "100", "0.50", "-0.10"),
+                ("2026-09-01", "100", "0.52", "-0.04"),
+            ]:
+                odb.import_merged_dataframe(
+                    conn,
+                    expiry=exp,
+                    as_of_date=as_of,
+                    merged=_merged_row(strike, d, th, "Call"),
+                    source_options_csv="o.csv",
+                    source_greeks_csv="g.csv",
+                )
+            conn.close()
+            base = dss.search_diagonal_spreads(
+                "PROG2",
+                as_of_date=as_of,
+                strategy="long_call_diagonal",
+                top_n=10,
+                max_strikes_per_expiry=50,
+            )
+            out, flog, eff = dss.progressive_filter_search(
+                "PROG2",
+                as_of_date=as_of,
+                strategy="long_call_diagonal",
+                top_n=10,
+                max_strikes_per_expiry=50,
+            )
+            assert not out.empty
+            assert len(out) == len(base)
+            assert flog.any_relaxed is False
+            assert not flog.steps
+            assert eff.delta_tolerance is None
+        finally:
+            odb.OPTION_CHAINS_DIR = old
+            p = os.path.join(td, "PROG2.db")
+            if os.path.isfile(p):
+                os.remove(p)
+
+
+def test_build_delta_search_protocol_markdown_empty_and_nonempty():
+    opt = dss.DiagonalSearchOptions(delta_tolerance=1.0, net_theta_min=0.05)
+    flog_empty = dss.FilterLog(steps=[], final_rows=0, any_relaxed=False, failure_steps=None)
+    md0 = dss.build_delta_search_protocol_markdown(
+        ticker="XX",
+        as_of_date="2026-01-01",
+        strategy="long_call_diagonal",
+        target_net_delta=0.0,
+        top_n=10,
+        max_strikes_per_expiry=40,
+        strike_min=None,
+        strike_max=None,
+        initial_options=opt,
+        effective_options=opt,
+        filter_log=flog_empty,
+        result=pd.DataFrame(),
+    )
+    assert "XX" in md0
+    assert "Výsledok: 0 riadkov" in md0
+    assert "```json" in md0
+    assert "delta_tolerance" in md0
+
+    tiny = pd.DataFrame({"Čistá delta ×100": [1.0], "Short — strike": [100.0]})
+    flog_ok = dss.FilterLog(steps=[], final_rows=1, any_relaxed=False, failure_steps=None)
+    md1 = dss.build_delta_search_protocol_markdown(
+        ticker="YY",
+        as_of_date="2026-01-01",
+        strategy="short_put_diagonal",
+        target_net_delta=-0.1,
+        top_n=5,
+        max_strikes_per_expiry=30,
+        strike_min=90.0,
+        strike_max=110.0,
+        initial_options=opt,
+        effective_options=opt,
+        filter_log=flog_ok,
+        result=tiny,
+        preview_rows=5,
+    )
+    assert "YY" in md1
+    assert "Výsledok: 1 riadkov" in md1
+    assert "90" in md1 and "110" in md1
+    assert "Čistá delta" in md1
+
+
+def test_next_relax_short_otm_min_last_step_disables_filter():
+    """Posledný krok v RELAX_STEPS musí nastaviť filter na None (predtým sa kvôli ``None`` slučka nevykonala)."""
+    v = dss._next_relax_value("short_otm_min", 0.02)
+    assert dss._opt_value_from_relax_token("short_otm_min", v) is None
+
+
+def test_progressive_filter_search_phase2_combined_can_find_rows():
+    """Ak izolované zjemnenie nič nenájde, 2. fáza uvoľní všetky filtre naraz."""
+    with tempfile.TemporaryDirectory() as td:
+        old = odb.OPTION_CHAINS_DIR
+        odb.OPTION_CHAINS_DIR = td
+        try:
+            conn = odb.get_connection("PH2")
+            odb.init_schema(conn)
+            as_of = "2026-04-16"
+            for exp, strike, d, th in [
+                ("2026-06-01", "100", "0.50", "-0.10"),
+                ("2026-06-01", "105", "0.48", "-0.09"),
+                ("2026-09-01", "100", "0.52", "-0.04"),
+                ("2026-09-01", "105", "0.50", "-0.03"),
+            ]:
+                odb.import_merged_dataframe(
+                    conn,
+                    expiry=exp,
+                    as_of_date=as_of,
+                    merged=_merged_row(strike, d, th, "Call"),
+                    source_options_csv="o.csv",
+                    source_greeks_csv="g.csv",
+                )
+            conn.close()
+            impossible = dss.DiagonalSearchOptions(
+                dte_near_min=0,
+                dte_near_max=500,
+                dte_far_min=30,
+                dte_far_max=500,
+                net_theta_min=1e9,
+                theta_scale_contracts=False,
+            )
+            solo = dss.search_diagonal_spreads(
+                "PH2",
+                as_of_date=as_of,
+                strategy="long_call_diagonal",
+                top_n=10,
+                max_strikes_per_expiry=50,
+                options=impossible,
+            )
+            assert solo.empty
+            out, flog, eff = dss.progressive_filter_search(
+                "PH2",
+                as_of_date=as_of,
+                strategy="long_call_diagonal",
+                top_n=10,
+                max_strikes_per_expiry=50,
+                options=impossible,
+                max_relax_iterations=2,
+            )
+            assert not out.empty
+            assert flog.cumulative_relaxed
+            assert flog.cumulative_attempted
+        finally:
+            odb.OPTION_CHAINS_DIR = old
+            p = os.path.join(td, "PH2.db")
             if os.path.isfile(p):
                 os.remove(p)

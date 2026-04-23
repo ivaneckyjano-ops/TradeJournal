@@ -2,7 +2,7 @@ import json
 import os
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "journal.db")
 
@@ -95,6 +95,9 @@ def init_db() -> None:
     _migrate_steady_yields_alerts(get_connection())
     _migrate_symbol_market_snapshots(get_connection())
     _migrate_symbol_ib_option_snapshots(get_connection())
+    _migrate_sector_performance_snapshots(get_connection())
+    _migrate_ticker_correlation_data(get_connection())
+    _migrate_trade_journal_greeks(get_connection())
     with get_connection() as conn:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_events_date ON events (date)")
         conn.commit()
@@ -144,6 +147,35 @@ def _migrate_trades(conn: sqlite3.Connection) -> None:
             conn.execute(sql)
     conn.commit()
     conn.close()
+
+
+def _migrate_trade_journal_greeks(conn: sqlite3.Connection) -> None:
+    """Vega / aktuálna IV a Θ + časová história Grékov pre journal (bez TWS)."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(trades)").fetchall()}
+    for col, sql in {
+        "vega_at_entry": "ALTER TABLE trades ADD COLUMN vega_at_entry REAL",
+        "vega_current": "ALTER TABLE trades ADD COLUMN vega_current REAL",
+        "iv_current": "ALTER TABLE trades ADD COLUMN iv_current REAL",
+        "theta_current": "ALTER TABLE trades ADD COLUMN theta_current REAL",
+    }.items():
+        if col not in existing:
+            conn.execute(sql)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS trade_greek_snapshots (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_id     INTEGER NOT NULL REFERENCES trades(id) ON DELETE CASCADE,
+            recorded_at  TEXT NOT NULL,
+            delta          REAL,
+            theta_usd      REAL,
+            vega           REAL,
+            iv             REAL,
+            source         TEXT DEFAULT 'journal'
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tgs_trade_time ON trade_greek_snapshots (trade_id, recorded_at)"
+    )
+    conn.commit()
 
 
 def _migrate_group_apr_snapshots(conn: sqlite3.Connection) -> None:
@@ -587,13 +619,81 @@ def set_trade_portfolio_greeks(
     delta_at_entry: Optional[float],
     theta_at_entry: Optional[float],
     delta_current: Optional[float],
+    *,
+    vega_at_entry: Optional[float] = None,
+    vega_current: Optional[float] = None,
+    iv_current: Optional[float] = None,
+    theta_current: Optional[float] = None,
 ) -> None:
-    """Portfolio: IV/Δ/Θ pri vstupe + aktuálna Δ (napr. z TWS) pre sledovanie short nohy."""
+    """
+    Journal / Portfolio: vstupné a aktuálne Gréky + IV v denníku (doplnenie oproti TWS).
+    ``None`` pri volaní znamená „nezmenené“ len ak volajúci posiela výhradne staré API — pri úplnom zápise z UI pošli všetky hodnoty z riadka.
+    """
     with get_connection() as conn:
         conn.execute(
-            "UPDATE trades SET iv_at_entry=?, delta_at_entry=?, theta_at_entry=?, delta_current=? WHERE id=?",
-            (iv_at_entry, delta_at_entry, theta_at_entry, delta_current, trade_id),
+            "UPDATE trades SET iv_at_entry=?, delta_at_entry=?, theta_at_entry=?, delta_current=?, "
+            "vega_at_entry=?, vega_current=?, iv_current=?, theta_current=? WHERE id=?",
+            (
+                iv_at_entry,
+                delta_at_entry,
+                theta_at_entry,
+                delta_current,
+                vega_at_entry,
+                vega_current,
+                iv_current,
+                theta_current,
+                trade_id,
+            ),
         )
+
+
+def insert_trade_greek_snapshot(
+    trade_id: int,
+    *,
+    delta: Optional[float] = None,
+    theta_usd: Optional[float] = None,
+    vega: Optional[float] = None,
+    iv: Optional[float] = None,
+    recorded_at: Optional[str] = None,
+    source: str = "journal",
+) -> int:
+    """Uloží jeden bod časovej série Grékov pre nohu (od otvorenia po uzavretie)."""
+    rid = int(trade_id)
+    if rid <= 0:
+        raise ValueError("trade_id")
+    ts = recorded_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    src = (source or "journal").strip() or "journal"
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO trade_greek_snapshots (trade_id, recorded_at, delta, theta_usd, vega, iv, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (rid, ts, delta, theta_usd, vega, iv, src),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def list_trade_greek_snapshots(trade_id: int, limit: int = 800) -> list[dict[str, Any]]:
+    lim = max(1, min(int(limit), 5000))
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, trade_id, recorded_at, delta, theta_usd, vega, iv, source
+            FROM trade_greek_snapshots WHERE trade_id=?
+            ORDER BY recorded_at ASC, id ASC
+            LIMIT ?
+            """,
+            (int(trade_id), lim),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_trade_by_id(trade_id: int) -> Optional[dict[str, Any]]:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM trades WHERE id=?", (int(trade_id),)).fetchone()
+    return dict(row) if row else None
 
 
 def bulk_set_group_id(trade_ids: list[int], group_id: str) -> None:
@@ -625,14 +725,19 @@ def split_trade(trade_id: int, group_ids: list[str]) -> list[int]:
                    (ticker, strategy, leg_type, option_type, strike, expiry,
                     contracts, entry_price, entry_date, group_id, iv_at_entry,
                     pop_at_entry, commission, delta_at_entry, theta_at_entry,
-                    delta_current, exit_price, exit_date, status)
-                   VALUES (?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?)""",
+                    delta_current, vega_at_entry, vega_current, iv_current, theta_current,
+                    exit_price, exit_date, status)
+                   VALUES (?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     t["ticker"], t["strategy"], t["leg_type"], t["option_type"],
                     t["strike"], t["expiry"], t["entry_price"], t["entry_date"],
                     gid if gid else None, t["iv_at_entry"], t["pop_at_entry"],
                     t.get("commission") or 0.0, t.get("delta_at_entry"), t.get("theta_at_entry"),
                     t.get("delta_current"),
+                    t.get("vega_at_entry"),
+                    t.get("vega_current"),
+                    t.get("iv_current"),
+                    t.get("theta_current"),
                     t["exit_price"], t["exit_date"], t["status"],
                 ),
             )
@@ -850,6 +955,8 @@ AGENT_IBKR_MARKET_DATA_KEY = "agent_ibkr_market_data"
 # Archív hotových sedení portfóliového agenta (JSON pole; v UI posledných ~90 dní)
 PORTFOLIO_AGENT_EVAL_ARCHIVE_KEY = "portfolio_agent_eval_archive"
 SPREAD_BUILDER_AGENT_CHAT_KEY = "spread_builder_agent_chat"
+# AI chat: porovnanie uložených diagonál (Hľadanie diagonálu — 2+ riadky)
+DIAGONAL_COMPARE_AGENT_CHAT_KEY = "diagonal_compare_agent_chat"
 
 
 def get_group_maint_margins() -> dict[str, float]:
@@ -1246,6 +1353,62 @@ def _migrate_symbol_market_snapshots(conn: sqlite3.Connection) -> None:
 SYMBOL_IB_OPTION_REFRESH_KEY = "symbol_ib_option_last_refresh_utc"
 
 
+def _migrate_sector_performance_snapshots(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sector_performance_snapshots (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at   TEXT NOT NULL,
+            horizon      TEXT NOT NULL CHECK(horizon IN ('short','long')),
+            note         TEXT,
+            payload_json TEXT NOT NULL
+        )
+    """)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sector_perf_h_created "
+        "ON sector_performance_snapshots (horizon, created_at DESC)"
+    )
+    conn.commit()
+
+
+def _migrate_ticker_correlation_data(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ticker_hist_snapshots (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at   TEXT NOT NULL,
+            ticker       TEXT NOT NULL,
+            note         TEXT,
+            bar_count    INTEGER NOT NULL,
+            first_date   TEXT,
+            last_date    TEXT,
+            series_json  TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ths_ticker_created ON ticker_hist_snapshots (ticker, created_at DESC)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ticker_corr_matrix_runs (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at   TEXT NOT NULL,
+            title        TEXT,
+            max_days     INTEGER NOT NULL,
+            method       TEXT NOT NULL DEFAULT 'pearson',
+            return_kind  TEXT NOT NULL DEFAULT 'log',
+            tickers_json TEXT NOT NULL,
+            matrix_json  TEXT NOT NULL,
+            n_obs_json   TEXT
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tcm_created ON ticker_corr_matrix_runs (created_at DESC)"
+    )
+    conn.commit()
+
+
 def _migrate_symbol_ib_option_snapshots(conn: sqlite3.Connection) -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS symbol_ib_option_snapshots (
@@ -1567,3 +1730,257 @@ def set_group_maint_margins(margins: dict[str, float]) -> None:
         else:
             existing.pop(ks, None)
     set_setting(GROUP_MAINT_MARGIN_KEY, json.dumps(existing, ensure_ascii=False))
+
+
+def insert_sector_performance_snapshot(
+    horizon: str,
+    payload: dict[str, Any],
+    note: Optional[str] = None,
+) -> int:
+    """
+    Uloží OCR/normalizovanú tabuľku výkonnosti sektorov.
+    ``horizon``: ``short`` (krátkodobý screenshot) alebo ``long`` (dlhodobý).
+    ``payload``: napr. ``{"rows": [{"sector": "...", "pct_1d": 0.1, ...}]}``.
+    """
+    h = (horizon or "").strip().lower()
+    if h not in ("short", "long"):
+        raise ValueError("horizon musí byť 'short' alebo 'long'")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO sector_performance_snapshots (created_at, horizon, note, payload_json)
+            VALUES (?, ?, ?, ?)
+            """,
+            (now, h, (note or "").strip() or None, json.dumps(payload, ensure_ascii=False)),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def get_latest_sector_performance_snapshot(horizon: str) -> Optional[dict[str, Any]]:
+    h = (horizon or "").strip().lower()
+    if h not in ("short", "long"):
+        return None
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT id, created_at, horizon, note, payload_json
+            FROM sector_performance_snapshots
+            WHERE horizon = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (h,),
+        ).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    try:
+        d["payload"] = json.loads(d.pop("payload_json"))
+    except (json.JSONDecodeError, TypeError):
+        d["payload"] = {}
+    return d
+
+
+def list_sector_performance_snapshots(limit: int = 30) -> list[dict[str, Any]]:
+    lim = max(1, min(int(limit), 200))
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, created_at, horizon, note, payload_json
+            FROM sector_performance_snapshots
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (lim,),
+        ).fetchall()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["payload"] = json.loads(d.pop("payload_json"))
+        except (json.JSONDecodeError, TypeError):
+            d["payload"] = {}
+        out.append(d)
+    return out
+
+
+def insert_ticker_hist_snapshot(
+    ticker: str,
+    series_json: str,
+    *,
+    bar_count: int,
+    first_date: str,
+    last_date: str,
+    note: Optional[str] = None,
+) -> int:
+    """Uloží denné uzávierky (JSON: zoznam objektov s kľúčmi ``d``, ``c`` — pozri ``hist_dataframe_to_series_json``)."""
+    tk = (ticker or "").strip().upper()
+    if not tk:
+        raise ValueError("Ticker je prázdny.")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO ticker_hist_snapshots
+            (created_at, ticker, note, bar_count, first_date, last_date, series_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                now,
+                tk,
+                (note or "").strip() or None,
+                int(bar_count),
+                (first_date or "").strip() or None,
+                (last_date or "").strip() or None,
+                series_json,
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def list_ticker_hist_snapshots(limit: int = 200) -> list[dict[str, Any]]:
+    lim = max(1, min(int(limit), 500))
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, created_at, ticker, note, bar_count, first_date, last_date
+            FROM ticker_hist_snapshots
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (lim,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_ticker_hist_snapshot(snap_id: int) -> Optional[dict[str, Any]]:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT id, created_at, ticker, note, bar_count, first_date, last_date, series_json
+            FROM ticker_hist_snapshots
+            WHERE id = ?
+            """,
+            (int(snap_id),),
+        ).fetchone()
+    if not row:
+        return None
+    return dict(row)
+
+
+def delete_ticker_hist_snapshot(snap_id: int) -> int:
+    with get_connection() as conn:
+        cur = conn.execute("DELETE FROM ticker_hist_snapshots WHERE id = ?", (int(snap_id),))
+        conn.commit()
+        return int(cur.rowcount)
+
+
+def insert_ticker_corr_matrix_run(
+    title: str,
+    tickers: list[str],
+    matrix: list[list[Optional[float]]],
+    *,
+    max_days: int,
+    method: str = "pearson",
+    return_kind: str = "log",
+    n_obs: Optional[list[list[Optional[int]]]] = None,
+) -> int:
+    if not tickers or len(matrix) != len(tickers):
+        raise ValueError("Neplatná matica alebo zoznam tickerov.")
+    if n_obs is not None and len(n_obs) != len(tickers):
+        raise ValueError("n_obs musí mať rovnaký rozmer ako matica.")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    tjson = json.dumps([str(t).strip().upper() for t in tickers], ensure_ascii=False)
+    mjson = json.dumps(matrix, ensure_ascii=False)
+    njson = json.dumps(n_obs, ensure_ascii=False) if n_obs else None
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO ticker_corr_matrix_runs
+            (created_at, title, max_days, method, return_kind, tickers_json, matrix_json, n_obs_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                now,
+                (title or "").strip() or None,
+                int(max_days),
+                (method or "pearson").strip().lower(),
+                (return_kind or "log").strip().lower(),
+                tjson,
+                mjson,
+                njson,
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def list_ticker_corr_matrix_runs(limit: int = 50) -> list[dict[str, Any]]:
+    lim = max(1, min(int(limit), 200))
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, created_at, title, max_days, method, return_kind, tickers_json, matrix_json, n_obs_json
+            FROM ticker_corr_matrix_runs
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (lim,),
+        ).fetchall()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["tickers"] = json.loads(d.pop("tickers_json"))
+        except (json.JSONDecodeError, TypeError):
+            d["tickers"] = []
+        try:
+            d["matrix"] = json.loads(d.pop("matrix_json"))
+        except (json.JSONDecodeError, TypeError):
+            d["matrix"] = []
+        raw_n = d.pop("n_obs_json")
+        try:
+            d["n_obs"] = json.loads(raw_n) if raw_n else None
+        except (json.JSONDecodeError, TypeError):
+            d["n_obs"] = None
+        out.append(d)
+    return out
+
+
+def get_ticker_corr_matrix_run(run_id: int) -> Optional[dict[str, Any]]:
+    with get_connection() as conn:
+        row = conn.execute(
+            """
+            SELECT id, created_at, title, max_days, method, return_kind, tickers_json, matrix_json, n_obs_json
+            FROM ticker_corr_matrix_runs
+            WHERE id = ?
+            """,
+            (int(run_id),),
+        ).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    try:
+        d["tickers"] = json.loads(d.pop("tickers_json"))
+    except (json.JSONDecodeError, TypeError):
+        d["tickers"] = []
+    try:
+        d["matrix"] = json.loads(d.pop("matrix_json"))
+    except (json.JSONDecodeError, TypeError):
+        d["matrix"] = []
+    raw_n = d.pop("n_obs_json")
+    try:
+        d["n_obs"] = json.loads(raw_n) if raw_n else None
+    except (json.JSONDecodeError, TypeError):
+        d["n_obs"] = None
+    return d
+
+
+def delete_ticker_corr_matrix_run(run_id: int) -> int:
+    with get_connection() as conn:
+        cur = conn.execute("DELETE FROM ticker_corr_matrix_runs WHERE id = ?", (int(run_id),))
+        conn.commit()
+        return int(cur.rowcount)

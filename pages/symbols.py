@@ -10,17 +10,13 @@ from core.symbol_ib_option_sync import (
     run_symbol_ib_option_refresh,
     seconds_since_last_refresh,
 )
+from core.sector_select_options import symbol_sector_edit_options, symbol_sector_table_options
 from core.yahoo_symbol_sync import YAHOO_SYMBOL_SYNC_SETTING_KEY, sync_all_symbols_from_yahoo
 
 db.init_db()
 set_tradejournal_page("symbols")
 
-SECTORS = [
-    "—", "Technology", "Consumer Discretionary", "Consumer Staples",
-    "Healthcare", "Financials", "Energy", "Utilities",
-    "Real Estate", "Materials", "Industrials", "Communication Services",
-    "Iné",
-]
+SECTOR_OPTS_ADD = symbol_sector_table_options()
 
 ASSET_TYPES = ["Stock", "ETF", "Index Options", "Futures", "Crypto", "Iné"]
 
@@ -51,7 +47,8 @@ st.title("📌 Symboly")
 st.caption(
     "Centrálna správa tickerov — definuj symboly raz a vyberaj ich z dropdownu "
     "v celom denníku (Trade Log, Roll Simulátor, Kalendár, Dashboard). "
-    "Spot, sektor a IV vieš pravidelne dopĺňať cez **Yahoo Finance** (záložka Prehľad)."
+    "**Sektor** = výber z **jednej tabuľky** — 11 slovenských názvov indexov S&P 500 (zarovnanie na Barchart); **Yahoo ho neprepisuje**. "
+    "Spot a IV vieš dopĺňať cez **Yahoo Finance** (nižšie v Prehľade)."
 )
 
 tab_add, tab_manage = st.tabs(["Pridať symbol", "Prehľad a úprava"])
@@ -72,7 +69,11 @@ with tab_add:
 
         c4, c5 = st.columns(2)
         with c4:
-            s_sector = st.selectbox("Sektor", SECTORS)
+            s_sector = st.selectbox(
+                "Sektor (tabuľka S&P — 11 riadkov)",
+                SECTOR_OPTS_ADD,
+                help="Rovnaký zoznam ako v návode na stránke Sektory — insight; nie Yahoo.",
+            )
         with c5:
             s_iv = st.number_input(
                 "IV Rank / Percentil (%)",
@@ -259,10 +260,10 @@ with tab_manage:
         st.subheader("Obnova z Yahoo Finance")
         _yh_last = db.get_setting(YAHOO_SYMBOL_SYNC_SETTING_KEY, "")
         st.caption(
-            "Stiahne **spot**, **názov**, **sektor**, **industry**, **IV %** (ATM call, yfinance; v **percentách**) "
+            "Stiahne **spot**, **názov**, **industry**, **IV %** (ATM call, yfinance; v **percentách**) "
             "a **IV rank** ako percentil aktuálneho IV % voči min/max z **predchádzajúcich** denných snapshotov "
             "(nie fixný kalendárny rok brokera). Po pár dňoch/týždňoch pravidelného behu je rank použiteľnejší. "
-            "Neprepisuje earnings ani IR URL."
+            "**Sektor** z Yahoo sa **neukladá** — nastavuješ ho vyššie / v úprave symbolu. Neprepisuje earnings ani IR URL."
         )
         st.caption(f"Posledný hromadný beh: **{_yh_last or '—'}**")
         yh_pause = st.number_input(
@@ -297,7 +298,8 @@ with tab_manage:
 
         st.caption(
             "Automaticky (cron): z koreňa projektu spusti `python core/yahoo_symbol_sync.py` "
-            "(voliteľne zoznam tickerov ako argumenty)."
+            "(voliteľne zoznam tickerov ako argumenty). Postup skriptu + stav v DB pre jeden ticker (napr. SPY): "
+            "`python core/yahoo_symbol_sync.py --zhrnutie SPY`."
         )
 
         st.divider()
@@ -437,11 +439,19 @@ with tab_manage:
 
                     ec4, ec5 = st.columns(2)
                     with ec4:
+                        sector_opts_edit = symbol_sector_edit_options(sym.get("sector"))
                         cur_sector = sym.get("sector") or "—"
-                        sector_idx = SECTORS.index(cur_sector) if cur_sector in SECTORS else 0
+                        sector_idx = (
+                            sector_opts_edit.index(cur_sector)
+                            if cur_sector in sector_opts_edit
+                            else 0
+                        )
                         e_sector = st.selectbox(
-                            "Sektor", SECTORS, index=sector_idx,
-                            key=f"ss_{sym['id']}"
+                            "Sektor (tabuľka S&P — 11 riadkov)",
+                            sector_opts_edit,
+                            index=sector_idx,
+                            key=f"ss_{sym['id']}",
+                            help="Vyber jeden z 11 slovenských názvov indexov S&P 500. Ak má symbol starý text mimo tabuľky, zobrazí sa ako posledná položka — zmeň na riadok z tabuľky.",
                         )
                     with ec5:
                         e_iv = st.number_input(

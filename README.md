@@ -8,6 +8,8 @@ Streamlit aplikácia pre sledovanie a analýzu opčných obchodov s prepojením 
 - **Trade Log** — Zadávanie obchodov (single/multi-leg), P&L sledovanie
 - **Konzultácie & Poznámky** — Markdown záznamy priradené k Trade_ID / Group_ID, historia log
 - **Strategy Modeler** — Roll simulátor so sliderom pre strike, real-time PoP aktualizácia
+- **Hľadanie delty — diagonály** — skríning diagonálov z lokálnej DB reťazcov (gréky, filtre, triedenie). Manuál: [docs/hladanie-delty-diagonaly.md](docs/hladanie-delty-diagonaly.md)
+- **Journal — Gréky** — zápis Δ, Θ, Vega, IV, skupiny, net, história; prepojenie s TWS. Manuál: [docs/journal-greky.md](docs/journal-greky.md)
 
 ## Inštalácia
 

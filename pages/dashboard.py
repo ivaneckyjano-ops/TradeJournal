@@ -5,7 +5,7 @@ from datetime import date, datetime
 from core import database as db
 from core import ibkr
 from core.page_context import set_tradejournal_page
-from core.portfolio_data import normalize_expiry
+from core.portfolio_data import journal_position_key, normalize_expiry
 
 db.init_db()
 set_tradejournal_page("dashboard")
@@ -25,6 +25,10 @@ auto_on = st.session_state.get("auto_refresh_on", False)
 _ib_connected = ibkr.is_connected()
 
 st.title("Dashboard")
+st.info(
+    "**TWS:** pripojenie, import pozícií a fills, kontrola zhody s denníkom. "
+    "**Journal (čo TWS nedáva dlhodobo):** zápis a história **Δ, Θ, Vega, IV** po otvorení, skupiny a net súčty — záložka **Journal — Gréky**."
+)
 
 # ─── IBKR Panel ───────────────────────────────────────────────────────────────
 with st.expander("IBKR Pripojenie", expanded=not _ib_connected):
@@ -110,24 +114,26 @@ fills_btn = st.button(
     help="Načíta vykonané obchody z TWS. Automaticky uzavrie Short pozície (BOT) a Long pozície (SLD).",
 )
 if fills_btn:
-    with st.spinner("Načítavam fills z IBKR..."):
+    with st.spinner("Načítavam fills z IBKR (reqExecutions)..."):
         fills_res = ibkr.fetch_fills()
     if fills_res["error"]:
         st.error(fills_res["error"])
     elif not fills_res["fills"]:
-        st.info("Žiadne fills v aktuálnej TWS session.")
+        st.warning(
+            "IBKR nevrátil žiadne opčné výplne. Skús znova po obchode v TWS, "
+            "alebo skontroluj účet / typ klienta (Paper vs Live). Pri prvom pripojení často pomôže druhý klik."
+        )
     else:
+        n_in = len(fills_res["fills"])
         sync_f = ibkr.sync_fills_to_db(fills_res["fills"], db)
         msg = (
-            f"Fills spracované — "
-            f"uzavreté: **{sync_f.get('closed', 0)}** &nbsp;·&nbsp; "
-            f"pridané: **{sync_f['added']}** &nbsp;·&nbsp; "
-            f"preskočené: **{sync_f['skipped']}**"
+            f"Z IBKR prišlo **{n_in}** výplní (OPT). Spracovanie: "
+            f"uzavreté **{sync_f.get('closed', 0)}** · pridané **{sync_f['added']}** · preskočené **{sync_f['skipped']}**."
         )
-        if sync_f.get("closed", 0) > 0:
+        if sync_f.get("closed", 0) > 0 or sync_f.get("added", 0) > 0:
             st.success(msg)
         else:
-            st.info(msg)
+            st.info(msg + " Ak čakáš uzavretie nohy, skontroluj v denníku rovnaký ticker, strike, expiráciu (YYYYMMDD) a typ nohy (Short+BOT / Long+SLD).")
         st.rerun()
 
 # ─── Possibly Closed Alert ────────────────────────────────────────────────────
@@ -168,14 +174,21 @@ if show_ibkr_raw and _ib_connected:
     if live_res["error"]:
         st.error(live_res["error"])
     elif not live_res["positions"]:
-        st.info("IBKR portfólio je prázdne alebo žiadne opčné pozície.")
+        st.info("IBKR nevrátil žiadne pozície.")
     else:
+        st.caption(f"Načítaných pozícií z IBKR: **{len(live_res['positions'])}** (OPT + STK + ostatné typy v zdroji).")
         opts = [p for p in live_res["positions"] if p["sec_type"] == "OPT"]
         stks = [p for p in live_res["positions"] if p["sec_type"] == "STK"]
 
         opt_upnl = sum(float(p.get("unrealized_pnl") or 0) for p in opts)
         stk_upnl = sum(float(p.get("unrealized_pnl") or 0) for p in stks)
         total_upnl = opt_upnl + stk_upnl
+
+        if not opts and not stks:
+            st.warning(
+                "V odpovedi nie sú riadky typu OPT ani STK (napr. len futures, cash alebo iný typ). "
+                "Kontrola zhody nižšie pracuje len s **opciami**."
+            )
 
         if opts:
             st.markdown("**Opcie v portfóliu:**")
@@ -264,6 +277,10 @@ st.divider()
 
 # ─── Kontrola: Porovnanie Denník ↔ TWS ────────────────────────────────────────
 st.subheader("Kontrola zhody Denník ↔ TWS")
+st.caption(
+    "Porovnáva len **opcie (OPT)** z TWS s otvorenými nohami v denníku. "
+    "Nohy, ktoré v TWS vôbec nie sú, sa v hlavnej tabuľke **nezobrazujú**."
+)
 
 if not _ib_connected:
     st.info("Pripoj sa na IBKR pre živé porovnanie.")
@@ -280,30 +297,23 @@ else:
             tws_opts = [p for p in live_chk["positions"] if p["sec_type"] == "OPT"]
             db_open  = db.get_open_trades()
 
-            def _pos_key(ticker, strike, expiry, opt_type, leg_type):
-                """Normalizovaný kľúč pre porovnanie (exp vždy YYYYMMDD)."""
-                exp_c = normalize_expiry(str(expiry or "")).replace("-", "")
-                return (
-                    str(ticker).upper(),
-                    f"{float(strike or 0):.2f}",
-                    exp_c,
-                    str(opt_type).capitalize(),
-                    str(leg_type).capitalize(),
-                )
-
-            tws_keys  = {_pos_key(p["ticker"], p["strike"], p["expiry"],
-                                   p["option_type"], p["leg_type"]): p
-                         for p in tws_opts}
-            db_keys   = {_pos_key(t["ticker"], t["strike"] or 0, t["expiry"] or "",
-                                   t["option_type"] or "", t["leg_type"] or ""): t
-                         for t in db_open}
+            tws_keys  = {
+                journal_position_key(p["ticker"], p["strike"], p["expiry"], p["option_type"], p["leg_type"]): p
+                for p in tws_opts
+            }
+            db_keys   = {
+                journal_position_key(t["ticker"], t["strike"] or 0, t["expiry"] or "", t["option_type"] or "", t["leg_type"] or ""): t
+                for t in db_open
+            }
 
             rows_cmp = []
-            all_keys = set(tws_keys) | set(db_keys)
+            journal_only: list[dict] = []
+            # Porovnávame len kľúče z TWS (OPT). Nohy len v denníku bez zodpovedajúcej OPT v TWS
+            # neuvádzame ako „chybu“ — zobrazia sa voliteľne v expanderi.
 
-            for k in sorted(all_keys):
-                tws_p = tws_keys.get(k)
-                db_p  = db_keys.get(k)
+            for k in sorted(tws_keys):
+                tws_p = tws_keys[k]
+                db_p = db_keys.get(k)
 
                 if tws_p and db_p:
                     tws_c = float(abs(tws_p.get("contracts", 1)))
@@ -337,36 +347,46 @@ else:
                         "Kontr. Denník": "—",
                         "Group": "—",
                     })
-                elif db_p and not tws_p:
-                    rows_cmp.append({
-                        "Stav": "⚠️ Chýba v TWS",
-                        "ID": db_p["id"],
-                        "Ticker": k[0],
-                        "Noha": k[4],
-                        "Typ": k[3],
-                        "Strike": float(k[1]),
-                        "Expiry": k[2],
-                        "Kontr. TWS": "—",
-                        "Kontr. Denník": float(db_p.get("contracts", 1)),
-                        "Group": db_p.get("group_id") or "—",
-                    })
 
-            if not rows_cmp:
-                st.success("Denník aj TWS sú prázdne — žiadne otvorené pozície.")
-            else:
-                ok_count    = sum(1 for r in rows_cmp if r["Stav"].startswith("✅"))
-                warn_count  = sum(1 for r in rows_cmp if r["Stav"].startswith("⚠️"))
-                err_count   = sum(1 for r in rows_cmp if r["Stav"].startswith("❌"))
+            for k in sorted(set(db_keys) - set(tws_keys)):
+                db_p = db_keys.get(k)
+                if db_p:
+                    journal_only.append(
+                        {
+                            "ID": db_p["id"],
+                            "Ticker": k[0],
+                            "Noha": k[4],
+                            "Typ": k[3],
+                            "Strike": float(k[1]),
+                            "Expiry": k[2],
+                            "Kontr.": float(db_p.get("contracts", 1)),
+                            "Group": db_p.get("group_id") or "—",
+                        }
+                    )
+
+            if not tws_opts and not db_open:
+                st.success("Žiadne otvorené opcie v denníku ani OPT v TWS.")
+            elif not tws_opts and db_open:
+                st.info(
+                    "V TWS momentálne **nie sú žiadne opčné pozície** — kontrola zhody sa netýka TWS. "
+                    "Nohy len v denníku sú v expanderi nižšie (nie sú chybou)."
+                )
+            elif not rows_cmp and not journal_only:
+                st.success("Žiadne OPT v TWS na porovnanie.")
+            elif rows_cmp:
+                ok_count = sum(1 for r in rows_cmp if r["Stav"].startswith("✅"))
+                warn_count = sum(1 for r in rows_cmp if r["Stav"].startswith("⚠️"))
+                err_count = sum(1 for r in rows_cmp if r["Stav"].startswith("❌"))
 
                 col_s1, col_s2, col_s3 = st.columns(3)
                 col_s1.metric("✅ Zhoduje sa", ok_count)
-                col_s2.metric("⚠️ Rozdiel / Chýba v TWS", warn_count)
+                col_s2.metric("⚠️ Rozdiel kontraktov", warn_count)
                 col_s3.metric("❌ Chýba v denníku", err_count)
 
                 if warn_count == 0 and err_count == 0:
-                    st.success("Denník je v plnej zhode s TWS portfóliom.")
+                    st.success("Všetky TWS opčné nohy majú zodpovedajúci záznam v denníku (vrátane kontraktov).")
                 else:
-                    st.warning("Nájdené rozdiely — pozri tabuľku nižšie.")
+                    st.warning("Nájdené rozdiely — pozri tabuľku.")
 
                 df_cmp = pd.DataFrame(rows_cmp)
                 st.dataframe(
@@ -379,19 +399,21 @@ else:
                     },
                 )
 
-                # Rýchla oprava: ak niečo chýba v denníku, ponúkni import
                 missing_in_db = [r for r in rows_cmp if r["Stav"] == "❌ Chýba v denníku"]
                 if missing_in_db:
                     st.caption(
-                        "Pozície označené ❌ sú v TWS ale nie v denníku. "
-                        "Klikni na **Importuj pozície z IBKR** vyššie."
+                        "❌ = v TWS je OPT, v denníku chýba rovnaký kľúč. Použi **Importuj pozície z IBKR**."
                     )
-                missing_in_tws = [r for r in rows_cmp if "Chýba v TWS" in r["Stav"]]
-                if missing_in_tws:
+            else:
+                st.caption("Žiadny riadok TWS↔denník na zhodnom kľúči (skontroluj formát expirácie v denníku: YYYYMMDD).")
+
+            if journal_only:
+                with st.expander(f"Nohy len v denníku (bez zodpovedajúcej OPT v TWS) — {len(journal_only)}", expanded=False):
                     st.caption(
-                        "Pozície označené ⚠️ Chýba v TWS môžu byť uzavreté. "
-                        "Klikni na **Importuj Fills** alebo ich uzavri manuálne v sekcii vyššie."
+                        "Toto **nie je chyba**, ak nohy vedieš len v journali alebo už nie sú v TWS. "
+                        "Kontrola vyššie sa týka iba toho, čo TWS vráti ako OPT."
                     )
+                    st.dataframe(pd.DataFrame(journal_only), use_container_width=True, hide_index=True)
 
 st.divider()
 
@@ -399,12 +421,57 @@ st.divider()
 st.subheader("Otvorené pozície")
 
 open_trades = db.get_open_trades()
+show_all_off_tws = False
+if _ib_connected and open_trades:
+    show_all_off_tws = st.checkbox(
+        "Zobraziť aj nohy z denníka, ktoré **nie sú** v TWS ako OPT (napr. už uzavreté v brokrovi)",
+        value=False,
+        key="dash_show_journal_not_in_tws",
+        help="Predvolene Dashboard zobrazí len to, čo TWS aktuálne vráti ako opčnú pozíciu — aby sa nelíšalo od horného bloku.",
+    )
+
+display_trades = open_trades
+off_tws_trades: list[dict] = []
+if _ib_connected and open_trades and not show_all_off_tws:
+    live_tbl = ibkr.fetch_positions(use_historical_last=False)
+    _pos_list = live_tbl.get("positions")
+    if not live_tbl.get("error") and _pos_list is not None:
+        tws_opt_list = [p for p in _pos_list if p["sec_type"] == "OPT"]
+        in_tws = {
+            journal_position_key(p["ticker"], p["strike"], p["expiry"], p["option_type"], p["leg_type"])
+            for p in tws_opt_list
+        }
+        display_trades = []
+        for t in open_trades:
+            k = journal_position_key(
+                t.get("ticker"),
+                t.get("strike") or 0,
+                t.get("expiry") or "",
+                t.get("option_type") or "",
+                t.get("leg_type") or "",
+            )
+            if k in in_tws:
+                display_trades.append(t)
+            else:
+                off_tws_trades.append(t)
+    elif live_tbl.get("error"):
+        st.caption(f"TWS pozície sa nepodarilo načítať na filter tabuľky: {live_tbl['error']}")
 
 if not open_trades:
     st.info("Žiadne otvorené pozície. Použi **Importuj pozície z IBKR** alebo pridaj manuálne v **Trade Log**.")
+elif _ib_connected and not show_all_off_tws and not display_trades and off_tws_trades:
+    st.warning(
+        "V denníku máš otvorené nohy, ale **žiadna nezodpovedá** aktuálnym OPT v TWS (horný blok). "
+        "Skontroluj import, alebo nohy uzavri / oprav v Trade Logu. Zatiaľ môžeš zapnúť checkbox vyššie a zobraziť celý denník."
+    )
 else:
+    if _ib_connected and not show_all_off_tws:
+        st.caption(
+            "Tabuľka nižšie = **iba nohy**, ktoré TWS momentálne hlási ako OPT (rovnaký kľúč ako kontrola zhody). "
+            "Ostatné sú v expanderi."
+        )
     rows = []
-    for t in open_trades:
+    for t in display_trades:
         dte_val = None
         th_val = t.get("theta_at_entry")
 
@@ -445,4 +512,55 @@ else:
             "Entry cena": st.column_config.NumberColumn(format="$%.2f"),
         },
     )
+
+    if off_tws_trades and not show_all_off_tws:
+        with st.expander(
+            f"Otvorené v denníku, ale nie v TWS OPT ({len(off_tws_trades)} nôh)",
+            expanded=False,
+        ):
+            st.caption(
+                "Tieto záznamy sú v denníku stále **Open**, ale v odpovedi TWS pre opcie sa neobjavujú "
+                "(iný účet, už zatvorené v TWS, alebo nepresná zhoda kľúča). Úprava v **Trade Log** / **Journal — Gréky**."
+            )
+            rows2 = []
+            for t in off_tws_trades:
+                dte_val = None
+                th_val = t.get("theta_at_entry")
+                if t.get("expiry"):
+                    try:
+                        exp_str = t["expiry"]
+                        exp_date = date.fromisoformat(
+                            f"{exp_str[:4]}-{exp_str[4:6]}-{exp_str[6:8]}"
+                            if len(exp_str) == 8
+                            else exp_str
+                        )
+                        dte_val = (exp_date - date.today()).days
+                    except Exception:
+                        pass
+                rows2.append(
+                    {
+                        "ID": t["id"],
+                        "Group": t.get("group_id", "") or "",
+                        "Ticker": t["ticker"],
+                        "Stratégia": t.get("strategy", ""),
+                        "Noha": t.get("leg_type", ""),
+                        "Typ": t.get("option_type", ""),
+                        "Strike": t.get("strike"),
+                        "Expiry": t.get("expiry", ""),
+                        "DTE": dte_val,
+                        "Kontrakty": t.get("contracts", 1),
+                        "Entry cena": t.get("entry_price"),
+                        "Θ (entry) $/deň": f"${float(th_val):+.3f}" if th_val is not None else "—",
+                        "Entry dátum": t.get("entry_date", ""),
+                    }
+                )
+            st.dataframe(
+                pd.DataFrame(rows2),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Strike": st.column_config.NumberColumn(format="$%.2f"),
+                    "Entry cena": st.column_config.NumberColumn(format="$%.2f"),
+                },
+            )
 

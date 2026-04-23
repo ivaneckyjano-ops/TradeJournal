@@ -12,7 +12,7 @@ from core.probability import calc_greeks, bs_price, calc_iv_from_price, calc_sd_
 from core import database as db
 from core import ibkr
 from core import agent as ai_agent
-from core.page_context import set_tradejournal_page
+from core.page_context import render_ai_chat_markdown, set_tradejournal_page
 from core.portfolio_data import compute_spread_model_theta_aptr_pct
 from core.spread_mentor import (
     analyze_calendar_mentor,
@@ -1652,6 +1652,7 @@ st.markdown(f"### Nohy spreadu  ({len(legs)})")
 st.caption(
     "Jedna tabuľka — uprav **Bid / Ask**, **IV** (zlomok, napr. 0,30 = 30 %), **Δ / Θ / Vega** a **vstupnú prémiu** priamo v bunkách. "
     "**Δ $** = „dollar delta“ pozície: približne **(delta opcie ako 0–1) × 100 × kontrakty** — teda pri **1 kontrakte** a delte **0,12** zadáš cca **12**, nie **0,12** ani **122** (122 by zodpovedalo napr. ~1,22 delty na 1 kontr.). "
+    "**Vega $** = zmena hodnoty pozície v **USD na 1 percentuálnu bodu IV** pre **celý kontrakt** (100 akcií): z BS vyjde vega na 1 akciu rádovo **0,2–0,4** → v tabuľke pri **1 kontrakte** uvidíš cca **20–40 $** (≈ 0,28 × 100), nie tú istú desatinnú hodnotu ako v stĺpci IV podkladov. "
     "Greeks v tabuľke sú vždy **USD na celú nohu** (nie „na 1 akciu“). **DTE** a **BS $** sú len náhľad. "
     "Po úprave klikni **Aplikovať zmeny z tabuľky**. Expiráciu vieš zmeniť aj **kalendárom** pod tabuľkou."
 )
@@ -1729,7 +1730,14 @@ _sb_edited_legs = st.data_editor(
             help="≈ delta(0–1) × 100 × kontrakty. Príklad: 1 kontr., delta 0,12 → cca **12**.",
         ),
         "Θ $/deň": st.column_config.NumberColumn(format="$%+.2f", step=0.01),
-        "Vega $": st.column_config.NumberColumn(format="$%+.2f", step=0.01),
+        "Vega $": st.column_config.NumberColumn(
+            format="$%+.2f",
+            step=0.01,
+            help=(
+                "USD na **celú nohu** za **+1 % bod IV** (100 akcií × kontrakty). "
+                "Ak v podkladoch / BS vidíš vegu **na 1 akciu** napr. **0,28**, tu pri 1 kontrakte bude cca **+28 $** (0,28 × 100). Pri viacerých kontraktoch ešte × počet."
+            ),
+        ),
         "DTE": st.column_config.NumberColumn(format="%d"),
         "BS $": st.column_config.NumberColumn(format="$%.2f"),
     },
@@ -1792,6 +1800,13 @@ with st.expander("ℹ️ Ako zadávať a čítať Θ (denný rozpad)", expanded=
 | **Long**  | **záporné** (−)  | spread **platí** časový rozpad |
 
 > Net Θ = súčet všetkých nôh. Kladný net Θ = spread celkovo **zarába** čas (short calendar, iron condor…).
+
+---
+
+### Vega $ v tabuľke vs. „malá“ vega v podkladoch (0,28 vs 28)
+
+- V **hlavnej tabuľke** je stĺpec **Vega $** vždy **USD na celú nohu** za zmenu impl. volatility o **+1 percentuálny bod** (napr. IV z 30 % na 31 %), už s násobkom **100 akcií na kontrakt** × počet kontraktov.
+- Hodnota **~0,28** z BS alebo z popisu „na 1 akciu“ = **približne $ zmeny ceny opcie na 1 akciu** pri +1 % IV. Pri **1 kontrakte** je to v tabuľke **× 100** → cca **28 $** (znamienko podľa Long/Short ako pri Θ).
 
 ---
 
@@ -2808,17 +2823,7 @@ Odpovedaj v tomto formáte:
     if _sb_hist:
         st.markdown("---")
         with st.expander("💬 Aktuálna analýza a chat — rozbaľ / zbaľ", expanded=True):
-            for _msg in _sb_hist:
-                if not isinstance(_msg, dict):
-                    continue
-                _role = _msg.get("role")
-                _content = _msg.get("content") or ""
-                if _role == "assistant":
-                    with st.chat_message("assistant", avatar="🤖"):
-                        st.markdown(_content)
-                elif _role == "user":
-                    with st.chat_message("user", avatar="👤"):
-                        st.markdown(_content)
+            render_ai_chat_markdown(_sb_hist)
 
         st.markdown("**Doplňujúca otázka:**")
         _sb_follow = st.chat_input("Napíš doplňujúcu otázku k spreadu…")

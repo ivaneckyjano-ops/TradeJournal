@@ -23,7 +23,7 @@ def test_save_list_delete_roundtrip():
             assert n == 1
             out = sdb.list_saved()
             assert len(out) == 1
-            assert out.iloc[0]["Ticker uloženia"] == "TEST"
+            assert out.iloc[0]["Ticker"] == "TEST"
             assert abs(float(out.iloc[0]["Debit/kredit ($/1 lot ×100)"]) - 150.0) < 1e-6
             rid = int(out.iloc[0]["ID"])
             assert sdb.delete_by_ids([rid]) == 1

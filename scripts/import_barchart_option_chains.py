@@ -11,6 +11,9 @@ Názvy súborov musia zodpovedať vzoru:
   TICKER-volatility-greeks-exp-YYYY-MM-DD-...-MM-DD-YYYY.csv
 
 Výstup: data/option_chains/TICKER.db
+
+Pri sťahovaní z Barchartu pre ETF s vysokým spotom (SPY, QQQ) stiahni **širší rozsah strike-ov**
+(od ~70 % do ~150 % spotu), inak filtre typu „min. OTM short“ v diagonále nemajú z čoho vyberať.
 """
 
 from __future__ import annotations

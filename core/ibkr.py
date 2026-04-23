@@ -2026,44 +2026,72 @@ def sync_positions_to_db(positions: list[dict], db_module) -> dict:
 
 
 def fetch_fills() -> dict:
-    """Načíta vykonané obchody (fills) z aktuálnej TWS session vrátane komisií."""
+    """
+    Načíta vykonané obchady (fills) z IBKR vrátane komisií.
+
+    Používa ``reqExecutions()`` — na rozdiel od ``ib.fills()`` vráti aj dáta po pripojení
+    (cache ``fills()`` často ostane prázdny, kým sa nevyžiadajú exekúcie zo servera).
+    """
     ib = get_ib()
     if not ib or not ib.isConnected():
         return {"fills": [], "error": "Nie je pripojenie na IBKR"}
     _ib_ready()
     try:
-        # Zostavíme mapu execId → komisia z commissionReports
+        raw: list = []
+        try:
+            raw = list(ib.reqExecutions() or [])
+        except Exception:
+            raw = []
+        if not raw:
+            raw = list(ib.fills() or [])
+
         commission_map: dict[str, float] = {}
-        for cr in ib.fills():
-            if hasattr(cr, "commissionReport") and cr.commissionReport:
-                rpt = cr.commissionReport
-                eid = getattr(rpt, "execId", None) or getattr(cr.execution, "execId", None)
-                if eid and rpt.commission not in (None, 1.7976931348623157e+308):
-                    commission_map[eid] = float(rpt.commission)
+        for f in raw:
+            rpt = getattr(f, "commissionReport", None)
+            if rpt:
+                eid = getattr(rpt, "execId", None) or getattr(f.execution, "execId", None)
+                if eid and rpt.commission not in (None, 1.7976931348623157e+308, float("inf")):
+                    try:
+                        commission_map[str(eid)] = float(rpt.commission)
+                    except (TypeError, ValueError):
+                        pass
 
         result = []
-        for f in ib.fills():
+        for f in raw:
             c = f.contract
             if c.secType != "OPT":
                 continue
             ex = f.execution
-            side = ex.side.upper()  # "BOT" alebo "SLD"
-            comm = commission_map.get(ex.execId, 0.0)
-            result.append({
-                "ticker": c.symbol,
-                "option_type": "Call" if c.right == "C" else "Put",
-                "strike": float(c.strike),
-                "expiry": c.lastTradeDateOrContractMonth,
-                "contracts": int(abs(ex.shares)),
-                "leg_type": "Long" if side == "BOT" else "Short",
-                "entry_price": ex.price,
-                "realized_fill_price": ex.price,
-                "entry_date": (ex.time.strftime("%Y-%m-%d") if hasattr(ex.time, "strftime") else str(ex.time)[:10]) if ex.time else datetime.today().strftime("%Y-%m-%d"),
-                "exec_id": ex.execId,
-                "side": side,
-                "account": ex.acctNumber,
-                "commission": comm,
-            })
+            side = ex.side.upper()
+            comm = commission_map.get(str(ex.execId), 0.0)
+            exp_raw = str(getattr(c, "lastTradeDateOrContractMonth", "") or "").strip()
+            if len(exp_raw) >= 8 and exp_raw[:8].isdigit():
+                exp_norm = exp_raw[:8]
+            else:
+                from core.portfolio_data import normalize_expiry
+
+                exp_norm = normalize_expiry(exp_raw).replace("-", "")[:8]
+            result.append(
+                {
+                    "ticker": c.symbol,
+                    "option_type": "Call" if c.right == "C" else "Put",
+                    "strike": float(c.strike),
+                    "expiry": exp_norm,
+                    "contracts": int(abs(ex.shares)),
+                    "leg_type": "Long" if side == "BOT" else "Short",
+                    "entry_price": float(ex.price),
+                    "realized_fill_price": float(ex.price),
+                    "entry_date": (
+                        (ex.time.strftime("%Y-%m-%d") if hasattr(ex.time, "strftime") else str(ex.time)[:10])
+                        if ex.time
+                        else datetime.today().strftime("%Y-%m-%d")
+                    ),
+                    "exec_id": ex.execId,
+                    "side": side,
+                    "account": ex.acctNumber,
+                    "commission": comm,
+                }
+            )
         return {"fills": result, "error": None}
     except Exception as e:
         return {"fills": [], "error": str(e)}
@@ -2079,6 +2107,39 @@ def sync_fills_to_db(fills: list[dict], db_module) -> dict:
     Poznámka: ex.shares je vždy kladné, preto sa leg_type nedá odvodiť zo znamienka.
     Namiesto toho porovnáme fill priamo s otvorenými pozíciami v DB.
     """
+    from core.portfolio_data import normalize_expiry
+
+    def _canon_expiry(exp) -> str:
+        s = str(exp or "").strip().split()[0]
+        if len(s) >= 8 and s[:8].isdigit():
+            return s[:8]
+        try:
+            return normalize_expiry(s).replace("-", "")[:8]
+        except Exception:
+            return s.replace("-", "")[:8]
+
+    def _same_opt_type(a, b) -> bool:
+        ca = str(a or "").strip().lower().startswith("c")
+        cb = str(b or "").strip().lower().startswith("c")
+        return ca == cb
+
+    def _strike_eq(a, b) -> bool:
+        try:
+            return abs(float(a or 0) - float(b or 0)) < 1e-4
+        except (TypeError, ValueError):
+            return str(a) == str(b)
+
+    def _fill_matches_leg(t: dict, fill: dict, leg: str, *, require_open: bool = True) -> bool:
+        st_ok = str(t.get("status") or "") == "Open" if require_open else True
+        return (
+            str(t.get("ticker") or "").upper() == str(fill.get("ticker") or "").upper()
+            and _strike_eq(t.get("strike"), fill.get("strike"))
+            and _canon_expiry(t.get("expiry")) == _canon_expiry(fill.get("expiry"))
+            and _same_opt_type(t.get("option_type"), fill.get("option_type"))
+            and str(t.get("leg_type") or "") == leg
+            and st_ok
+        )
+
     existing = db_module.get_all_trades()
     open_trades = [t for t in existing if t.get("status") == "Open"]
     added = skipped = closed = 0
@@ -2091,18 +2152,7 @@ def sync_fills_to_db(fills: list[dict], db_module) -> dict:
         close_leg = "Short" if side == "BOT" else "Long"
 
         # Pokús sa nájsť zodpovedajúcu Open pozíciu na uzavretie
-        target = next(
-            (
-                t for t in open_trades
-                if t["ticker"] == fill["ticker"]
-                and str(t.get("strike", "")) == str(fill["strike"])
-                and str(t.get("expiry", "")) == str(fill["expiry"])
-                and t.get("option_type") == fill["option_type"]
-                and t.get("leg_type") == close_leg
-                and t.get("status") == "Open"
-            ),
-            None,
-        )
+        target = next((t for t in open_trades if _fill_matches_leg(t, fill, close_leg, require_open=True)), None)
 
         if target:
             # Celková komisia = entry komisia (uložená) + exit komisia (z tohto fillu)
@@ -2123,12 +2173,8 @@ def sync_fills_to_db(fills: list[dict], db_module) -> dict:
         # Otváracie plnenie — leg_type podľa smeru (BOT=Long, SLD=Short)
         open_leg = "Long" if side == "BOT" else "Short"
         duplicate = any(
-            t["ticker"] == fill["ticker"]
-            and str(t.get("strike", "")) == str(fill["strike"])
-            and str(t.get("expiry", "")) == str(fill["expiry"])
-            and t.get("leg_type") == open_leg
-            and t.get("option_type") == fill["option_type"]
-            and t.get("entry_date", "") == fill["entry_date"]
+            _fill_matches_leg(t, fill, open_leg, require_open=False)
+            and str(t.get("entry_date", "")) == str(fill.get("entry_date", ""))
             for t in existing
         )
         if duplicate:

@@ -183,7 +183,7 @@ if auto_on and not _tj_skip_global:
 
 # ─── Navigácia ────────────────────────────────────────────────────────────────
 dashboard = st.Page("pages/dashboard.py",  title="Dashboard",         icon=":material/dashboard:",      default=True)
-portfolio = st.Page("pages/portfolio.py",  title="Portfolio",         icon=":material/analytics:")
+portfolio = st.Page("pages/portfolio.py",  title="Journal — Gréky",   icon=":material/analytics:")
 trade_log = st.Page("pages/trade_log.py",  title="Trade Log",         icon=":material/edit_note:")
 groups    = st.Page("pages/groups.py",     title="Skupiny",           icon=":material/folder:")
 symbols   = st.Page("pages/symbols.py",    title="Symboly",           icon=":material/bookmarks:")
@@ -196,6 +196,7 @@ steady_yields  = st.Page("pages/steady_yields.py",     title="Steady Yields",   
 csv_variants   = st.Page("pages/csv_variants.py",      title="CSV Varianty",     icon=":material/table_view:")
 greeks_db      = st.Page("pages/option_chain_greeks.py", title="DB Grékov",      icon=":material/storage:")
 delta_diag     = st.Page("pages/delta_search_diagonal.py", title="Hľadanie delty — diagonály", icon=":material/merge:")
+sector_ins     = st.Page("pages/sector_insights.py", title="Sektory — insight", icon=":material/hub:")
 calendar       = st.Page("pages/calendar.py",         title="Kalendár",            icon=":material/calendar_month:")
 help_page      = st.Page("pages/help.py",             title="Pomocník",            icon=":material/help:")
 
@@ -203,7 +204,7 @@ pg = st.navigation(
     {
         "Prehľad":  [dashboard, portfolio, calendar],
         "Obchody":  [trade_log, groups, symbols],
-        "Analýza":  [notes, modeler, spread_bld, csv_variants, greeks_db, delta_diag, steady_yields, portfolio_agent, portfolio_dash],
+        "Analýza":  [notes, modeler, spread_bld, csv_variants, greeks_db, delta_diag, sector_ins, steady_yields, portfolio_agent, portfolio_dash],
         "Info":     [help_page],
     },
     position="sidebar",

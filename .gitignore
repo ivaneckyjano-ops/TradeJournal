@@ -15,3 +15,6 @@ data/option_chains/*.db
 
 # Uložené riadky z Hľadania delty — diagonály (voliteľne odstráň z .gitignore, ak chceš zálohovať v gite)
 data/saved_diagonals.db
+
+# Protokoly z ladenia — Hľadanie delty (diagonály); odstráň riadok, ak ich chceš verzovať
+data/delta_search_debug/

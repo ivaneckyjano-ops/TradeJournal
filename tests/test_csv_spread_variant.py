@@ -16,6 +16,86 @@ def test_parse_expiry_variants():
     assert m.parse_expiry_to_yyyymmdd("17.07.2026") == "20260717"
 
 
+def test_diagonal_legs_from_saved_display_row():
+    row = pd.Series(
+        {
+            "Stratégia": "Long call diagonál",
+            "Typ": "Call",
+            "Short — expirácia": "2026-06-18",
+            "Long — expirácia": "2026-09-18",
+            "Short — strike": 150.0,
+            "Long — strike": 160.0,
+            "Short — bid": 2.5,
+            "Long — ask": 5.0,
+            "Čistá delta": 0.05,
+            "Čistá theta (+ príjem / − strata)": 0.02,
+            "Ticker": "AMZN",
+        }
+    )
+    legs, err, notice = m.diagonal_legs_from_saved_display_row(row, spot=200.0, iv=0.30, contracts=1)
+    assert err is None
+    assert len(legs) == 2
+    assert legs[0]["leg_type"] == "Short" and legs[1]["leg_type"] == "Long"
+    assert legs[0]["strike"] == 150.0 and legs[1]["strike"] == 160.0
+    assert legs[0]["expiry"] == "20260618"
+    assert notice and "uložen" in notice.lower()
+
+
+def test_diagonal_legs_from_saved_row_theta_vega_times100_columns():
+    """Riadok z tabuľky výsledkov (×100) sa pri odoslaní do Buildera prepočíta späť do jednotiek reťazca."""
+    row_raw = pd.Series(
+        {
+            "Stratégia": "Long call diagonál",
+            "Typ": "Call",
+            "Short — expirácia": "2026-06-18",
+            "Long — expirácia": "2026-09-18",
+            "Short — strike": 150.0,
+            "Long — strike": 160.0,
+            "Short — bid": 2.5,
+            "Long — ask": 5.0,
+            "Čistá delta": 0.05,
+            "Čistá theta (+ príjem / − strata)": 0.02,
+            "Ticker": "AMZN",
+        }
+    )
+    row_scaled = row_raw.copy()
+    row_scaled["Čistá theta (+ príjem / − strata) ×100"] = 2.0
+    row_scaled = row_scaled.drop(columns=["Čistá theta (+ príjem / − strata)"])
+    legs_a, err_a, _ = m.diagonal_legs_from_saved_display_row(row_raw, spot=200.0, iv=0.30, contracts=1)
+    legs_b, err_b, _ = m.diagonal_legs_from_saved_display_row(row_scaled, spot=200.0, iv=0.30, contracts=1)
+    assert err_a is None and err_b is None
+    sum_th_a = sum(float(lg.get("leg_theta_per_day_usd") or 0) for lg in legs_a)
+    sum_th_b = sum(float(lg.get("leg_theta_per_day_usd") or 0) for lg in legs_b)
+    assert sum_th_a == pytest.approx(sum_th_b, rel=1e-4, abs=1e-4)
+
+
+def test_diagonal_legs_from_saved_row_delta_times100_column():
+    row_raw = pd.Series(
+        {
+            "Stratégia": "Long call diagonál",
+            "Typ": "Call",
+            "Short — expirácia": "2026-06-18",
+            "Long — expirácia": "2026-09-18",
+            "Short — strike": 150.0,
+            "Long — strike": 160.0,
+            "Short — bid": 2.5,
+            "Long — ask": 5.0,
+            "Čistá delta": 0.05,
+            "Čistá theta (+ príjem / − strata)": 0.02,
+            "Ticker": "AMZN",
+        }
+    )
+    row_scaled = row_raw.copy()
+    row_scaled["Čistá delta ×100"] = 5.0
+    row_scaled = row_scaled.drop(columns=["Čistá delta"])
+    legs_a, err_a, _ = m.diagonal_legs_from_saved_display_row(row_raw, spot=200.0, iv=0.30, contracts=1)
+    legs_b, err_b, _ = m.diagonal_legs_from_saved_display_row(row_scaled, spot=200.0, iv=0.30, contracts=1)
+    assert err_a is None and err_b is None
+    sum_d_a = sum(float(lg.get("leg_delta_usd") or 0) for lg in legs_a)
+    sum_d_b = sum(float(lg.get("leg_delta_usd") or 0) for lg in legs_b)
+    assert sum_d_a == pytest.approx(sum_d_b, rel=1e-4, abs=1e-4)
+
+
 def test_calendar_legs_need_strike():
     row = pd.Series({"Exp Leg1": "2026-06-18", "Exp Leg2": "2026-07-17"})
     legs, err, _notice = m.calendar_legs_from_variant_row(row, spot=100.0, iv=0.25, contracts=1)

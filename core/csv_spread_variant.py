@@ -528,6 +528,129 @@ def calendar_legs_from_variant_row(
     return legs, None, notice_out
 
 
+def ticker_spot_iv_for_diagonal_send(
+    ticker: str,
+    *,
+    strike_hint: Optional[float] = None,
+) -> tuple[str, float, float]:
+    """
+    Ticker, spot a IV (zlomok 0–1) z tabuľky Symboly — rovnaká logika ako pri odoslaní z CSV variantov
+    (bez ceny z CSV riadku). Spot 200 len ak nič iné.
+    """
+    from core import database as db
+
+    tk = (ticker or "").strip().upper()
+    if not tk:
+        return "", max(1.0, float(strike_hint or 200.0)), 0.30
+    sym = db.get_symbol(tk)
+    spot = float(sym.get("spot") or 0) if sym else 0.0
+    iv = 0.30
+    if sym and sym.get("iv_pct") is not None:
+        try:
+            fv = float(sym["iv_pct"])
+        except (TypeError, ValueError):
+            fv = 0.30
+        if fv > 1.0:
+            fv = fv / 100.0
+        iv = float(min(max(fv, 0.01), 5.0))
+    if spot <= 0 and strike_hint is not None:
+        sh = float(strike_hint)
+        if sh > 0:
+            spot = sh
+    if spot <= 0:
+        spot = 200.0
+    return tk, spot, iv
+
+
+def diagonal_legs_from_saved_display_row(
+    row: pd.Series,
+    *,
+    spot: float,
+    iv: float,
+    contracts: int = 1,
+) -> tuple[list[dict], Optional[str], Optional[str]]:
+    """
+    Riadok z uložených / náhľadových diagonál (stĺpce ``Short — …`` / ``Long — …`` / ``Typ``)
+    → dve nohy (Short + Long) s expiráciami a strikmi presne ako v tabuľke — vhodné pre ``csv_calendar_variant`` patch.
+    """
+    skip = {"ID", "Uložené", "Zmazať", "Do Buildera", "Uložiť", "Ticker", "Snímka uloženia", "Stratégia ID"}
+    clean_idx = [c for c in row.index if c not in skip]
+    sub = row[clean_idx]
+    norm = series_to_norm_dict(sub)
+    for col in row.index:
+        if col in skip or pd.isna(row[col]) or not str(row[col]).strip():
+            continue
+        lc = str(col).lower()
+        cstr = str(col)
+        cista = ("čistá" in lc) or ("cista" in lc)
+        if cista and "delta" in lc and "theta" not in lc and "vega" not in lc and "gamma" not in lc:
+            x = parse_number(row[col])
+            if not np.isnan(x):
+                if "×100" in cstr or "x100" in lc:
+                    x = x / 100.0
+                norm["net_delta"] = str(x)
+        elif cista and "theta" in lc and "vega" not in lc:
+            x = parse_number(row[col])
+            if not np.isnan(x):
+                if "×100" in cstr or "x100" in lc:
+                    x = x / 100.0
+                norm["net_theta"] = str(x)
+        elif cista and "vega" in lc and "theta" not in lc and "gamma" not in lc:
+            x = parse_number(row[col])
+            if not np.isnan(x):
+                if "×100" in cstr or "x100" in lc:
+                    x = x / 100.0
+                norm["net_vega"] = str(x)
+
+    def _cell(*names) -> Any:
+        for n in names:
+            if n in row.index and pd.notna(row[n]) and str(row[n]).strip():
+                return row[n]
+        return None
+
+    sx = _cell("Short — expirácia")
+    lx = _cell("Long — expirácia")
+    if sx is None or lx is None:
+        return [], "Chýba Short alebo Long expirácia.", None
+
+    near = parse_expiry_to_yyyymmdd(sx)
+    far = parse_expiry_to_yyyymmdd(lx)
+    if not near or not far:
+        return [], "Nepodarilo sa rozparsovať dátum expirácie (očakávam YYYY-MM-DD).", None
+
+    sk = parse_number(_cell("Short — strike"))
+    lk = parse_number(_cell("Long — strike"))
+    if np.isnan(sk) or np.isnan(lk) or sk <= 0 or lk <= 0:
+        return [], "Chýbajú alebo sú neplatné striky Short / Long.", None
+
+    typ = str(_cell("Typ") or "Call").strip().lower()
+    if typ in ("p", "put", "puts") or typ.startswith("put"):
+        right = "P"
+    else:
+        right = "C"
+
+    bid1 = parse_number(_cell("Short — bid", "short_bid"))
+    ask2 = parse_number(_cell("Long — ask", "long_ask"))
+
+    iv_use = float(iv) if float(iv) > 0 else 0.30
+    sp = float(spot) if float(spot) > 0 else float(max(sk, lk))
+
+    legs = [
+        _make_leg(1, "Short", right, float(sk), near, contracts, sp, iv_use, entry_override=bid1 if not np.isnan(bid1) else None),
+        _make_leg(2, "Long", right, float(lk), far, contracts, sp, iv_use, entry_override=ask2 if not np.isnan(ask2) else None),
+    ]
+    if not np.isnan(bid1) and float(bid1) > 0:
+        legs[0]["tws_bid"] = float(bid1)
+    if not np.isnan(ask2) and float(ask2) > 0:
+        legs[1]["tws_ask"] = float(ask2)
+
+    _apply_net_greek_scales(legs, norm, contracts)
+
+    strat = str(_cell("Stratégia") or "").strip()
+    notice = f"Z uložených diagonál: {strat}" if strat else "Z uložených diagonál."
+    return legs, None, notice
+
+
 def csv_row_on_flag(norm: dict[str, str]) -> bool:
     for k in ("on", "active", "pick", "trade", "selected"):
         v = (norm.get(k) or "").strip().lower()

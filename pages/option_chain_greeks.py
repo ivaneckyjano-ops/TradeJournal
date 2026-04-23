@@ -366,6 +366,14 @@ with tab_view:
             as_f = None if as_pick == "(všetky)" else as_pick
             df = odb.read_chain(ticker, expiry=exp_f, as_of_date=as_f)
             status_df = odb.list_snapshot_status(ticker)
+            if not status_df.empty and "expiry" in status_df.columns and "as_of_date" in status_df.columns:
+                _se = pd.to_datetime(status_df["expiry"], errors="coerce")
+                _sa = pd.to_datetime(status_df["as_of_date"], errors="coerce")
+                status_df = status_df.copy()
+                status_df["dte"] = (_se - _sa).dt.days
+                _c = [x for x in status_df.columns if x != "dte"]
+                _i = _c.index("as_of_date") + 1
+                status_df = status_df[_c[:_i] + ["dte"] + _c[_i:]]
             if not status_df.empty:
                 status_df["Stav"] = status_df.apply(
                     lambda r: _status_label(
@@ -386,6 +394,7 @@ with tab_view:
                         columns={
                             "expiry": "Expirácia",
                             "as_of_date": "Dátum snímky",
+                            "dte": "DTE (k snímke)",
                             "rows": "Riadkov",
                             "has_options": "Options",
                             "has_greeks": "Greeks",
@@ -470,10 +479,17 @@ with tab_view:
                             st.rerun()
                         except Exception as exc:
                             st.error(f"Opätovný import sa nepodaril: {type(exc).__name__}: {exc}")
+            if not df.empty and "expiry" in df.columns and "as_of_date" in df.columns:
+                _e = pd.to_datetime(df["expiry"], errors="coerce")
+                _a = pd.to_datetime(df["as_of_date"], errors="coerce")
+                df = df.copy()
+                _insert_at = list(df.columns).index("as_of_date") + 1
+                df.insert(_insert_at, "dte", (_e - _a).dt.days)
             pretty = df.rename(
                 columns={
                     "expiry": "Expirácia",
                     "as_of_date": "Dátum snímky",
+                    "dte": "DTE (k snímke)",
                     "strike": "Strike",
                     "option_type": "Typ",
                     "bid": "Bid",
@@ -498,4 +514,7 @@ with tab_view:
                 }
             )
             st.dataframe(pretty, use_container_width=True, hide_index=True)
-            st.caption(f"Zobrazených **{len(df)}** riadkov.")
+            st.caption(
+                f"Zobrazených **{len(df)}** riadkov. **DTE (k snímke)** = kalendárne dni do expirácie "
+                "od dátumu snímky (sťahovania dát), nie od dneška."
+            )
