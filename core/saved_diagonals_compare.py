@@ -146,31 +146,6 @@ def compare_saved_diagonals(
     if not m["id"] or m["id"] not in rows.columns:
         m["id"] = "ID" if "ID" in rows.columns else str(rows.columns[0])
 
-    # Vylúčiť riadky kde Long strike < Short strike — neplatná konfigurácia diagonály.
-    ssk_col = m.get("short_strike")
-    lsk_col = m.get("long_strike")
-    filtered_invalid_ids: list = []
-    if ssk_col and lsk_col and ssk_col in rows.columns and lsk_col in rows.columns:
-        ss_num = pd.to_numeric(rows[ssk_col], errors="coerce")
-        ls_num = pd.to_numeric(rows[lsk_col], errors="coerce")
-        inv_mask = ss_num.notna() & ls_num.notna() & (ls_num < ss_num)
-        if inv_mask.any():
-            id_col = m["id"] if m["id"] and m["id"] in rows.columns else None
-            filtered_invalid_ids = (
-                rows.loc[inv_mask, id_col].tolist() if id_col else rows.index[inv_mask].tolist()
-            )
-            rows = rows.loc[~inv_mask].reset_index(drop=True)
-            if rows.empty:
-                warn = (
-                    f"⚠️ Všetky riadky boli vyfiltrované (Long strike < Short strike): "
-                    f"ID {', '.join(str(x) for x in filtered_invalid_ids)}. Žiadne platné riadky na porovnanie."
-                )
-                return (
-                    pd.DataFrame(),
-                    warn,
-                    f"# Protokol — porovnanie uložených diagonál\n\n{warn}\n",
-                )
-
     ids = []
     thetas, debits, dltas, vegas, skores, tickers, short_bids = [], [], [], [], [], [], []
     sbc = m.get("short_bid")
@@ -315,15 +290,8 @@ def compare_saved_diagonals(
     else:
         btxt = "Báza: heuristika z theta a |debitu|. "
 
-    inv_note = ""
-    if filtered_invalid_ids:
-        inv_note = (
-            f"\n\n⚠️ **Vyfiltrované** riadky (Long strike < Short strike — neplatná konfigurácia): "
-            f"ID {', '.join(str(x) for x in filtered_invalid_ids)}. Tieto sa do porovnania nezapočítali."
-        )
-
     lines: list[str] = [
-        wtxt + btxt + f"Počet v porovnaní: **{n}**.{warn_tk}{inv_note}",
+        wtxt + btxt + f"Počet v porovnaní: **{n}**.{warn_tk}",
         "",
     ]
 
@@ -369,7 +337,7 @@ def compare_saved_diagonals(
         "_Odoslanie do Buildera: v stĺpci **Do Buildera** ponechaj stále **práve jeden** riadok._"
     )
     summary_md = "\n".join(lines).strip()
-    summary_in_protocol = summary_md.replace(inv_note, "", 1).replace("\n\n\n", "\n\n").strip() if inv_note else summary_md
+    summary_in_protocol = summary_md
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     proto: list[str] = [
@@ -378,11 +346,6 @@ def compare_saved_diagonals(
         f"- **Čas (UTC):** `{ts}`",
         f"- **Počet porovnávaných záznamov:** {n}",
     ]
-    if filtered_invalid_ids:
-        proto.append(
-            f"- **Vyfiltrované** (Long strike < Short strike): "
-            f"ID {', '.join(str(x) for x in filtered_invalid_ids)}"
-        )
     proto += [
         "",
         "## 1. Spôsob porovnania (metodika)",
@@ -425,9 +388,6 @@ def compare_saved_diagonals(
             "",
         ]
     )
-    if inv_note:
-        proto.append("*(O vyfiltrovaných ID pozri hlavičku; text nižšie to neopakuje — v UI stručnom zhrnutí zostáva plná poznámka.)*")
-        proto.append("")
     proto.append(summary_in_protocol)
     proto.extend(
         [

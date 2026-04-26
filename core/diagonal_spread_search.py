@@ -13,10 +13,11 @@ Gréky z reťazca sú za predpokladu **long 1 kontrakt**; váhy w_near / w_far z
 from __future__ import annotations
 
 import json
+from collections import Counter
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Literal, Optional, Union
 
 # Ďalší krok v RELAX_STEPS = úplne vypnúť filter (nastaviť pole v DiagonalSearchOptions na None).
 _RELAX_DISABLE = object()
@@ -109,6 +110,11 @@ class DiagonalSearchOptions:
     min_volume: Optional[int] = None
     require_iv_short_ge_long: bool = False
     iv_short_ge_long_margin: float = 0.0
+    # Ktorá noha má mať strike bližší k spotu (menšie |K−spot|). None = bez filtra. Predvolene long (potrebuje spot > 0).
+    strike_proximity_leg: Optional[Literal["long", "short"]] = "long"
+
+
+OptScalar = Union[float, int, bool, str, None]
 
 
 def _expiry_sort_key(expiry: str) -> datetime:
@@ -296,6 +302,237 @@ def first_calendar_dte_pair(
         "dte_near": dte_n,
         "dte_far": dte_f,
     }
+
+
+def _dte_interval_penalty(x: int, lo: Optional[int], hi: Optional[int]) -> float:
+    """Kvádrová penalizácia mimo [lo, hi]; ak hranica chýba, neberie sa."""
+    w = 0.0
+    if lo is not None and int(x) < int(lo):
+        w += float(int(lo) - int(x)) ** 2
+    if hi is not None and int(x) > int(hi):
+        w += float(int(x) - int(hi)) ** 2
+    return w
+
+
+def suggest_dte_pair_closest_to_ui(
+    ticker: str,
+    as_of_date: str,
+    strategy: StrategyId,
+    opt: DiagonalSearchOptions,
+) -> Optional[dict[str, Any]]:
+    """
+    Dvojica expirácií, ktorá je **najbližšia** (v zmysle L2 „vzdialenosti“) k **aktuálnym** DTE pásmam
+    v ``opt`` (len zapnuté filtre, None = neohraničené strany). Pri remíze skoršia v kalendári.
+
+    Ak DTE v ``opt`` nie sú vôbec zapnuté, vráti tú istú vec ako ``first_calendar_dte_pair``.
+    """
+    spec = STRATEGIES.get(strategy)
+    if not spec:
+        return None
+    raw = odb.read_chain(ticker, as_of_date=as_of_date)
+    if raw.empty:
+        return None
+    need = {"expiry", "strike", "option_type", "delta", "theta"}
+    if not need <= set(raw.columns):
+        return None
+    df = raw.loc[raw["option_type"].astype(str) == spec.option_type].copy()
+    df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
+    df = df.loc[df["strike"].notna()]
+    df["delta"] = pd.to_numeric(df["delta"], errors="coerce")
+    df["theta"] = pd.to_numeric(df["theta"], errors="coerce")
+    df = df.loc[df["delta"].notna() & df["theta"].notna()]
+    if df.empty:
+        return None
+    expiries = sorted(df["expiry"].astype(str).unique().tolist(), key=_expiry_sort_key)
+    if len(expiries) < 2:
+        return None
+    has_any_dte = any(
+        getattr(opt, f) is not None
+        for f in ("dte_near_min", "dte_near_max", "dte_far_min", "dte_far_max")
+    )
+    if not has_any_dte:
+        return first_calendar_dte_pair(ticker, as_of_date, strategy)
+    best_score: float = float("inf")
+    best_ij: tuple[int, int] = (10**9, 10**9)
+    best: dict[str, Any] | None = None
+    for i, exp_near in enumerate(expiries):
+        for j in range(i + 1, len(expiries)):
+            exp_far = expiries[j]
+            dte_n = _dte_single(as_of_date, exp_near)
+            dte_f = _dte_single(as_of_date, exp_far)
+            score = 0.0
+            score += _dte_interval_penalty(
+                dte_n, opt.dte_near_min, opt.dte_near_max
+            )
+            score += _dte_interval_penalty(
+                dte_f, opt.dte_far_min, opt.dte_far_max
+            )
+            t_ij = (i, j)
+            if score < best_score - 1e-9 or (abs(float(score) - best_score) < 1e-9 and t_ij < best_ij):
+                best_score = float(score)
+                best_ij = t_ij
+                best = {
+                    "expiry_near": exp_near,
+                    "expiry_far": exp_far,
+                    "dte_near": dte_n,
+                    "dte_far": dte_f,
+                    "distance_score": float(score),
+                }
+    return best
+
+
+DTE_VIOLATION_CODE_SK: dict[str, str] = {
+    "skoršia_min": "skoršia DTE pod dolnou hranicou (páslo skoršia — min.)",
+    "skoršia_max": "skoršia DTE nad hornou hranicou (páslo skoršia — max.)",
+    "neskoršia_min": "neskoršia DTE pod dolnou hranicou (páslo neskoršia — min.)",
+    "neskoršia_max": "neskoršia DTE nad hornou hranicou (páslo neskoršia — max.)",
+}
+
+
+def dte_pair_band_violation_codes(
+    dte_n: int,
+    dte_f: int,
+    opt: DiagonalSearchOptions,
+) -> list[str]:
+    """Ktoré zadané pásma DTE dvojica porušuje (prázdne = vyhovuje). Rovnaká logika ako v ``_expiries_and_dte_pair_count``."""
+    codes: list[str] = []
+    if opt.dte_near_min is not None and dte_n < int(opt.dte_near_min):
+        codes.append("skoršia_min")
+    if opt.dte_near_max is not None and dte_n > int(opt.dte_near_max):
+        codes.append("skoršia_max")
+    if opt.dte_far_min is not None and dte_f < int(opt.dte_far_min):
+        codes.append("neskoršia_min")
+    if opt.dte_far_max is not None and dte_f > int(opt.dte_far_max):
+        codes.append("neskoršia_max")
+    return codes
+
+
+def _dte_bands_caption_line(opt: DiagonalSearchOptions) -> str:
+    def _one(lo: Optional[int], hi: Optional[int], label: str) -> str:
+        if lo is None and hi is None:
+            return f"**{label}:** (neobmedzené)"
+        a = f"{int(lo)}" if lo is not None else "—"
+        b = f"{int(hi)}" if hi is not None else "—"
+        return f"**{label}:** {a}–{b} dní"
+
+    return _one(opt.dte_near_min, opt.dte_near_max, "skoršia (skorší dátum v dvojici)") + "; " + _one(
+        opt.dte_far_min, opt.dte_far_max, "neskoršia (neskorší dátum v dvojici)"
+    )
+
+
+def _calendar_pair_count(n_expiries: int) -> int:
+    return n_expiries * (n_expiries - 1) // 2 if n_expiries >= 2 else 0
+
+
+def dte_calendar_diagnostic_markdown(
+    ticker: str,
+    as_of_date: str,
+    strategy: StrategyId,
+    opt: DiagonalSearchOptions,
+) -> str:
+    """
+    Markdown: zoznam expirácií s DTE a pre každú kalendárnu dvojicu, či vyhovuje pásmam alebo **ktoré** pásma režú.
+    Prázdny reťazec, ak v ``opt`` nie sú žiadne DTE hranice.
+    """
+    if not any(
+        getattr(opt, f) is not None
+        for f in ("dte_near_min", "dte_near_max", "dte_far_min", "dte_far_max")
+    ):
+        return ""
+    spec = STRATEGIES.get(strategy)
+    if not spec:
+        return ""
+    raw = odb.read_chain(ticker, as_of_date=as_of_date)
+    if raw.empty:
+        return "**DTE diagnostika:** v reťazci pre tento dátum snímky **nie sú dáta**."
+    need = {"expiry", "strike", "option_type", "delta", "theta"}
+    if not need <= set(raw.columns):
+        return "**DTE diagnostika:** v importe chýbajú stĺpce pre túto kontrolu."
+    df = raw.loc[raw["option_type"].astype(str) == spec.option_type].copy()
+    df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
+    df = df.loc[df["strike"].notna()]
+    df["delta"] = pd.to_numeric(df["delta"], errors="coerce")
+    df["theta"] = pd.to_numeric(df["theta"], errors="coerce")
+    df = df.loc[df["delta"].notna() & df["theta"].notna()]
+    if df.empty:
+        return "**DTE diagnostika:** žiadne riadky s delta+theta pre túto stratégiu."
+    expiries = sorted(df["expiry"].astype(str).unique().tolist(), key=_expiry_sort_key)
+    if len(expiries) < 2:
+        return "**DTE diagnostika:** v dátach je menej ako **dve** distinktné expirácie s delta+theta (diagonál nevznikne)."
+
+    parts: list[str] = [
+        f"Zadané pásma z hľadania: {_dte_bands_caption_line(opt)}.",
+        "",
+        "**Expirácie v dátach** (kalendárne poradie, DTE = dni od dátumu snímky k expirácii):",
+        "",
+        "| # | Expirácia | DTE |",
+        "|---:|:---|---:|",
+    ]
+    for idx, e in enumerate(expiries, start=1):
+        d = _dte_single(as_of_date, e)
+        parts.append(f"| {idx} | {str(e)[:10]} | {d} |")
+    parts.append("")
+    parts.append(
+        "**Kalendárne dvojice** (skorší dátum = *skoršia* noha, neskorší = *neskoršia*; v každom riadku DTE vľavo vždy ku skoršej expirácii, vpravo ku neskoršej):"
+    )
+    parts.append("")
+    parts.append(
+        "| Skoršia exp. | Neskoršia exp. | DTE skoršia | DTE neskoršia | Vyhovuje pásam? | Čo nevyhovuje |"
+    )
+    parts.append("|:---|:---|---:|---:|:---|:---|")
+
+    max_show = 60
+    type_counts: Counter[str] = Counter()
+    real_ok = 0
+    table_row = 0
+    total_pairs = _calendar_pair_count(len(expiries))
+    for i, exp_near in enumerate(expiries):
+        for exp_far in expiries[i + 1 :]:
+            dte_n = _dte_single(as_of_date, exp_near)
+            dte_f = _dte_single(as_of_date, exp_far)
+            vcodes = dte_pair_band_violation_codes(dte_n, dte_f, opt)
+            if not vcodes:
+                real_ok += 1
+            else:
+                for c in vcodes:
+                    type_counts[c] += 1
+            table_row += 1
+            if table_row > max_show:
+                continue
+            if not vcodes:
+                parts.append(
+                    f"| {str(exp_near)[:10]} | {str(exp_far)[:10]} | {dte_n} | {dte_f} | áno | — |"
+                )
+            else:
+                vtxt = ", ".join(DTE_VIOLATION_CODE_SK.get(c, c) for c in vcodes)
+                parts.append(
+                    f"| {str(exp_near)[:10]} | {str(exp_far)[:10]} | {dte_n} | {dte_f} | **nie** | {vtxt} |"
+                )
+
+    if total_pairs > max_show:
+        parts.append(
+            f"| … | … | — | — | *({total_pairs - max_show} ďalších dvojíc, tabuľka skrátená)* | |"
+        )
+
+    parts.append("")
+    if real_ok > 0:
+        parts.append(
+            f"**Súčet:** z **{total_pairs}** kalendárnych dvojíc **{real_ok}** vyhovuje (aspoň) zadaným DTE pásam. "
+            "Ak hľadanie pritom dalo 0 riadkov, pád je v **iných** filtroch (delta, theta, OTM, likvidita, …), nie v DTE pásmach."
+        )
+    else:
+        if type_counts:
+            top = ", ".join(
+                f"**{DTE_VIOLATION_CODE_SK.get(k, k)}** ({n}×)" for k, n in type_counts.most_common(4)
+            )
+            parts.append(
+                f"**Súčet:** z **{total_pairs}** dvojíc **žiadna** nesplní súčasne páslo skoršia aj páslo neskoršia. "
+                f"Najčastejšie, čo reže (počet výskytov u dvojíc, jedna dvojica môže narušiť obe nohy): {top}."
+            )
+        else:
+            parts.append("**Súčet:** žiadna dvojica; skontroluj, či majú pásma zmysel.")
+
+    return "\n".join(parts)
 
 
 def diagonal_search_why_empty_hint(
@@ -568,6 +805,10 @@ def _apply_row_filters(
         return cart
     m = pd.Series(True, index=cart.index)
 
+    # Záporná čistá theta = v tomto modeli *strata* (decay proti pozícii) — nenaťahovať do výsledku.
+    _nt = pd.to_numeric(cart["net_theta"], errors="coerce")
+    m &= _nt.isna() | (_nt >= 0)
+
     if opt.delta_tolerance is not None:
         tol = float(opt.delta_tolerance)
         m &= (cart["net_delta"] - target_net_delta).abs() <= tol
@@ -623,6 +864,16 @@ def _apply_row_filters(
     if opt.require_iv_short_ge_long:
         mar = float(opt.iv_short_ge_long_margin)
         m &= (cart["iv_short"].notna()) & (cart["iv_long"].notna()) & (cart["iv_short"] >= cart["iv_long"] + mar)
+
+    if opt.strike_proximity_leg in ("long", "short") and opt.spot is not None and float(opt.spot) > 0:
+        sk_s, lk_s = _short_long_strikes(spec, cart)
+        spt = float(opt.spot)
+        d_s = (pd.to_numeric(sk_s, errors="coerce") - spt).abs()
+        d_l = (pd.to_numeric(lk_s, errors="coerce") - spt).abs()
+        if opt.strike_proximity_leg == "long":
+            m &= d_l <= d_s + 1e-9
+        else:
+            m &= d_s <= d_l + 1e-9
 
     return cart.loc[m.fillna(False)]
 
@@ -873,13 +1124,14 @@ def _to_display_spread_table(out: pd.DataFrame, spec: StrategySpec, as_of_date: 
 # Postupné filtrovanie s automatickým zjemnením
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class FilterStep:
     """Záznam o jednom filtri v protokole."""
     name: str
     passed: bool
-    original: Optional[float | int | bool]
-    relaxed_to: Optional[float | int | bool]
+    original: OptScalar
+    relaxed_to: OptScalar
     rows_before: int
     rows_after: int
 
@@ -889,8 +1141,8 @@ class FilterFailureStep:
     """Jeden filter v poradí — po zjemnení stále 0 výsledkov (alebo sa nedá ďalej zjemniť)."""
     label: str
     field: str
-    start_value: Optional[float | int | bool]
-    values_attempted: list[Optional[float | int | bool]]
+    start_value: OptScalar
+    values_attempted: list[OptScalar]
     reason_sk: str
 
 
@@ -1110,11 +1362,13 @@ def write_delta_search_protocol_to_data_dir(markdown: str, ticker: str) -> Path:
     return path
 
 
-def _fmt_opt_val(v: Optional[float | int | bool]) -> str:
+def _fmt_opt_val(v: OptScalar) -> str:
     if v is None:
         return "vypnuté"
     if isinstance(v, bool):
         return "áno" if v else "nie"
+    if isinstance(v, str):
+        return "Long" if v == "long" else ("Short" if v == "short" else v)
     if isinstance(v, float):
         return f"{v:g}"
     return str(v)
@@ -1160,17 +1414,29 @@ def _format_diagonal_options_markdown_sk(o: DiagonalSearchOptions) -> str:
         lines.append(f"- Min. volume: **{o.min_volume}**")
     if o.require_iv_short_ge_long:
         lines.append(f"- IV short ≥ IV long: **áno** (marža **{_fmt_opt_val(o.iv_short_ge_long_margin)}**)")
+    if o.strike_proximity_leg in ("long", "short") and o.spot is not None and float(o.spot) > 0:
+        _leg = "Long" if o.strike_proximity_leg == "long" else "Short"
+        lines.append(
+            f"- **Strike k spotu:** noha **{_leg}** má byť *bližšie* (menšie |strike − spot|) ako druhá noha"
+        )
     lines.append(f"- Triedenie: **{o.rank_mode}**")
     if o.spot is not None and float(o.spot) > 0:
-        lines.append(f"- Spot (pre OTM): **{float(o.spot):.2f}**")
+        lines.append(f"- Spot (pre OTM a strike): **{float(o.spot):.2f}**")
     if not lines:
         return "_Žiadne riadkové filtre — len dáta z reťazca._"
     return "\n".join(lines)
 
 
-# Tieto polia sa pri postupnom / kumulatívnom zjemnení **nemenia** — DTE zostáva presne podľa UI.
+# Tieto polia sa pri postupnom / kumulatívnom zjemnení **nemenia** — DTE a výber nohy pri strike zostanú presne podľa UI.
+# Inak by sa napr. „long bližšie k spotu“ pri 0 riadkoch ticho zmenilo na „short“ alebo sa filter vypol.
 RELAX_EXCLUDE_FIELDS: frozenset[str] = frozenset(
-    {"dte_near_min", "dte_near_max", "dte_far_min", "dte_far_max"}
+    {
+        "dte_near_min",
+        "dte_near_max",
+        "dte_far_min",
+        "dte_far_max",
+        "strike_proximity_leg",
+    }
 )
 
 FILTER_PRIORITY: list[tuple[str, list[str]]] = [
@@ -1179,6 +1445,7 @@ FILTER_PRIORITY: list[tuple[str, list[str]]] = [
     ("Delta tolerancia", ["delta_tolerance"]),
     ("Theta", ["net_theta_min", "net_theta_max"]),
     ("OTM short", ["short_otm_min"]),
+    ("Strike k spotu (|K−spot|)", ["strike_proximity_leg"]),
     ("Debit/šírka", ["max_debit_to_strike_width_ratio"]),
     ("Vega", ["net_vega_min", "net_vega_max"]),
     ("Gamma", ["net_gamma_min", "net_gamma_max"]),
@@ -1207,20 +1474,21 @@ RELAX_STEPS: dict[str, list[Any]] = {
     "min_open_interest": [100, 50, 20, _RELAX_DISABLE],
     "min_volume": [10, 5, 1, _RELAX_DISABLE],
     "require_iv_short_ge_long": [True, False],
+    "strike_proximity_leg": ["long", "short", _RELAX_DISABLE],
 }
 
 
-def _get_opt_value(opt: DiagonalSearchOptions, field: str) -> Optional[float | int | bool]:
+def _get_opt_value(opt: DiagonalSearchOptions, field: str) -> OptScalar:
     """Získa hodnotu atribútu z DiagonalSearchOptions."""
-    return getattr(opt, field, None)
+    return getattr(opt, field, None)  # type: ignore[no-any-return]
 
 
-def _set_opt_value(opt: DiagonalSearchOptions, field: str, value: Optional[float | int | bool]) -> None:
+def _set_opt_value(opt: DiagonalSearchOptions, field: str, value: OptScalar) -> None:
     """Nastaví hodnotu atribútu v DiagonalSearchOptions."""
     setattr(opt, field, value)
 
 
-def _next_relax_value(field: str, current: Optional[float | int | bool]) -> Any:
+def _next_relax_value(field: str, current: OptScalar) -> Any:
     """Vráti nasledujúcu zjemnenú hodnotu, ``_RELAX_DISABLE`` (= vypnúť filter), alebo ``None`` ak už nie je krok."""
     steps = RELAX_STEPS.get(field, [])
     if not steps:
@@ -1244,7 +1512,10 @@ def _next_relax_value(field: str, current: Optional[float | int | bool]) -> Any:
     nums = [s for s in steps if isinstance(s, (int, float))]
     if not nums:
         return None
-    cur = float(current)
+    try:
+        cur = float(current)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
     min_style = field.startswith("min_") or field.endswith("_min")
     max_style = (
         field.startswith("max_")
@@ -1268,20 +1539,20 @@ def _next_relax_value(field: str, current: Optional[float | int | bool]) -> Any:
     return None
 
 
-def _opt_value_from_relax_token(field: str, token: Any) -> Optional[float | int | bool]:
+def _opt_value_from_relax_token(field: str, token: Any) -> OptScalar:
     """Mapuje výstup z ``_next_relax_value`` na hodnotu v ``DiagonalSearchOptions``."""
     if token is _RELAX_DISABLE:
         return None
-    return token  # type: ignore[return-value]
+    return token  # type: ignore[no-any-return]
 
 
-def _final_relaxed_opt_value(field: str, start: Optional[float | int | bool]) -> Optional[float | int | bool]:
+def _final_relaxed_opt_value(field: str, start: OptScalar) -> OptScalar:
     """Po prechode celou tabuľkou RELAX_STEPS od počiatočnej hodnoty — najvoľnejší stav (None = filter vypnutý)."""
     if start is None:
         return None
     if isinstance(start, bool) and field == "require_iv_short_ge_long":
         return False if start is True else start
-    cur: Optional[float | int | bool] = start
+    cur: OptScalar = start
     while cur is not None:
         nxt = _next_relax_value(field, cur)
         if nxt is None:
@@ -1340,6 +1611,7 @@ def progressive_filter_search(
             "min_volume",
             "require_iv_short_ge_long",
             "iv_short_ge_long_margin",
+            "strike_proximity_leg",
         ):
             _set_opt_value(d, field, None if field != "require_iv_short_ge_long" else False)
         return d
@@ -1390,9 +1662,10 @@ def progressive_filter_search(
     )
     if dte_hits_filter_bounds:
         dte_reason = (
-            "Podľa dát v DB (aspoň dve expirácie s delta+theta) **neexistuje žiadna dvojica** "
-            "expirácií, ktorá by súčasne spĺňala zadané pásma DTE (skoršia + neskoršia). "
-            "Hľadanie sa tu zastavilo, aby bolo jasné, že treba upraviť tieto hranice alebo vypnúť DTE filtre."
+            "V importe (aspoň dve expirácie s delta+theta) **neexistuje kalendárna dvojica** dátumov, kde by "
+            "zároveň DTE k **skoršiemu** dátumu bolo v pásme skoršia *a* DTE k **neskoršiemu** bolo v pásme neskoršia. "
+            "Typický prípad: páslo skoršia je OK (napr. 40–61), ale **min. neskoršia** ostal napr. **90** a v DB k najbližšej vhodnej "
+            "dvojici pripadne len **80–86** dní k ďalšej expirácii — vtedy je nutné znížiť *Neskoršia min* alebo páslo vypnúť."
         )
         failure_trace.append(
             FilterFailureStep(

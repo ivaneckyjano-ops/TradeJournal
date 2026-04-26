@@ -1856,6 +1856,35 @@ def list_ticker_hist_snapshots(limit: int = 200) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+def list_ticker_hist_snapshots_latest_per_ticker() -> list[dict[str, Any]]:
+    """
+    Jeden (najnovší) záznam **na každý ticker** — vhodné na UI výberu.
+
+    Oproti ``list_ticker_hist_snapshots(limit)`` tým nepadnú mimo zoznam tickery, ktoré sú v DB
+    skôr, ale medzi 300/500 „poslednými riadkami“ globálne neboli (najmä pri rozšírení matice o nové
+    tickery).
+    """
+    with get_connection() as conn:
+        rows = conn.execute(
+            """
+            WITH ranked AS (
+                SELECT
+                    id, created_at, ticker, note, bar_count, first_date, last_date,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY UPPER(TRIM(ticker))
+                        ORDER BY created_at DESC, id DESC
+                    ) AS rn
+                FROM ticker_hist_snapshots
+            )
+            SELECT id, created_at, ticker, note, bar_count, first_date, last_date
+            FROM ranked
+            WHERE rn = 1
+            ORDER BY UPPER(ticker)
+            """
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def get_ticker_hist_snapshot(snap_id: int) -> Optional[dict[str, Any]]:
     with get_connection() as conn:
         row = conn.execute(
@@ -1871,11 +1900,86 @@ def get_ticker_hist_snapshot(snap_id: int) -> Optional[dict[str, Any]]:
     return dict(row)
 
 
+def get_latest_ticker_hist_snapshot_rows(
+    tickers: list[str], *, max_scan: int = 500
+) -> dict[str, dict[str, Any]]:
+    """
+    Pre každý zadaný symbol jeden **najnovší** snímok (priamo v ``ticker_hist_snapshots``) so ``series_json``.
+    Ak ticker v DB ešte nie je, v slovníku chýba.
+
+    Parameter ``max_scan`` sa ponecháva kvôli kompatibilite; výber je vždy **globálne najnovší** na symbol,
+    neobmedzený počtom mladších iných záznamov.
+    """
+    _ = int(max_scan)  # zachovať signatúru
+    want: set[str] = {str(t).strip().upper() for t in (tickers or []) if (t or "").strip()}
+    if not want:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    with get_connection() as conn:
+        for w in want:
+            row = conn.execute(
+                """
+                SELECT id, created_at, ticker, note, bar_count, first_date, last_date, series_json
+                FROM ticker_hist_snapshots
+                WHERE UPPER(TRIM(ticker)) = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (w,),
+            ).fetchone()
+            if not row or not (dict(row).get("series_json") or "").strip():
+                continue
+            d = dict(row)
+            tk = str(d.get("ticker") or "").strip().upper()
+            out[tk] = d
+    return out
+
+
 def delete_ticker_hist_snapshot(snap_id: int) -> int:
     with get_connection() as conn:
         cur = conn.execute("DELETE FROM ticker_hist_snapshots WHERE id = ?", (int(snap_id),))
         conn.commit()
         return int(cur.rowcount)
+
+
+def delete_ticker_hist_snapshots_by_ticker(ticker: str) -> int:
+    """Vymaže **všetky** uložené snímky daného symbolu (všetky verzie CSV v čase). Vráti počet zmazaných riadkov."""
+    tk = (ticker or "").strip().upper()
+    if not tk:
+        return 0
+    with get_connection() as conn:
+        cur = conn.execute("DELETE FROM ticker_hist_snapshots WHERE UPPER(TRIM(ticker)) = ?", (tk,))
+        conn.commit()
+        return int(cur.rowcount)
+
+
+def delete_ticker_corr_matrix_runs_containing_ticker(ticker: str) -> int:
+    """
+    Vymaže záznamy v ``ticker_corr_matrix_runs``, v ktorých je tento symbol v zozname tickerov
+    (uložené korelačné matice môžu ostať v DB aj po vymazaní historických snímok).
+    Vráti počet zmazaných riadkov.
+    """
+    tk = (ticker or "").strip().upper()
+    if not tk:
+        return 0
+    n_del = 0
+    with get_connection() as conn:
+        rows = conn.execute("SELECT id, tickers_json FROM ticker_corr_matrix_runs").fetchall()
+        for rid, tj in rows:
+            if not tj or not str(tj).strip():
+                continue
+            try:
+                arr = json.loads(tj)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(arr, (list, tuple)):
+                continue
+            ups = {str(x).strip().upper() for x in arr if (x is not None and str(x).strip())}
+            if tk in ups:
+                conn.execute("DELETE FROM ticker_corr_matrix_runs WHERE id = ?", (int(rid),))
+                n_del += 1
+        conn.commit()
+    return n_del
 
 
 def insert_ticker_corr_matrix_run(

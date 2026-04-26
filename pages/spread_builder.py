@@ -815,6 +815,46 @@ def _sb_cell_float(v, default: float = 0.0) -> float:
         return default
 
 
+_SB_LEGS_TABLE_COMPARE_COLS: tuple[str, ...] = (
+    "#",
+    "L/S",
+    "C/P",
+    "Strike",
+    "Expirácia",
+    "Kontr.",
+    "Bid $",
+    "Ask $",
+    "Vstup $",
+    "IV",
+    "Δ $",
+    "Θ $/deň",
+    "Vega $",
+)
+
+
+def _sb_legs_edit_normal_form(df: pd.DataFrame) -> tuple:
+    """Kľúč na porovnanie: čísla zaokrúhlené, reťazce orezané — DTE/BS$ ignorujeme."""
+    rows: list[tuple] = []
+    for i in range(len(df)):
+        r: list = []
+        for c in _SB_LEGS_TABLE_COMPARE_COLS:
+            v = df.iloc[i][c] if c in df.columns else None
+            if c in ("#", "Kontr."):
+                r.append(int(round(_sb_float_any(v, 0.0))))
+            elif c in ("L/S", "C/P", "Expirácia"):
+                r.append(str(v or "").strip())
+            else:
+                r.append(round(_sb_float_any(v, 0.0), 6))
+        rows.append(tuple(r))
+    return tuple(rows)
+
+
+def _sb_legs_edit_rows_equivalent(a: pd.DataFrame, b: pd.DataFrame) -> bool:
+    if len(a) != len(b):
+        return False
+    return _sb_legs_edit_normal_form(a) == _sb_legs_edit_normal_form(b)
+
+
 def _sb_leg_editor_expiry_options(legs: list) -> tuple[list[str], dict[str, str]]:
     """Štítky expirácií pre SelectboxColumn + mapa štítok → YYYYMMDD (vrátane nôh mimo katalógu)."""
     _exps = get_catalog_expiries(months=18)
@@ -1650,11 +1690,11 @@ if _sb_sync_note:
 
 st.markdown(f"### Nohy spreadu  ({len(legs)})")
 st.caption(
-    "Jedna tabuľka — uprav **Bid / Ask**, **IV** (zlomok, napr. 0,30 = 30 %), **Δ / Θ / Vega** a **vstupnú prémiu** priamo v bunkách. "
+    "Jedna tabuľka — **klik do bunky**, uprav **Bid / Ask**, **IV** (zlomok, napr. 0,30 = 30 %), **Δ / Θ / Vega** a **vstupnú prémiu**; po **opustení bunky** (klik mimo) alebo **Enter** sa zmeny **uložia do nôh** automaticky. "
     "**Δ $** = „dollar delta“ pozície: približne **(delta opcie ako 0–1) × 100 × kontrakty** — teda pri **1 kontrakte** a delte **0,12** zadáš cca **12**, nie **0,12** ani **122** (122 by zodpovedalo napr. ~1,22 delty na 1 kontr.). "
     "**Vega $** = zmena hodnoty pozície v **USD na 1 percentuálnu bodu IV** pre **celý kontrakt** (100 akcií): z BS vyjde vega na 1 akciu rádovo **0,2–0,4** → v tabuľke pri **1 kontrakte** uvidíš cca **20–40 $** (≈ 0,28 × 100), nie tú istú desatinnú hodnotu ako v stĺpci IV podkladov. "
     "Greeks v tabuľke sú vždy **USD na celú nohu** (nie „na 1 akciu“). **DTE** a **BS $** sú len náhľad. "
-    "Po úprave klikni **Aplikovať zmeny z tabuľky**. Expiráciu vieš zmeniť aj **kalendárom** pod tabuľkou."
+    "Expiráciu vieš zmeniť aj v stĺpci **Expirácia** alebo **kalendárom** pod tabuľkou."
 )
 
 _spot = float(st.session_state["sb_spot"])
@@ -1742,9 +1782,15 @@ _sb_edited_legs = st.data_editor(
         "BS $": st.column_config.NumberColumn(format="$%.2f"),
     },
 )
-_ap1, _ap2 = st.columns([1, 2])
-with _ap1:
-    if st.button("💾 Aplikovať zmeny z tabuľky", type="primary", key="sb_legs_editor_apply"):
+if _sb_legs_edit_rows_equivalent(_df_legs_edit, _sb_edited_legs):
+    st.session_state.pop("sb_leg_apply_err_sig", None)
+    st.session_state.pop("sb_leg_apply_err_msg", None)
+else:
+    _cur_edit_sig = _sb_legs_edit_normal_form(_sb_edited_legs)
+    _cached_err = st.session_state.get("sb_leg_apply_err_sig")
+    if _cached_err is not None and _cur_edit_sig == _cached_err:
+        st.error(str(st.session_state.get("sb_leg_apply_err_msg", "")))
+    else:
         _ok, _em = _sb_apply_legs_from_editor(
             _sb_edited_legs,
             legs,
@@ -1754,15 +1800,18 @@ with _ap1:
             spot=_spot,
         )
         if not _ok:
+            st.session_state["sb_leg_apply_err_sig"] = _cur_edit_sig
+            st.session_state["sb_leg_apply_err_msg"] = _em
             st.error(_em)
         else:
+            st.session_state.pop("sb_leg_apply_err_sig", None)
+            st.session_state.pop("sb_leg_apply_err_msg", None)
             _sb_clear_greek_editor_widget_keys()
             st.rerun()
-with _ap2:
-    st.caption(
-        f"Súčty z aktuálnych uložených nôh: **Δ** ${tot['delta']:+.2f} · **Θ** ${tot['theta']:+.2f}/deň · **V** ${tot['vega']:+.2f}. "
-        f"Režim *Ako zadávaš Greeks* vyššie (**{_sb_greek_input_mode_label()}**) platí pre *Pridať nohu* a ručný net — nie pre stĺpce v tejto tabuľke."
-    )
+st.caption(
+    f"Súčty z aktuálnych uložených nôh: **Δ** ${tot['delta']:+.2f} · **Θ** ${tot['theta']:+.2f}/deň · **V** ${tot['vega']:+.2f}. "
+    f"Režim *Ako zadávaš Greeks* vyššie (**{_sb_greek_input_mode_label()}**) platí pre *Pridať nohu* a ručný net — nie pre stĺpce v tejto tabuľke."
+)
 
 with st.expander("📅 Expirácie z kalendára (mimo rozbaľovacieho zoznamu)", expanded=False):
     st.caption(

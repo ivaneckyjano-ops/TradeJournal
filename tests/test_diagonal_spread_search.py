@@ -234,6 +234,49 @@ def test_net_theta_max_can_empty_results():
                 os.remove(p)
 
 
+def test_negative_net_theta_combinations_excluded_from_results():
+    """len(long_call) net_theta = th_far - th_near; ak je < 0, riadok sa nepridá (strata)."""
+    with tempfile.TemporaryDirectory() as td:
+        old = odb.OPTION_CHAINS_DIR
+        odb.OPTION_CHAINS_DIR = td
+        try:
+            conn = odb.get_connection("NTNEG")
+            odb.init_schema(conn)
+            as_of = "2026-04-16"
+            for exp, strike, d, th in [
+                ("2026-06-01", "100", "0.50", "-0.10"),
+                ("2026-09-01", "100", "0.50", "-0.16"),
+            ]:
+                odb.import_merged_dataframe(
+                    conn,
+                    expiry=exp,
+                    as_of_date=as_of,
+                    merged=_merged_row(strike, d, th, "Call"),
+                    source_options_csv="o.csv",
+                    source_greeks_csv="g.csv",
+                )
+            conn.close()
+            out = dss.search_diagonal_spreads(
+                "NTNEG",
+                as_of_date=as_of,
+                strategy="long_call_diagonal",
+                top_n=20,
+                max_strikes_per_expiry=50,
+                options=dss.DiagonalSearchOptions(
+                    dte_near_min=0,
+                    dte_near_max=200,
+                    dte_far_min=0,
+                    dte_far_max=500,
+                ),
+            )
+            assert out.empty
+        finally:
+            odb.OPTION_CHAINS_DIR = old
+            p = os.path.join(td, "NTNEG.db")
+            if os.path.isfile(p):
+                os.remove(p)
+
+
 def test_diagonal_relax_suggestions_lists_dte_when_far_min_high():
     opt = dss.DiagonalSearchOptions(
         dte_far_min=90,
@@ -440,6 +483,48 @@ def test_progressive_one_expiry_does_not_misblame_dte():
         finally:
             odb.OPTION_CHAINS_DIR = old
             p = os.path.join(td, "ONEEXP.db")
+            if os.path.isfile(p):
+                os.remove(p)
+
+
+def test_suggest_dte_pair_prefers_closer_to_ui_bands():
+    with tempfile.TemporaryDirectory() as td:
+        old = odb.OPTION_CHAINS_DIR
+        odb.OPTION_CHAINS_DIR = td
+        try:
+            conn = odb.get_connection("SUG1")
+            odb.init_schema(conn)
+            as_of = "2026-04-16"
+            for exp, strike, d, th in [
+                ("2026-05-15", "100", "0.50", "-0.10"),
+                ("2026-06-18", "100", "0.52", "-0.04"),
+                ("2026-08-21", "100", "0.54", "-0.03"),
+            ]:
+                odb.import_merged_dataframe(
+                    conn,
+                    expiry=exp,
+                    as_of_date=as_of,
+                    merged=_merged_row(strike, d, th, "Call"),
+                    source_options_csv="o.csv",
+                    source_greeks_csv="g.csv",
+                )
+            conn.close()
+            opt = dss.DiagonalSearchOptions(
+                dte_near_min=50,
+                dte_near_max=60,
+                dte_far_min=100,
+                dte_far_max=130,
+            )
+            pair = dss.suggest_dte_pair_closest_to_ui("SUG1", as_of, "long_call_diagonal", opt)
+            assert pair is not None
+            # skoršia 2026-05-15 DTE=29, 2026-06-18 DTE=63, 2026-08-21 DTE=127
+            # pár 2026-06-18 + 2026-08-21: near 63, far 127 — skoršia 63 je v 50-60? nie. 29+127 horšie.
+            # 29+63: near 29 mimo, 29+127: atď. Najnižšia penalizácia: pair (jún, aug) dte 63+127
+            assert str(pair["expiry_near"]).startswith("2026-06")
+            assert str(pair["expiry_far"]).startswith("2026-08")
+        finally:
+            odb.OPTION_CHAINS_DIR = old
+            p = os.path.join(td, "SUG1.db")
             if os.path.isfile(p):
                 os.remove(p)
 
@@ -778,5 +863,55 @@ def test_progressive_filter_search_phase2_combined_can_find_rows():
         finally:
             odb.OPTION_CHAINS_DIR = old
             p = os.path.join(td, "PH2.db")
+            if os.path.isfile(p):
+                os.remove(p)
+
+
+def test_dte_pair_band_violation_codes():
+    o = dss.DiagonalSearchOptions(
+        dte_near_min=40,
+        dte_near_max=60,
+        dte_far_min=90,
+        dte_far_max=120,
+    )
+    assert dss.dte_pair_band_violation_codes(50, 100, o) == []
+    assert "neskoršia_min" in dss.dte_pair_band_violation_codes(50, 85, o)
+    assert "skoršia_max" in dss.dte_pair_band_violation_codes(65, 100, o)
+
+
+def test_dte_calendar_diagnostic_markdown_lists_pairs():
+    with tempfile.TemporaryDirectory() as td:
+        old = odb.OPTION_CHAINS_DIR
+        odb.OPTION_CHAINS_DIR = td
+        try:
+            conn = odb.get_connection("DTEG")
+            odb.init_schema(conn)
+            as_of = "2026-04-16"
+            for exp, strike, d, th in [
+                ("2026-06-18", "100", "0.50", "-0.10"),
+                ("2026-07-17", "100", "0.48", "-0.09"),
+            ]:
+                odb.import_merged_dataframe(
+                    conn,
+                    expiry=exp,
+                    as_of_date=as_of,
+                    merged=_merged_row(strike, d, th, "Call"),
+                    source_options_csv="o.csv",
+                    source_greeks_csv="g.csv",
+                )
+            conn.close()
+            o = dss.DiagonalSearchOptions(
+                dte_near_min=40,
+                dte_near_max=60,
+                dte_far_min=90,
+                dte_far_max=120,
+            )
+            md = dss.dte_calendar_diagnostic_markdown("DTEG", as_of, "long_call_diagonal", o)
+            assert "Expirácie" in md
+            assert "Kalendárne dvojice" in md
+            assert "Súčet" in md
+        finally:
+            odb.OPTION_CHAINS_DIR = old
+            p = os.path.join(td, "DTEG.db")
             if os.path.isfile(p):
                 os.remove(p)

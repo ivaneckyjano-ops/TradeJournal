@@ -42,6 +42,8 @@ if "dsd_compare_agent_chat" not in st.session_state:
         st.session_state["dsd_compare_agent_chat"] = []
 if "dsd_post_search_is_empty" not in st.session_state:
     st.session_state["dsd_post_search_is_empty"] = False
+if "dsd_strike_prox_leg" not in st.session_state:
+    st.session_state["dsd_strike_prox_leg"] = "long"
 
 # Tabuľkové číslice — rovnaká šírka číslic v stĺpci (lepšie zarovnanie v tabuľke výsledkov)
 _DSD_TABLE_STYLE = """
@@ -77,6 +79,49 @@ def _dsd_data_editor_key(prefix: str, df: pd.DataFrame) -> str:
     return f"{prefix}_c{len(fp)}_r{len(df)}_h{abs(hash(fp)) % 10_000_000_000_000}"
 
 
+def _dsd_dte_ui_band_str(lo: int | None, hi: int | None) -> str:
+    """Jednoriadok pre pásom DTE v upozorneniach (Pokročilé)."""
+    if lo is None and hi is None:
+        return "vypnuté (ľubovoľné dni)"
+    if lo is not None and hi is not None:
+        return f"**{int(lo)}–{int(hi)}** dní"
+    if lo is not None:
+        return f"aspoň **{int(lo)}** dní"
+    return f"do **{int(hi)}** dní"  # type: ignore[misc]
+
+
+def _dsd_explain_suggested_dte_mismatch(
+    o: dss.DiagonalSearchOptions, pick: dict[str, object]
+) -> str:
+    """Nevyžaduje import dss fcií; porovnanie návrhu s pásmami z hľadania (žiadne kv.pen.)."""
+    try:
+        d_n = int(pick["dte_near"])
+        d_f = int(pick["dte_far"])
+    except (KeyError, TypeError, ValueError):
+        return ""
+    bits: list[str] = []
+    if o.dte_near_min is not None and d_n < int(o.dte_near_min):
+        bits.append(
+            f"DTE k skoršej dátumovej nohe v návrhu (**{d_n}** dní) je **pod** min. pásma skoršia (**{int(o.dte_near_min)}**)"
+        )
+    if o.dte_near_max is not None and d_n > int(o.dte_near_max):
+        bits.append(
+            f"skoršia strana v návrhu ({d_n} dní) je **nad** max. pásma skoršia ({int(o.dte_near_max)})"
+        )
+    if o.dte_far_min is not None and d_f < int(o.dte_far_min):
+        bits.append(
+            f"**najčastejšie tento bod:** neskoršia noha v návrhu je **{d_f} dní**, ale v Pokročilých máš **Neskoršia min. ≥ {int(o.dte_far_min)}** – "
+            "táto expirácia v importe môže byť **nižšie** než pásom"
+        )
+    if o.dte_far_max is not None and d_f > int(o.dte_far_max):
+        bits.append(
+            f"neskoršia strana ({d_f} dní) je **nad** max. pásma neskoršia ({int(o.dte_far_max)})"
+        )
+    if not bits:
+        return ""
+    return " **Prečo s tým „nesedí“ tvoj rozsah:** " + " ".join(bits) + "."
+
+
 def _dsd_render_empty_search_panel() -> None:
     """Výsledok 0 — mimo tlačidla „Hľadať“ (inak vnorené widgety + ``rerun`` mätú React/Streamlit)."""
     if not st.session_state.get("dsd_post_search_is_empty", False):
@@ -102,10 +147,11 @@ def _dsd_render_empty_search_panel() -> None:
     _fs = (filter_log.failure_steps or [])
     _dte_pick = None
     try:
-        _dte_pick = dss.first_calendar_dte_pair(
+        _dte_pick = dss.suggest_dte_pair_closest_to_ui(
             ticker=_t0,
             as_of_date=as_of0,
             strategy=_s0,  # type: ignore[arg-type]
+            opt=search_opts,
         )
     except Exception:
         _dte_pick = None
@@ -115,41 +161,74 @@ def _dsd_render_empty_search_panel() -> None:
             f"Brána zlyhala na **{_first.label}** (`{_first.field}`). "
             "Pozri protokol nižšie, tam je presne vidno, kde sa to zastavilo."
         )
+        if _first.field == "dte_near_min/dte_near_max/dte_far_min/dte_far_max":
+            st.markdown(
+                "— **Dôležité:** Upravíš len páslo **skoršej** expirácie (napr. 40–61), ale v Pokročilých ostane aj páslo **neskoršej** — "
+                "hľadanie musí nájsť **kalendárnu** dvojicu, kde *zároveň* DTE k skoršiemu dátumu ∈ skoršia a DTE k neskoršiemu dátumu ∈ neskoršia. "
+                "Ak **Neskoršia min** ostane napr. **90** dní a v importe druhá vhodná expirácia končí o pár dní skôr (napr. **85** dní), hlási sa zlyhanie DTE, "
+                "hoci skoršia strana by mohla s niektorou expiráciou sedieť. "
+                f"**Pásma z tohto hľadania — skoršia:** {_dsd_dte_ui_band_str(search_opts.dte_near_min, search_opts.dte_near_max)}; "
+                f"**neskoršia:** {_dsd_dte_ui_band_str(search_opts.dte_far_min, search_opts.dte_far_max)}."
+            )
         if _first.field == "dte_near_min/dte_near_max/dte_far_min/dte_far_max" and _dte_pick:
+            _dsv = _dte_pick.get("distance_score")
+            if _dsv is not None and float(_dsv) > 1e-6:
+                _p = _dsd_explain_suggested_dte_mismatch(search_opts, _dte_pick)
+                _pen = (
+                    f" *Kvádr. penalizácia* (súčet odmocnín mimo intervalu): **{float(_dsv):.0f}**; pri **jedinej** medzere to býva druhá mocnina odstupu v dňoch (napr. 5 dní mimo pásma ⇒ 25). "
+                    f"**0** = obe nohy v pásme.{_p}"
+                )
+            elif _dsv is not None:
+                _pen = " *Penalizácia* **0** = návrh v oboch pásmach; ak aj tak padla DTE brána, je to ojedinelé — pozri protokol."
+            else:
+                _pen = ""
             st.info(
-                "**Návrh z dát (prvá kalendárna dvojica v importe):** "
+                "**Návrh (dvojica v kalendári najbližšia k tvojim pásnam):** "
                 f"skoršia **{_dte_pick['expiry_near']}** (DTE **{_dte_pick['dte_near']}** dní), "
-                f"neskoršia **{_dte_pick['expiry_far']}** (DTE **{_dte_pick['dte_far']}** dní). "
-                "DTE filtre v Pokročilých môžeš predvyplniť na tieto hodnoty, potom znovu klikni **Hľadať**."
+                f"neskoršia **{_dte_pick['expiry_far']}** (DTE **{_dte_pick['dte_far']}** dní).{_pen} "
+                "Dole **Upraviť** zarovná **DTE pásma** v Pokročilých na túto dvojicu (dni), potom znovu klikni **Hľadať**."
             )
             if st.button(
                 "Upraviť na túto DTE dvojicu a obnoviť stránku",
                 key="dsd_apply_suggested_dte",
                 type="secondary",
             ):
-                st.session_state["dsd_use_dnmin"] = True
-                st.session_state["dsd_use_dnmax"] = True
-                st.session_state["dsd_use_dfmin"] = True
-                st.session_state["dsd_use_dfmax"] = True
-                st.session_state["dsd_dnmin"] = int(_dte_pick["dte_near"])
-                st.session_state["dsd_dnmax"] = int(_dte_pick["dte_near"])
-                st.session_state["dsd_dfmin"] = int(_dte_pick["dte_far"])
-                st.session_state["dsd_dfmax"] = int(_dte_pick["dte_far"])
+                st.session_state["dsd_pending_dte_suggestion"] = {
+                    "dte_near": int(_dte_pick["dte_near"]),
+                    "dte_far": int(_dte_pick["dte_far"]),
+                }
                 st.rerun()
             st.caption(
-                "Nastaví len DTE pásma na presné dni tejto dvojice. Potom ešte raz klikni **Hľadať**."
+                "Hodnoty sa zapíšu do session skôr, než sa vykreslia polia v Pokročilých (inak Streamlit hlási chybu na kľúči). Potom znovu klikni **Hľadať**."
             )
     else:
         st.error("DTE prešlo, ale ďalšie filtre nenašli kombináciu. Pozri protokol nižšie pre presnú bránu.")
     st.markdown(filter_log.failure_report_markdown(initial_opt=search_opts, last_tried_opt=effective_opt))
+    if any(
+        getattr(search_opts, f) is not None
+        for f in ("dte_near_min", "dte_near_max", "dte_far_min", "dte_far_max")
+    ):
+        _dte_gate = bool(_fs and _fs[0].field == "dte_near_min/dte_near_max/dte_far_min/dte_far_max")
+        try:
+            _dm = dss.dte_calendar_diagnostic_markdown(
+                _t0, as_of_date=as_of0, strategy=_s0, opt=search_opts  # type: ignore[arg-type]
+            )
+            if _dm:
+                with st.expander(
+                    "DTE diagnostika: expirácie a kalendárne dvojice (kde nevyhovujú pásma)",
+                    expanded=_dte_gate,
+                ):
+                    st.markdown(_dm)
+        except Exception:
+            st.caption("DTE diagnostiku sa nepodarilo zostaviť.")
     try:
         st.markdown(dss.diagonal_relax_suggestions_markdown(search_opts))
     except Exception:
         st.caption("Skús v Pokročilých zjemniť DTE, theta alebo vegu, prípadne tlačidlo **Širšie filtre**.")
     try:
         _hint = dss.diagonal_search_why_empty_hint(
-            _t0, as_of_date=as_of0, strategy=_s0, options=search_opts
-        )  # type: ignore[arg-type]
+            _t0, as_of_date=as_of0, strategy=_s0, opt=search_opts
+        )
         if _hint:
             st.info(_hint)
     except Exception:
@@ -166,6 +245,7 @@ _DSD_REC_NOTE = (
     "**Širšie filtre** (tlačidlo): DTE **10–60** / **35–400**, theta **0,5–15**, vega **0,05–0,35** — často pomôže pri **GLD** a kratších reťazcoch."
 )
 _DSD_REC_STRICT = {
+    "dsd_strike_prox_leg": "long",
     "dsd_use_dt": True,
     "dsd_delta_tol": 2.0,
     "dsd_use_tmin": True,
@@ -201,6 +281,7 @@ _DSD_REC_STRICT = {
     "dsd_minoi": 100,
 }
 _DSD_REC_RELAXED = {
+    "dsd_strike_prox_leg": "long",
     "dsd_use_dt": True,
     "dsd_delta_tol": 2.0,
     "dsd_use_tmin": True,
@@ -314,6 +395,10 @@ def _dsd_apply_diagonal_options_to_session_state(o: dss.DiagonalSearchOptions, t
     if o.min_volume is not None:
         st.session_state["dsd_minvol"] = int(o.min_volume)
     st.session_state["dsd_rank_mode"] = o.rank_mode
+    if o.strike_proximity_leg is None:
+        st.session_state["dsd_strike_prox_leg"] = "none"
+    else:
+        st.session_state["dsd_strike_prox_leg"] = str(o.strike_proximity_leg)
     if o.spot is not None and float(o.spot) > 0:
         st.session_state[f"dsd_spot_{tk}"] = float(o.spot)
 
@@ -332,6 +417,29 @@ def _dsd_drain_rehydrate_after_relaxation() -> None:
     if blob:
         o = _dsd_options_from_stored_blob(blob)
         _dsd_apply_diagonal_options_to_session_state(o, tk)
+
+
+def _dsd_drain_pending_dte_suggestion() -> None:
+    """
+    DTE z tlačidla „Upraviť“ — **pred** widgetmi s kľúčmi ``dsd_use_dnmin``/``dsd_dn*``.
+    Inak: ``StreamlitAPIException`` (session_state po inštancii widgetu sa nesmie meniť týmto kľúčom).
+    """
+    p = st.session_state.pop("dsd_pending_dte_suggestion", None)
+    if not p or not isinstance(p, dict):
+        return
+    try:
+        d_n = int(p["dte_near"])
+        d_f = int(p["dte_far"])
+    except (KeyError, TypeError, ValueError):
+        return
+    st.session_state["dsd_use_dnmin"] = True
+    st.session_state["dsd_use_dnmax"] = True
+    st.session_state["dsd_use_dfmin"] = True
+    st.session_state["dsd_use_dfmax"] = True
+    st.session_state["dsd_dnmin"] = d_n
+    st.session_state["dsd_dnmax"] = d_n
+    st.session_state["dsd_dfmin"] = d_f
+    st.session_state["dsd_dfmax"] = d_f
 
 
 def _dsd_on_ticker_change() -> None:
@@ -471,6 +579,7 @@ def _spread_table_column_config(df: pd.DataFrame) -> dict:
 
 _dsd_inject_tabular_css_once()
 _dsd_drain_rehydrate_after_relaxation()
+_dsd_drain_pending_dte_suggestion()
 st.title("Hľadanie delty — diagonály")
 _flash_ok = st.session_state.pop("dsd_flash_success", None)
 if _flash_ok:
@@ -722,6 +831,21 @@ with st.expander("Pokročilé filtre a režim triedenia", expanded=False):
             "Pri **short call/put** diagonáli je **Short** na **neskoršej** expirácii a **Long** na skoršej — "
             "pásma *Neskoršia min/max* = stĺpec **Short — DTE**; *Skoršia* = **Long — DTE**."
         )
+    st.selectbox(
+        "Strike k spotu (|K−spot|) — ktorá noha má *menšie* |strike − spot| (vyžaduje spot > 0)",
+        options=["long", "short", "none"],
+        key="dsd_strike_prox_leg",
+        format_func=lambda x: {
+            "long": "Long (predvolené) — táto noha bližšie k spotu",
+            "short": "Short — táto noha bližšie k spotu",
+            "none": "Bez filtra",
+        }[x],
+    )
+    st.caption(
+        "Bez **spotu** (hore) sa tento filter neaplikuje. Pri **OTM call** je zvyčajne *nižší* strike *bližšie* k spotu; "
+        "u **long call** diagonálu je long na neskoršej expirácii — ak je long strike vyšší ako short, long často **nie** je bližšie. "
+        "Nastavenie sa pri **automatickom zjemnení** filtrov nemení (rovnako ako DTE)."
+    )
     liq1, liq2, liq3 = st.columns(3)
     with liq1:
         use_otm = st.checkbox(
@@ -799,6 +923,13 @@ if st.button("Hľadať", type="primary", key="dsd_run"):
         smin = float(strike_od) if use_strike_band else None
         smax = float(strike_do) if use_strike_band else None
         spot_f = float(spot_display)
+        _prox = str(st.session_state.get("dsd_strike_prox_leg", "long"))
+        if _prox == "none":
+            _strike_leg = None
+        elif _prox == "short":
+            _strike_leg = "short"
+        else:
+            _strike_leg = "long"
         search_opts = dss.DiagonalSearchOptions(
             spot=spot_f if spot_f > 0 else None,
             rank_mode=rank_mode,  # type: ignore[arg-type]
@@ -822,6 +953,7 @@ if st.button("Hľadať", type="primary", key="dsd_run"):
             min_volume=int(min_volume) if use_minvol else None,
             require_iv_short_ge_long=bool(use_iv_sl),
             iv_short_ge_long_margin=float(iv_margin) if use_iv_sl else 0.0,
+            strike_proximity_leg=_strike_leg,
         )
         _precheck = dss.diagonal_search_precheck_warnings_markdown(
             ticker, as_of_date=as_of, strategy=strategy, opt=search_opts
@@ -915,6 +1047,8 @@ if st.button("Hľadať", type="primary", key="dsd_run"):
         st.error(f"Chyba: {type(exc).__name__}: {exc}")
         st.stop()
 
+_dsd_render_empty_search_panel()
+
 _dsd_proto = st.session_state.get("dsd_last_protocol_md")
 if _dsd_proto:
     with st.expander("📋 Kompletný protokol posledného hľadania (Markdown — kopíruj alebo stiahni)", expanded=False):
@@ -999,7 +1133,7 @@ if res is not None and not res.empty:
     )
     st.caption(
         "**Čistá theta:** **+** = decay v tvoj prospech (zjednodušene ako *denný príjem* z theta v týchto jednotkách), "
-        "**−** = decay proti tebe (*denná strata*). Ide o model z reťazca, nie hotovosť."
+        "**−** = decay proti tebe (*denná strata*). **Riadky so zápornou čistou thetou hľadanie nezobrazuje** (Pokročilé stále umožnia zužovať hornú/dolnú hranu medzi *kladnými*). Ide o model z reťazca, nie hotovosť."
     )
     st.caption(
         "**APR % (rát.):** hrubý pomer očakávaného denného theta (USD/deň na 1 lot) k absolútnej veľkosti debetu; na porovnanie kandidátov, nie zaručený výnos."

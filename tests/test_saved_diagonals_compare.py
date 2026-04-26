@@ -58,13 +58,13 @@ def test_better_short_bid_can_outrank_same_base_score():
     assert float(out.iloc[0]["Short bid (kval.) 0–100"]) > float(out.iloc[1]["Short bid (kval.) 0–100"])
 
 
-def test_invalid_strike_config_filtered_out():
-    """Riadok kde Long strike < Short strike musí byť vyfiltrovaný z porovnania."""
+def test_long_strike_lt_short_still_compared():
+    """Long strike < Short strike sa nevyraďuje — oba riadky sa zaradia do poradia."""
     df = pd.DataFrame(
         {
             "ID": [32, 33],
             "Short — strike": [382.5, 460.0],
-            "Long — strike": [380.0, 540.0],  # ID 32: long < short → invalid
+            "Long — strike": [380.0, 540.0],  # ID 32: long < short (dovolené)
             "Čistá delta ×100": [1.0, 1.0],
             "Čistá theta (+ príjem / − strata) ×100": [12.0, 2.4],
             "Čistá vega ×100": [0.35, 0.06],
@@ -73,17 +73,16 @@ def test_invalid_strike_config_filtered_out():
         }
     )
     out, md, protocol = sdc.compare_saved_diagonals(df)
-    # Iba ID 33 musí ostať
-    assert len(out) == 1
-    assert int(out.iloc[0]["ID"]) == 33
-    # Protokol a summary musia obsahovať zmienku o vyfiltrovanom ID 32
-    assert "32" in md
-    assert "32" in protocol
-    assert "vyfiltrovan" in md.lower() or "vyfiltrovan" in protocol.lower()
+    assert len(out) == 2
+    out_ids = {int(x) for x in out["ID"].tolist()}
+    assert out_ids == {32, 33}
+    assert "Počet v porovnaní" in md or "porovnan" in md.lower()
+    assert "1. miesto" in md
+    assert "32" in protocol and "33" in protocol
 
 
-def test_all_invalid_strike_config_returns_empty():
-    """Ak sú všetky riadky s long < short, výsledok je prázdny s varovnou správou."""
+def test_all_long_lt_short_still_ranks_both():
+    """Aj keď pri oboch long < short, oba sa porovnajú (nie prázdna tabuľka)."""
     df = pd.DataFrame(
         {
             "ID": [1, 2],
@@ -93,9 +92,9 @@ def test_all_invalid_strike_config_returns_empty():
             "Debit/kredit ($/1 lot ×100)": [100.0, 80.0],
         }
     )
-    out, md, _p = sdc.compare_saved_diagonals(df)
-    assert out.empty
-    assert "vyfiltrovan" in md.lower() or "long strike" in md.lower()
+    out, _md, _p = sdc.compare_saved_diagonals(df)
+    assert len(out) == 2
+    assert {int(x) for x in out["ID"].tolist()} == {1, 2}
 
 
 def test_theta_debit_delta_columns_correctly_mapped():

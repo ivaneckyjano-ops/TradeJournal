@@ -76,6 +76,9 @@ with st.expander("Prehľad sektorov (Barchart → rovnaký zoznam ako v Symboly)
     st.markdown(barchart_insight_sector_guide_markdown())
 
 with st.expander("Korelácia uzatváracích cien (CSV z Barchartu, DB, matica)", expanded=False):
+    _si_ext = st.session_state.pop("si_ext_notice", None)
+    if _si_ext:
+        st.success(_si_ext)
     st.caption(
         "Stiahni z Barchartu **denné** CSV (**Time** / **Čas** + **Latest** / **Najnovšie**). "
         "Korelácia = **Pearson na log-výnosoch**; páry používajú **prienik** obchodných dní (v okne **max. dní** od najnovšieho)."
@@ -168,9 +171,81 @@ with st.expander("Korelácia uzatváracích cien (CSV z Barchartu, DB, matica)",
             except Exception as e:
                 st.error(f"{type(e).__name__}: {e}")
 
+    with st.expander("🗑 Odstrániť symbol / snímok z histórie (korelácia)", expanded=False):
+        _hist_del = st.session_state.pop("si_hist_del_notice", None)
+        if _hist_del:
+            st.success(_hist_del)
+        st.caption(
+            "Ak je v zozname zlý upload (napr. zlý ticker pri uložení CSV) alebo poškodené dáta, zmaž záznam a **nahraj CSV znova**. "
+            "Snímky sú v tabuľke `ticker_hist_snapshots`. **Uložené korelačné matice** sú zvlášť (`ticker_corr_matrix_runs`) — po vymazaní histórie môžu ostať; sekcia nižšie ich dočistí. "
+            "Záložka **Symboly** sa tým nemení."
+        )
+        _del_list = db.list_ticker_hist_snapshots_latest_per_ticker()
+        if not _del_list:
+            st.info("Zatiaľ **žiadne** uložené série v DB — môžeš ešte vyčistiť **uložené matice** podľa symbolu (ak ti tam ostal zlý ticker).")
+        else:
+            _del_labels = [
+                f"{s['ticker']}: id **{s['id']}** · {s['bar_count']}d · {str(s['created_at'])[:10]}"
+                for s in _del_list
+            ]
+            _del_by_label = {_del_labels[i]: _del_list[i] for i in range(len(_del_list))}
+            _pick_lbl = st.selectbox(
+                "Vyber riadok (najnovší snímok na tento symbol):",
+                options=_del_labels,
+                key="si_hist_del_pick",
+            )
+            dc1, dc2 = st.columns(2)
+            with dc1:
+                if st.button("Zmazať tento 1 snímok", key="si_hist_del_one", type="secondary"):
+                    _row = _del_by_label.get(_pick_lbl)
+                    if _row:
+                        n = db.delete_ticker_hist_snapshot(int(_row["id"]))
+                        if n:
+                            st.session_state["si_hist_del_notice"] = (
+                                f"Snímok **{int(_row['id'])}** (`{_row.get('ticker', '')}`) odstránený. "
+                                "Ak ešte existovali staršie snímky tohto tickera, v zozname bude opäť zobrazený **predchádzajúci**."
+                            )
+                        else:
+                            st.session_state["si_hist_del_notice"] = "Záznam sa nenašiel (možno už bol zmazaný)."
+                    st.rerun()
+            with dc2:
+                if st.button("Zmazať VŠETKY snímky pre tento ticker", key="si_hist_del_all", type="primary"):
+                    _row = _del_by_label.get(_pick_lbl)
+                    if _row:
+                        tk0 = str(_row.get("ticker") or "").strip().upper()
+                        n2 = db.delete_ticker_hist_snapshots_by_ticker(tk0)
+                        n3 = db.delete_ticker_corr_matrix_runs_containing_ticker(tk0)
+                        st.session_state["si_hist_del_notice"] = (
+                            f"História snímok: **{n2}** záznam(ov) pre **{tk0}**. "
+                            f"Uložené korelačné matice odstránené: **{n3}** (všetky, ktoré obsahovali tento symbol)."
+                        )
+                    st.rerun()
+        st.markdown("---")
+        st.markdown("**Uložené korelačné matice** (ak ťa otravujú ešte po vymazaní snímok)")
+        _t_purge = st.text_input(
+            "Symbol (ticker) na vyčistenie mát v „Uložené matice“",
+            value="",
+            key="si_corr_purge_ticker",
+            placeholder="TXN",
+            help="Zmaže celé záznamy (riadky) v `ticker_corr_matrix_runs`, ak zoznam tickerov v matici obsahuje tento symbol.",
+        )
+        if st.button("Zmazať uložené matice obsahujúce tento symbol", key="si_corr_purge_runs", type="secondary"):
+            tku = (_t_purge or "").strip().upper()
+            if not tku:
+                st.session_state["si_hist_del_notice"] = "Zadaj symbol (napr. **TXN**)."
+            else:
+                npur = db.delete_ticker_corr_matrix_runs_containing_ticker(tku)
+                st.session_state["si_hist_del_notice"] = (
+                    f"Z uložených korelačných mátic odstránené **{npur}** záznam(ov) obsahujúcich **{tku}**."
+                )
+            st.rerun()
+
     st.divider()
     st.markdown("##### Korelačná matica z uložených snímok")
-    snaps = db.list_ticker_hist_snapshots(300)
+    snaps = db.list_ticker_hist_snapshots_latest_per_ticker()
+    st.caption(
+        "V zozname je **najnovší** uložený snímok pre každý ticker (nie 300 posledných riadkov z DB, aby nezmizli staršie tickery)."
+    )
     if len(snaps) < 2:
         st.info("V DB musia byť aspoň **2** uložené série — najprv ich pridaj vyššie.")
     else:
@@ -274,6 +349,115 @@ with st.expander("Korelácia uzatváracích cien (CSV z Barchartu, DB, matica)",
             no = rr.get("n_obs")
             if no:
                 st.dataframe(pd.DataFrame(no, index=tks, columns=tks), use_container_width=True)
+            if tks and mat:
+                st.markdown("##### Rozšíriť o ďalšie tickery")
+                st.caption(
+                    "Nemusíš skladať maticu od nuly: pôvodný blok **všetkých pôvodných parov** ostane z tohto uloženia. "
+                    "Dopočítajú sa korelácie s **novými** a medzi **novými** (Pearson / log-výnosy, rovnaké **max. dní** ako v tomto zázname). "
+                    "Pre staré tickery sa na nové páry berie **najnovší** snímok z DB — ak chceš inú dĺžku histórie, nechaj v DB len ten snímok alebo urob novú plnú maticu. "
+                    "**Korelácia** nie zo záložky Symboly: nový symbol musí mať nahraté **CSV** vyššie (uložená história v DB)."
+                )
+                _snaps_x = db.list_ticker_hist_snapshots_latest_per_ticker()
+                _labels_x = [
+                    f"{s['id']}: {s['ticker']} · {s['bar_count']}d · {str(s['created_at'])[:10]}"
+                    for s in _snaps_x
+                ]
+                _idmap_x = {_labels_x[i]: _snaps_x[i]["id"] for i in range(len(_labels_x))}
+                _have = {str(x).strip().upper() for x in tks}
+                _add_opts = [
+                    lb
+                    for lb, s in zip(_labels_x, _snaps_x)
+                    if str(s.get("ticker") or "").strip().upper() not in _have
+                ]
+                if not _add_opts:
+                    st.info(
+                        "Nie je čo pridať: v DB buď **nie je** iný ticker s históriou, alebo **všetky** tickery s uloženým CSV "
+                        "už máš v tejto matici. **Symbol v Symboly nestačí** — musí byť sekcia **„Uložiť sériu“** (denné CSV z Barchartu). "
+                        "Potom sa v zozname objaví **najnovší** snímok na tento symbol."
+                    )
+                else:
+                    _ext_key = f"si_mat_ext_{int(rr['id'])}"
+                    _ext_pick = st.multiselect(
+                        "Pridať snímky (iba tickery, ktoré ešte v matici nie sú)",
+                        options=_add_opts,
+                        key=f"{_ext_key}_multiselect",
+                    )
+                    if st.button(
+                        "Dopočítať a načítať rozšírenú maticu do pracovného stavu",
+                        key=f"{_ext_key}_run",
+                    ):
+                        if not _ext_pick:
+                            st.warning("Vyber aspoň jeden snímok.")
+                        else:
+                            try:
+                                frames: dict[str, pd.DataFrame] = {}
+                                new_tk_list: list[str] = []
+                                for lb in _ext_pick:
+                                    sid = int(_idmap_x[lb])
+                                    hrow = db.get_ticker_hist_snapshot(sid)
+                                    if not hrow:
+                                        continue
+                                    tku = str(hrow.get("ticker") or "").strip().upper()
+                                    if not tku:
+                                        continue
+                                    if tku in frames:
+                                        raise ValueError(
+                                            f"Ticker **{tku}** je v rozšírení viackrát — nechaj jeden snímok."
+                                        )
+                                    new_tk_list.append(tku)
+                                    frames[tku] = bhc.hist_series_json_to_dataframe(
+                                        str(hrow.get("series_json") or "")
+                                    )
+                                if not new_tk_list:
+                                    st.warning("Nepodarilo sa načítať nové snímky.")
+                                else:
+                                    old_latest = db.get_latest_ticker_hist_snapshot_rows(
+                                        [str(x) for x in tks], max_scan=500
+                                    )
+                                    miss = [
+                                        str(x).strip().upper()
+                                        for x in tks
+                                        if str(x).strip().upper() not in old_latest
+                                    ]
+                                    if miss:
+                                        st.error(
+                                            "V DB chýba **najnovší** snímok pre: **"
+                                            + "**, **".join(miss)
+                                            + "**. Ulož sériu vyššie, potom skús znova."
+                                        )
+                                    else:
+                                        for x in tks:
+                                            u = str(x).strip().upper()
+                                            frames[u] = bhc.hist_series_json_to_dataframe(
+                                                str(old_latest[u].get("series_json") or "")
+                                            )
+                                        r_method = str(rr.get("method") or "pearson")
+                                        r_ret = str(rr.get("return_kind") or "log")
+                                        if r_method not in ("pearson", "spearman"):
+                                            r_method = "pearson"
+                                        t_new, m_new, n_new = bhc.extend_correlation_matrix(
+                                            tks,
+                                            mat,
+                                            no,
+                                            new_tk_list,
+                                            frames,
+                                            max_trading_days=int(rr.get("max_days") or max_d),
+                                            method="spearman" if r_method == "spearman" else "pearson",
+                                            return_kind="simple" if r_ret == "simple" else "log",
+                                        )
+                                        st.session_state["si_last_matrix"] = {
+                                            "tickers": t_new,
+                                            "matrix": m_new,
+                                            "n_obs": n_new,
+                                            "max_days": int(rr.get("max_days") or max_d),
+                                        }
+                                        st.session_state["si_ext_notice"] = (
+                                            f"Matica rozšírená na **{len(t_new)}** symbolov — náhľad hore v tejto sekcii. "
+                                            "Môžeš ju uložiť znova pod novým názvom."
+                                        )
+                                        st.rerun()
+                            except Exception as e:
+                                st.error(f"{type(e).__name__}: {e}")
             if st.button("Zmazať túto maticu", key="si_run_del"):
                 db.delete_ticker_corr_matrix_run(int(rr["id"]))
                 st.rerun()

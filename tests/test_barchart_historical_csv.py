@@ -78,3 +78,27 @@ def test_hist_json_roundtrip_and_pairwise_matrix():
     assert tickers == ["AAA", "BBB", "ZZZ"]
     assert mat[0][0] == 1.0 and mat[1][1] == 1.0 and mat[2][2] == 1.0
     assert mat[0][1] is not None and -1.0 <= float(mat[0][1]) <= 1.0
+
+
+def test_extend_correlation_matrix_preserves_top_left_block():
+    dates = pd.to_datetime(
+        ["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-06", "2026-01-07", "2026-01-08"]
+    )
+    d1 = pd.DataFrame({"date": dates, "close": [100.0, 101.0, 100.5, 102.0, 101.5, 102.5]})
+    d2 = pd.DataFrame({"date": dates, "close": [50.0, 50.5, 50.2, 51.0, 50.8, 51.2]})
+    d3 = pd.DataFrame({"date": dates, "close": [10.0, 10.2, 10.1, 10.4, 10.3, 10.5]})
+    old_mat = [[1.0, 0.33], [0.33, 1.0]]
+    old_n = [[10, 8], [8, 9]]
+    t, m, nmat = bhc.extend_correlation_matrix(
+        ["AAA", "BBB"],
+        old_mat,
+        old_n,
+        ["ZZZ"],
+        {"AAA": d1, "BBB": d2, "ZZZ": d3},
+        max_trading_days=None,
+    )
+    assert t == ["AAA", "BBB", "ZZZ"]
+    assert m[0][0] == 1.0 and m[0][1] == 0.33 and m[1][0] == 0.33 and m[1][1] == 1.0
+    assert m[0][2] is not None and m[1][2] is not None and m[2][0] is not None
+    assert m[2][2] == 1.0
+    assert nmat[0][0] == 10 and nmat[0][1] == 8

@@ -234,3 +234,100 @@ def correlation_matrix_pairwise(
                 mat[i][j] = mat[j][i] = None
                 nmat[i][j] = nmat[j][i] = None
     return tickers, mat, nmat
+
+
+def _cell_to_float_log_corr(v: object) -> float | None:
+    if v is None:
+        return None
+    try:
+        if isinstance(v, (str, int, float, np.floating, np.integer)):
+            if pd.isna(v):  # type: ignore[arg-type]
+                return None
+    except (TypeError, ValueError):
+        pass
+    try:
+        return float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def extend_correlation_matrix(
+    old_tickers: list[str],
+    old_matrix: list[list[object]],
+    old_n_obs: list[list[object]] | None,
+    new_tickers: list[str],
+    frames: dict[str, pd.DataFrame],
+    *,
+    max_trading_days: int | None = 504,
+    method: CorrMethod = "pearson",
+    return_kind: Literal["simple", "log"] = "log",
+) -> tuple[list[str], list[list[float | None]], list[list[int | None]]]:
+    """
+    Obohatí uloženú maticu o nové tickery: hornoľavý blok (staré×staré) ostané z **old_matrix**,
+    nové riadky/stĺpce sa dopočítajú z ``frames`` (párovo, rovnako ako ``correlation_matrix_pairwise``).
+
+    Kľúče v ``frames`` očakávame ako **veľké písmená** (AAPL, …) a v súlade s ``old_tickers``/``new_tickers``.
+    """
+    old_u = [str(t).strip().upper() for t in old_tickers if str(t).strip()]
+    new_u = sorted([str(t).strip().upper() for t in new_tickers if str(t).strip()], key=str.upper)
+    n = len(old_u)
+    m = len(new_u)
+    if m < 1:
+        raise ValueError("Potrebuj aspoň jeden nový ticker na rozšírenie matice.")
+    for ftk in old_u + new_u:
+        u = str(ftk).strip().upper()
+        if u not in frames or frames[u].empty:
+            raise ValueError(f"Chýbajú dáta (close) pre ticker **{u}**.")
+    if n < 1:
+        raise ValueError("Pôvodná matica musí mať aspoň jeden ticker.")
+    if len(old_matrix) != n or any((len(r) if r is not None else 0) != n for r in old_matrix):
+        raise ValueError("Rozmer pôvodnej matice nezodpovedá počtu pôvodných tickerov.")
+    all_tk: list[str] = list(old_u) + new_u
+    N = n + m
+    mat: list[list[float | None]] = [[None] * N for _ in range(N)]
+    nmat: list[list[int | None]] = [[None] * N for _ in range(N)]
+
+    for i in range(n):
+        for j in range(n):
+            mat[i][j] = _cell_to_float_log_corr(old_matrix[i][j])
+    if old_n_obs is not None and len(old_n_obs) == n and all(
+        (len(r) if r is not None else 0) == n for r in old_n_obs
+    ):
+        for i in range(n):
+            for j in range(n):
+                v = old_n_obs[i][j]
+                if v is None:
+                    continue
+                try:
+                    fv = float(v)
+                    nmat[i][j] = None if np.isnan(fv) else int(round(fv))
+                except (TypeError, ValueError):
+                    nmat[i][j] = None
+    for k in range(m):
+        idx = n + k
+        mat[idx][idx] = 1.0
+        ca = frames[new_u[k]]["close"]
+        nmat[idx][idx] = _n_obs_single_close(ca, max_trading_days)
+
+    def _pair(
+        tia: str, tib: str, ii: int, ji: int
+    ) -> None:
+        try:
+            ca, cb, _ = align_close_series(frames[tia], frames[tib], max_trading_days=max_trading_days)
+            corr, nobs, _, _ = correlation_from_closes(ca, cb, method=method, return_kind=return_kind)
+            mat[ii][ji] = mat[ji][ii] = float(corr)
+            nmat[ii][ji] = nmat[ji][ii] = int(nobs)
+        except (ValueError, TypeError, KeyError):
+            mat[ii][ji] = mat[ji][ii] = None
+            nmat[ii][ji] = nmat[ji][ii] = None
+
+    for i in range(n):
+        for k in range(m):
+            _pair(old_u[i], new_u[k], i, n + k)
+
+    for k1 in range(m):
+        for k2 in range(k1 + 1, m):
+            i1, i2 = n + k1, n + k2
+            _pair(new_u[k1], new_u[k2], i1, i2)
+
+    return all_tk, mat, nmat
