@@ -50,6 +50,10 @@ set_tradejournal_page("steady_yields")
 
 st.title("Steady Yields")
 st.caption(
+    "**Návod:** **Monitor** = delty a semafor po skupinách. **Yield a APR** = profil, roll udalosti, súhrn. **Monitoring a roll** = prahy, alerty, návrhy. **Skener** = likvidita a IV viacerých tickerov. "
+    "Všade treba **Group ID** v Trade Log. Aplikácia **neposiela** príkazy do TWS."
+)
+st.caption(
     "PMCC / diagonály / kalendáre — APR a cost basis z **realizovaných** údajov (roll udalosti, Trade Log). "
     "Semafor a roll odhad z **IBKR** (bid/ask). Nepodáva príkazy. "
     "**DB:** `trades` (skupiny), `steady_yield_roll_events`, `steady_yield_group_profile` "
@@ -897,6 +901,10 @@ tab_sy_monitor, tab_yield, tab_mon, tab_scan = st.tabs(
 with tab_sy_monitor:
     st.subheader("Monitor otvorených pozícií")
     st.caption(
+        "**Návod:** Skupiny = **Group ID** z Trade Logu. Pri pripojenom IB sa **|Δ| teraz** ťahá z API; tlačidlo **Načítať pozície z IB** obnoví cache a portfólio. "
+        "**|Δ| vstup** potrebuje **IV pri vstupe** v obchode. Semafor pre short — prahy v **Monitoring a roll**."
+    )
+    st.caption(
         "Otvorené nohy z **Trade Logu** podľa **Group ID**. **|Δ| teraz** = IBKR modelGreeks (obnovuje sa ~každých 90 s); "
         "ak API nedá delta, použije sa cache z tlačidla nižšie alebo BS z ceny v portfóliu. **|Δ| vstup** = Black‑Scholes z "
         "**IV pri vstupe** v denníku, DTE k expirácii k **dátumu vstupu** a spotom z **STK v účte** alebo posledným close — "
@@ -1179,6 +1187,10 @@ with tab_sy_monitor:
 
 # ─── Tab: Yield a APR ─────────────────────────────────────────────────────────
 with tab_yield:
+    st.caption(
+        "**Návod:** Vyber **skupinu** s PMCC/diagonálou. Doplň **profil** (očakávaný APR, náklad LEAPS), zapisuj **roll / inkaso** udalosti — "
+        "z nich sa rátajú realizované toky a APR. Súhrn a metriky sú pod formulármi."
+    )
 
     c1, c2 = st.columns([2, 1])
     with c1:
@@ -1383,6 +1395,10 @@ with tab_yield:
 
 # ─── Tab: Monitoring ─────────────────────────────────────────────────────────
 with tab_mon:
+    st.caption(
+        "**Návod:** Vyber skupinu, nastav **prahy semafora** (|Δ|, DTE), obnov pozície z IB. Sleduj short nohy, alerty a návrhy rollu — "
+        "nič sa neposiela ako príkaz do TWS."
+    )
     if not ibkr.is_connected():
         st.warning("Pripoj **TWS / Gateway** pre live delty a sken kontraktov.")
     if ibkr.is_connected() and st.button("Obnoviť pozície s Greeks", key="sy_refresh_greeks"):
@@ -1713,8 +1729,8 @@ with tab_scan:
             _remembered.append(_u)
 
     st.caption(
-        "Políčko **Ďalšie tickery** je nad zoznamom: nové symboly sa ihned zapamätajú a **pridajú do výberu**. "
-        "Predvolený výber po reštarte appky = **posledný zoznam z tlačidla Spustiť sken** (uložené v DB), nie prvých 5 z abecedy."
+        "**Návod:** Vyber tickery (zo **Symboly** / obchodov alebo doplnené vyššie), nastav filtre a **Spustiť sken** — tabuľka likvidity a IV z IB. "
+        "Políčko **Ďalšie tickery** si pamätá symboly medzi behmi; predvolený výber po reštarte = posledný uložený zoznam zo skenu."
     )
     extra = st.text_input(
         "Ďalšie tickery (čiarkou)",

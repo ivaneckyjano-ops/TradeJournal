@@ -585,6 +585,9 @@ _flash_ok = st.session_state.pop("dsd_flash_success", None)
 if _flash_ok:
     st.success(_flash_ok)
 st.caption(
+    "**Návod:** Najprv import v **DB Grékov**. Vyber **ticker**, **dátum snímky** a typ diagonálu; nastav cieľ delty a filtre, spusti **hľadanie**. Výsledky sú z lokálnych `.db` súborov; detailný postup je v expandéri **Manuál**."
+)
+st.caption(
     "Dáta z **DB Grékov** (`data/option_chains/*.db`). Dva kontrakty rovnakého typu (Call alebo Put): "
     "**skoršia** expirácia = skorší dátum v kalendári, **neskoršia** = neskorší. Gréky sú za long 1 kontrakt; váhy zodpovedajú long/short nohám."
 )

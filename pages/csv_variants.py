@@ -17,7 +17,7 @@ set_tradejournal_page("csv_variants")
 
 st.title("CSV Varianty")
 st.caption(
-    "Nahraj CSV s variantmi spreadu a apka vyberie top výsledky priamo tu. "
+    "**Návod:** Nahraj **CSV** exportovaný z tabuľky variantov (kalendár/diagonál podľa stĺpcov). Vyber stratégiu, skontroluj náhľad, spusti **vyhodnotenie** — uvidíš zoradené top varianty. "
     "Podporuje európske čísla s čiarkou, percentá aj dopočet `Net Debit` z `Ask2 - Bid1`."
 )
 

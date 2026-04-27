@@ -18,6 +18,10 @@ set_tradejournal_page("option_chain_greeks")
 
 st.title("Databáza Grékov")
 st.caption(
+    "**Návod:** Záložka **Import CSV** — nahraj páry Barchart súborov (options + greeks) a importuj do per-ticker DB. **Prehľad** — čítaj uložené reťazce. "
+    "Tieto dáta používa napr. **Hľadanie delty — diagonály**."
+)
+st.caption(
     "Samostatná databáza **mimo journal.db**: jeden súbor `data/option_chains/<TICKER>.db` na symbol. "
     "Nahraj Barchart CSV — názov musí obsahovať `options-exp` alebo `volatility-greeks-exp`, dátum expirácie "
     "a na konci snímku `-MM-DD-YYYY.csv`."
@@ -203,6 +207,10 @@ def _render_import_report(report: dict) -> None:
 
 
 with tab_import:
+    st.caption(
+        "**Návod:** Nahraj **Barchart CSV** (options + greeks pre rovnakú expiráciu a dátum snímky). Skontroluj náhľad, zvoľ **Importovať všetko** alebo **len chýbajúce**. "
+        "Formát názvu súboru je v popise stránky hore."
+    )
     st.markdown("##### Nahrať súbory")
     uploaded = st.file_uploader(
         "Jeden alebo viac CSV (môžeš nahrať naraz options aj greeks pre viac expirácií)",
@@ -345,6 +353,9 @@ with tab_import:
             st.rerun()
 
 with tab_view:
+    st.caption(
+        "**Návod:** Vyber **ticker** a prípadne filtre expirácie / dátumu snímky — prehliadaš dáta v lokálnej `data/option_chains/<TICKER>.db`, nie v hlavnom journal.db."
+    )
     tickers = odb.list_chain_tickers()
     if not tickers:
         st.info("Zatiaľ nie je žiadna DB — použij záložku **Import CSV** alebo skript `scripts/import_barchart_option_chains.py`.")

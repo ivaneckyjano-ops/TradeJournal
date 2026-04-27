@@ -15,9 +15,8 @@ set_tradejournal_page("roll_breakeven")
 
 st.title("Rolovanie / spread — cena podkladu pre cieľové netto")
 st.caption(
-    "Model **Black–Scholes** s **ručnými** IV, strike, DTE a smerom nôh. Nájde cenu spotu, kde je "
-    "súčet (+ predaj, − nákup) príjem/prémiový tok rovný **cieľu** (typicky 0 = presne hranica medzi tým, "
-    "či platíš alebo príjímaš prémiu v tomto zjednodušenom modely)."
+    "**Návod:** Zapni nohy 1–4 (predaj/nákup, call/put, strike, DTE, IV, kontrakty) a nastav **cieľové netto** (často 0 = breakeven v prémii). "
+    "Model **Black–Scholes** s ručnými vstupmi nájde spot(y), kde súčet (+ predaj, − nákup) prémii zodpovedá cieľu — bez IB, zjednodušený odhad."
 )
 
 c1, c2, c3 = st.columns(3)

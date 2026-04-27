@@ -494,6 +494,10 @@ for _k, _v in _ss_defaults.items():
         st.session_state[_k] = _v
 
 st.title("Strategy Modeler — Roll Simulátor")
+st.caption(
+    "**Návod:** Buď **načítaj** otvorenú nohu z denníka (s IB aj spot), alebo zadaj **Spot, IV, DTE** a striky ručne. "
+    "Posúvaj **slider** nového striku — sleduj PoP, SD a záložky **Pred rollom / Po rolle**. Grafy **Bell curve** a **SD línie** vysvetľujú vzdialenosť strikov od spotu."
+)
 
 # ─── Sekcia: Načítať z pozície ────────────────────────────────────────────────
 with st.expander("📡  Načítať údaje z otvorenej pozície (IBKR)", expanded=True):
@@ -1414,6 +1418,9 @@ with st.expander("🔄 Multi-leg Roll — roll celej skupiny naraz", expanded=Fa
                 "Vega $":       st.column_config.NumberColumn(format="$%+.2f"),
             }
             with _tab_b:
+                st.caption(
+                    "**Návod:** Tabuľka nôh **pred** navrhovaným rollom — Theta / Delta / Vega v USD; riadok SPOLU = súčet skupiny."
+                )
                 _rows_b_df = rows_before + [{
                     "ID": "—", "Noha": "SPOLU", "Typ": "", "Strike": None, "DTE": None,
                     "Theta $/deň": round(tot_before["theta"], 2),
@@ -1424,6 +1431,9 @@ with st.expander("🔄 Multi-leg Roll — roll celej skupiny naraz", expanded=Fa
                 st.dataframe(pd.DataFrame(_rows_b_df), use_container_width=True,
                              hide_index=True, column_config=_col_cfg)
             with _tab_a:
+                st.caption(
+                    "**Návod:** Stav **po** rolle podľa zadaných nových strikov; **Net flow** = odhadovaný tok prémií pri roli."
+                )
                 _rows_a_df = rows_after + [{
                     "ID": "—", "Noha": "SPOLU", "Typ": "", "Strike": None, "DTE": None,
                     "Theta $/deň": round(tot_after["theta"], 2),
@@ -1745,8 +1755,14 @@ with st.expander("PoP kalkulačka — rýchly výpočet pravdepodobnosti (bez po
     all_strikes = orig_strikes + new_strikes
     all_labels  = orig_labels  + new_labels
     with tab_bell:
+        st.caption(
+            "**Návod:** Rozloženie cien (lognormálny model) — zvýraznené zvolené striky pred/po rolle."
+        )
         st.plotly_chart(bell_curve_chart(spot, iv, int(dte), ticker, all_strikes, all_labels), width="stretch")
     with tab_sd:
+        st.caption(
+            "**Návod:** Pásy ±1σ a ±2σ okolo spotu voči strikom — rýchla orientácia vzdialenosti od podkladu."
+        )
         st.plotly_chart(sd_lines_chart(sd, ticker, all_strikes, all_labels), width="stretch")
 
     import plotly.graph_objects as go

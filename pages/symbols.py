@@ -43,6 +43,10 @@ def _parse_date(s: str | None):
 
 st.title("📌 Symboly")
 st.caption(
+    "**Návod:** **Pridať symbol** = nový ticker do zoznamu. **Prehľad a úprava** = horná tabuľka (prehľad); **skutočná zmena** (sektor, IV, earnings…) je v **expandéri Editácia** pri tickri. "
+    "Yahoo a IB bloky doplnia trhové dáta. Ticker potom vyberáš v Trade Log a inde."
+)
+st.caption(
     "Centrálna správa tickerov — definuj symboly raz a vyberaj ich z dropdownu "
     "v celom denníku (Trade Log, Roll Simulátor, Kalendár, Dashboard). "
     "**Sektor** = výber z **jednej tabuľky** — 11 slovenských názvov indexov S&P 500 (zarovnanie na Barchart); **Yahoo ho neprepisuje**. "
@@ -53,6 +57,10 @@ tab_add, tab_manage = st.tabs(["Pridať symbol", "Prehľad a úprava"])
 
 # ─── Tab: Pridať symbol ───────────────────────────────────────────────────────
 with tab_add:
+    st.caption(
+        "**Návod:** Zadaj ticker a povinné polia; **sektor** vyber zo zoznamu (S&P, už použité symboly, snímky **Sektory**). "
+        "Earnings a IR URL sú voliteľné — earnings sa môžu doplniť aj do Kalendára."
+    )
     st.subheader("Nový symbol")
     _sector_opts_add = symbol_sector_dropdown_options()
 
@@ -185,6 +193,10 @@ with tab_add:
 # ─── Tab: Prehľad a úprava ────────────────────────────────────────────────────
 with tab_manage:
     st.subheader("Všetky symboly")
+    st.caption(
+        "**Návod:** Horná tabuľka je **prehľad** (vrátane sektora). **Úprava** — klikni na **expandér** s tickerom nižšie v sekcii **Editácia**: "
+        "tam zmeníš sektor, IV rank, earnings, URL a uložíš **Uložiť**. Yahoo a IB sekcie slúžia na doplnenie trhových dát."
+    )
 
     symbols = db.get_symbols()
     all_trades = db.get_all_trades()

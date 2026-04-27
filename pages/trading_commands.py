@@ -42,8 +42,8 @@ _STATUS_SK = _sk_map(_STATUS_OPT)
 
 st.title("Obchodné príkazy")
 st.caption(
-    "Zapisuj si **plánované** príkazy (limit, množstvo, poznámka). Údaje sú len v **journal.db** — "
-    "nenahrádzajú príkazy v IBKR ani TWS."
+    "**Návod:** V expandéri **➕ Nový príkaz** vytvor záznam (názov, ticker, smer, typ, stav). Pod tým **filtruj stav** a v rozbalenom riadku **uprav alebo zmaž** príkaz. "
+    "Ide len o **plánovací denník** v **journal.db** — neodosiela sa do IBKR ani TWS."
 )
 
 

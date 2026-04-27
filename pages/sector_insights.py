@@ -67,6 +67,10 @@ def _si_render_corr_heatmap(df: pd.DataFrame, *, title: str) -> None:
 
 st.title("Sektory — insight z tabuliek")
 st.caption(
+    "**Návod:** (1) V **Symboly** nastav **sektory** z rovnakého zoznamu ako tu. (2) Nahraj **krátky a dlhý** screenshot tabuľky výkonnosti (OCR). "
+    "(3) Pozri mapovanie portfólia na riadky tabuľky a textové odporúčania. Expandér **Korelácia** = samostatné CSV z Barchartu."
+)
+st.caption(
     "Nahraj **dva** screenshoty rovnakej logiky ako na Barchart (krátkodobý a dlhodobý výber stĺpcov). "
     "Aplikácia spraví OCR lokálne (Tesseract) a uloží snímky do denníka. Odporúčania vychádzajú z **podobnosti "
     "výkonnostných vektorov** v tabuľke, nie z korelácie cien."

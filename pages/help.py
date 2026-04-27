@@ -5,6 +5,10 @@ from core.page_context import set_tradejournal_page
 set_tradejournal_page("help")
 
 st.title("Pomocník — Návod na použitie")
+st.caption(
+    "**Návod:** Táto stránka je textová príručka. V skutočnej aplikácii používaj **sidebar** vľavo — rovnaké sekcie nájdeš v **Prehľad**, **Obchody**, **Analýza** a **Pomocník**. "
+    "Začni záložkou **Začíname** nižšie."
+)
 
 st.markdown("""
 > Denník je **čisto lokálny** — nikdy neposiela príkazy do TWS. Všetky zmeny sú len v tvojej SQLite databáze.
@@ -22,6 +26,7 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 
 # ══════════════════════════════════════════════════════════════════════════════
 with tab1:
+    st.caption("**Návod k záložke:** Postup od spustenia cez IBKR a import až po časovú os stratégie v Konzultáciách.")
     st.header("Začíname — prvé kroky")
 
     st.subheader("1. Spustenie aplikácie")
@@ -61,6 +66,7 @@ with tab1:
 
 # ══════════════════════════════════════════════════════════════════════════════
 with tab2:
+    st.caption("**Návod k záložke:** Význam polí pri manuálnom zápise, skupiny a úpravy — zrkadlí obrazovku **Trade Log** v aplikácii.")
     st.header("Trade Log")
 
     st.subheader("Pridať obchod manuálne")
@@ -119,6 +125,7 @@ napr. `AMZN_DIA_MAR26`, `TSLA_IC_APR26`, `SPY_STRANGLE_MAY26`
 
 # ══════════════════════════════════════════════════════════════════════════════
 with tab3:
+    st.caption("**Návod k záložke:** Ako písať poznámky (Markdown), priradiť trade/skupinu a čítať Strategy Timeline — zodpovedá stránke **Konzultácie**.")
     st.header("Konzultácie a Poznámky")
 
     st.subheader("Nová poznámka")
@@ -168,6 +175,7 @@ with tab3:
 
 # ══════════════════════════════════════════════════════════════════════════════
 with tab4:
+    st.caption("**Návod k záložke:** Postup pri simulácii rollu, význam PoP, SD a grafov — doplnok k obrazovke **Roll Simulátor**.")
     st.header("Roll Simulátor")
 
     st.subheader("Na čo slúži")
@@ -219,6 +227,7 @@ Vypočítava sa cez **Black-Scholes model (N(d2))**:
 
 # ══════════════════════════════════════════════════════════════════════════════
 with tab5:
+    st.caption("**Návod k záložke:** Porty TWS/Gateway, API nastavenia a čo v aplikácii funguje s pripojením / bez neho. Praktické pripojenie robíš na **Dashboarde**.")
     st.header("IBKR Pripojenie")
 
     st.subheader("Porty")
@@ -269,6 +278,7 @@ with tab5:
 
 # ══════════════════════════════════════════════════════════════════════════════
 with tab6:
+    st.caption("**Návod k záložke:** Vysvetlenie záložiek Monitor, Yield, Monitoring a Skener na stránke **Steady Yields** a závislosť na Group ID.")
     st.header("Steady Yields")
     st.markdown("""
 **Účel:** PMCC, diagonály a kalendáre — sledovanie **realizovaného APR** a **cost basis** oproti očakávaniu,

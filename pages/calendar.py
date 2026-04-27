@@ -36,9 +36,9 @@ DAY_NAMES = ["Po", "Ut", "St", "Št", "Pi", "So", "Ne"]
 
 st.title("📅 Kalendár")
 st.caption(
-    "Expirácie, earnings, alerty, udalosti a poznámky na jednom mieste. "
-    "Záznamy v kalendári staršie ako **365 dní** sa v databáze automaticky mažú (najviac raz denne); "
-    "obchody a konzultácie v denníku ostávajú."
+    "**Návod:** Šípkami **Predošlý / Nasledujúci** meníš mesiac. Klikni na **deň** v mriežke — v detaile uvidíš udalosti a môžeš pridávať podľa typu. "
+    "Zdroje: Kalendár + Trade Log + Konzultácie (poznámky). "
+    "Expirácie, earnings, alerty a poznámky na jednom mieste. Záznamy staršie ako **365 dní** sa z kalendára v DB mažú (najviac raz denne); obchody v denníku ostávajú."
 )
 
 # ─── Navigácia mesiacov ─────────────────────────────────────────────────────────

@@ -130,6 +130,10 @@ def _run_dashboard_fetch() -> None:
 # ─── UI ───────────────────────────────────────────────────────────────────────
 
 st.title("📊 Portfolio Dashboard")
+st.caption(
+    "**Návod:** Vyžaduje **pripojený IB** (najprv **Dashboard**). Stlač **Načítať z TWS** — načítajú sa pozície, účet a objednávky. "
+    "Potom prejdi sekcie: kontrola dát, voliteľné ručné úpravy súčtov, celkové P/L, marža, Gréky, APTR a detail **podľa skupín** z denníka (tlačidlá na snímky grafov)."
+)
 st.caption("Live stav portfólia z TWS – P/L, Margin, Greeks.")
 
 # ── Stav IBKR pripojenia ──────────────────────────────────────────────────────

@@ -112,8 +112,8 @@ def _group_id_from_select(cell_value: str) -> Optional[str]:
 
 st.title("Trade Log")
 st.caption(
-    "**Stratégia** pri novom obchode je v záložke *Pridať obchod* (stĺpec pri Tickeri). "
-    "Typy skupín (Calendar, Diagonal, …) nájdeš aj v **Skupiny**; šablóny spreadov (kalendár, kondor) v **Spread Builder** → expandér *Šablóna stratégie*."
+    "**Návod:** Použi štyri záložky nižšie — **Pridať** každú nohu zvlášť, **Otvorené** na uzávierku nohy, **Upraviť / Zoskupiť** na hromadné zmeny a skupiny, **Uzavreté** len na prehľad P&L. "
+    "**Stratégia** pri novom obchode je v *Pridať obchod*; šablóny spreadov v **Spread Builder**; názvy skupín v **Skupiny**."
 )
 
 tab_add, tab_open, tab_edit, tab_closed = st.tabs([
@@ -122,6 +122,10 @@ tab_add, tab_open, tab_edit, tab_closed = st.tabs([
 
 # ─── Tab: Pridať obchod ───────────────────────────────────────────────────────
 with tab_add:
+    st.caption(
+        "**Návod:** Vyber ticker (najprv ho pridaj v **Symboly**), stratégiu a **skupinu** zo zoznamu zo záložky **Skupiny**. "
+        "Každá noha stratégie = samostatné odoslanie formulára. Voliteľne IV pri vstupe pre výpočty v iných stránkach."
+    )
     st.subheader("Zadanie nového obchodu")
 
     with st.form("add_trade_form", clear_on_submit=True):
@@ -235,6 +239,10 @@ with tab_add:
 
 # ─── Tab: Otvorené pozície ────────────────────────────────────────────────────
 with tab_open:
+    st.caption(
+        "**Návod:** Prehľad otvorených nôh zoskupených podľa **Group ID**. V expandéri uzavrieš alebo zmažeš jednu nohu — "
+        "úprava viacerých polí je v záložke **Upraviť / Zoskupiť**."
+    )
     open_trades = db.get_open_trades()
 
     if not open_trades:
@@ -347,6 +355,10 @@ with tab_open:
 
 # ─── Tab: Upraviť / Zoskupiť ─────────────────────────────────────────────────
 with tab_edit:
+    st.caption(
+        "**Návod:** Uprav bunky v tabuľke a stlač **Uložiť zmeny**. Stĺpec **Skupina** = výber z **Skupiny** + existujúce hodnoty. "
+        "Nižšie môžeš rozdeliť kontrakty alebo hromadne priradiť skupinu podľa ID nôh."
+    )
     all_edit_trades = db.get_all_trades()
 
     if not all_edit_trades:
@@ -560,6 +572,9 @@ with tab_edit:
 
 # ─── Tab: Uzavreté pozície ────────────────────────────────────────────────────
 with tab_closed:
+    st.caption(
+        "**Návod:** Uzavreté nohy podľa skupiny so súhrnom P&L. Len prehľad — spätná zmena stavu je v **Upraviť / Zoskupiť**."
+    )
     closed_trades = db.get_closed_trades()
 
     if not closed_trades:

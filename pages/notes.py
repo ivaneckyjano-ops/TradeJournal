@@ -8,6 +8,10 @@ db.init_db()
 set_tradejournal_page("notes")
 
 st.title("Konzultácie a Poznámky")
+st.caption(
+    "**Návod:** **Nová poznámka** = zápis s Markdownom. **Strategy Timeline** = časová os podľa Group ID. **História** = filtre podľa trade/skupiny. "
+    "**Upraviť / Zmazať** = vyber konkrétny záznam. Uložené poznámky sa objavia aj v **Kalendári**."
+)
 
 tab_new, tab_timeline, tab_history, tab_edit = st.tabs([
     "Nová poznámka", "Strategy Timeline", "História (Log)", "Upraviť / Zmazať"
@@ -15,6 +19,9 @@ tab_new, tab_timeline, tab_history, tab_edit = st.tabs([
 
 # ─── Tab: Nová poznámka ────────────────────────────────────────────────────────
 with tab_new:
+    st.caption(
+        "**Návod:** Vyplň nadpis a text (Markdown). Voliteľne priraď **konkrétnu nohu** alebo **skupinu** — poznámka sa objaví v Kalendári a v **Strategy Timeline**."
+    )
     st.subheader("Pridať záznam")
 
     all_trades = db.get_all_trades()
@@ -99,7 +106,10 @@ with tab_new:
 # ─── Tab: Strategy Timeline ───────────────────────────────────────────────────
 with tab_timeline:
     st.subheader("Strategy Timeline — Chronologický vývoj stratégie")
-    st.caption("Vyber Group ID a uvidíš celý príbeh stratégie — obchody aj poznámky v časovom poradí.")
+    st.caption(
+        "**Návod:** Vyber **Group ID** (musí byť nastavený v Trade Log). Zobrazí sa časová os vstupov, výstupov a poznámok; "
+        "pri udalosti vieš rýchlo pridať poznámku cez **+ Pridať poznámku**."
+    )
 
     all_trades_tl = db.get_all_trades()
     group_ids_tl = sorted({t.get("group_id") for t in all_trades_tl if t.get("group_id")})
@@ -255,6 +265,10 @@ with tab_timeline:
 # ─── Tab: História ─────────────────────────────────────────────────────────────
 with tab_history:
     st.subheader("História poznámok")
+    st.caption(
+        "**Návod:** Filtre podľa **Trade** alebo textového **Group ID** — zoznam všetkých uložených poznámok s expandérom na obsah. "
+        "Na presnú úpravu textu použi záložku **Upraviť / Zmazať**."
+    )
 
     col_f1, col_f2 = st.columns(2)
     with col_f1:
@@ -300,6 +314,9 @@ with tab_history:
 # ─── Tab: Upraviť / Zmazať ────────────────────────────────────────────────────
 with tab_edit:
     st.subheader("Upraviť alebo zmazať poznámku")
+    st.caption(
+        "**Návod:** Vyber poznámku zo zoznamu, uprav nadpis alebo obsah a **Uložiť zmeny**, prípadne **Zmazať poznámku** — akcie sú mimo formulára (Streamlit), zmeny sa prejavia hneď po kliknutí."
+    )
 
     all_notes = db.get_notes()
     if not all_notes:

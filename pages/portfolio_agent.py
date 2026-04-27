@@ -45,7 +45,10 @@ _build_alerts     = pdata.build_alerts
 # SIDEBAR
 # ─────────────────────────────────────────────────────────────────────────────
 st.title("🧠 Portfolio Agent")
-st.caption("Prehľad celého portfólia call diagonalov + AI analýza na požiadanie.")
+st.caption(
+    "**Návod:** V **sidebar** nastav referenčný **SPY** (beta-weighted delta), model **Claude** a voliteľne **načítaj spoty z IB**. "
+    "Hlavná stránka zobrazuje skupiny z denníka (call diagonály), metriky a AI štúdie — analýza je na požiadanie, dáta sú z **Trade Log** a živého IB ak je pripojený."
+)
 
 with st.sidebar:
     st.header("⚙️ Nastavenia portfólia")

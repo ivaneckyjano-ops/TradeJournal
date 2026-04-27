@@ -28,7 +28,10 @@ def _run_fetch_job(stop_event: threading.Event):
         job["status"] = "error"
 
 st.title("Správa skupín (Group ID)")
-st.caption("Vytvor skupiny tu — potom ich priradíš obchodom aj poznámkam z dropdownu.")
+st.caption(
+    "**Návod:** **Vytvoriť** = nový Group ID. **Prehľad a úprava** = AI, IB dáta a správa poznámok v expandéroch. **Priradiť obchodom** = hromadne nastavíš rovnakú skupinu vybraným nohám. "
+    "Rovnaké meno skupiny potom vyberáš v Trade Log a Konzultáciách."
+)
 
 # ── Model selector v sidebari (zdieľaný s Portfolio Agent) ──────────────────
 with st.sidebar:
@@ -58,6 +61,10 @@ STRATEGIES = [
 
 # ─── Tab: Vytvoriť skupinu ────────────────────────────────────────────────────
 with tab_create:
+    st.caption(
+        "**Návod:** Zadaj jedinečný **Group ID** (odporúčaný formát v pomocníku). Tento názov potom vyberáš v **Trade Log**, "
+        "**Konzultáciách** a pri hromadnom priradení. Ticker a stratégia sú orientačné metadáta."
+    )
     st.subheader("Nová skupina")
 
     with st.form("new_group_form", clear_on_submit=True):
@@ -110,6 +117,10 @@ with tab_create:
 
 # ─── Tab: Prehľad a úprava ────────────────────────────────────────────────────
 with tab_manage:
+    st.caption(
+        "**Návod:** Každá skupina je v **expandéri** — živé dáta z IB (ak si pripojený), AI analýza/plán, úprava poznámok a udalostí. "
+        "Nižšie môžeš priradiť obchody hromadne v záložke **Priradiť obchodom**."
+    )
     st.subheader("Všetky skupiny")
 
     groups = db.get_groups()
@@ -623,7 +634,10 @@ TICKER | Short noha | Long noha | Net debet ~$XXX | Theta ~+$X/deň | Podmienka 
 # ─── Tab: Priradiť obchodom ───────────────────────────────────────────────────
 with tab_assign:
     st.subheader("Priradiť skupinu obchodom")
-    st.caption("Vyber skupinu a potom označ obchody, ktoré do nej patria.")
+    st.caption(
+        "**Návod:** Vyber existujúcu **skupinu**, v multiselect označ všetky nohy, ktoré majú mať rovnaké **Group ID**, a stlač **Priradiť**. "
+        "Rovnaké vieš aj v **Trade Log → Upraviť / Zoskupiť**."
+    )
 
     groups_assign = db.get_groups()
     if not groups_assign:

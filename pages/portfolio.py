@@ -29,6 +29,10 @@ _SHORT_DELTA_ALERT_RATIO = 2.0
 
 st.title("Journal — Gréky a skupiny")
 st.caption(
+    "**Návod:** Štyri záložky — **TWS** = živý výpis OPT z brokera; **Zápis journal** = uprav Gréky/skupiny a **Uložiť journal**; **Net** = súčty po skupinách; **Časový vývoj** = graf snímok po uložení. "
+    "Pri IB a OPT v TWS sa v *Zápis journal* zobrazia aj stĺpce **TWS …** (BS z cien IB). Rozbaľ **Návod na použitie** pre detail."
+)
+st.caption(
     "**TWS (živé):** opčné pozície z IB portfólia (OPT) — rovnaký kľúč ako pri kontrole na Dashboarde. "
     "**Journal:** len obchody so stavom *Open*; pri pripojenom IB a OPT v TWS **iba nohy, ktoré sú aj v TWS**. "
     "Zápis **Δ, Θ, Vega, IV** (vstup / aktuál), skupiny, net a história — stĺpce „TWS …“ sú **odhad z BS** z cien IB."
@@ -290,6 +294,10 @@ tab_tws, tab_legs, tab_net, tab_hist = st.tabs(
 )
 
 with tab_tws:
+    st.caption(
+        "**Návod:** Živý výpis **opčných** pozícií z TWS + dopočítané Gréky (BS). Vyžaduje pripojenie IB na **Dashboarde**. "
+        "Porovnanie s denníkom a úprava hodnôt je v záložke **Zápis journal**."
+    )
     if not _ib_connected:
         st.info("Pre živý výpis sa **pripoj na IBKR** (panel na Dashboarde).")
         st.page_link("pages/dashboard.py", label="Dashboard — IBKR", icon=":material/dashboard:")
@@ -369,6 +377,10 @@ with tab_tws:
         )
 
 with tab_legs:
+    st.caption(
+        "**Návod:** Otvorené nohy z **Trade Logu** po skupinách. Doplň **vstupné a aktuálne** Δ, Θ, Vega, IV; stĺpce TWS sú len na čítanie. "
+        "Stlač **Uložiť journal** — uloží sa aj bod do grafu v **Časový vývoj**."
+    )
     if not open_trades:
         if tws_cols_active:
             st.info(
@@ -624,7 +636,10 @@ with tab_legs:
             st.divider()
 
 with tab_net:
-    st.caption("Súčty **po nohách** v skupine (jednoduchý súčet hodnôt v denníku — rovnaká konvencia ako pri zápise z TWS).")
+    st.caption(
+        "**Návod:** Len **prehľad** — súčty Δ, Θ, Vega a priemer IV po **skupinách** z hodnôt v denníku (bez priameho editovania). "
+        "Hodnoty meníš v záložke **Zápis journal**."
+    )
     net_rows = []
     for gname in _sort_keys:
         legs = by_group[gname]
@@ -671,7 +686,10 @@ with tab_net:
     )
 
 with tab_hist:
-    st.caption("Body pridávaš uložením journalu v záložke **Zápis journal** (aspoň jedna z **aktuálnych** hodnôt Δ, Θ, Vega, IV).")
+    st.caption(
+        "**Návod:** Vyber **nochu** a pozri časový vývoj uložených snímok. Nový bod vznikne pri **Uložiť journal** v **Zápis journal**, "
+        "ak zmeníš aspoň jednu z aktuálnych hodnôt Δ, Θ, Vega alebo IV."
+    )
     opts = {
         f"#{t['id']} {t.get('ticker','')} {t.get('option_type','')} {t.get('strike','')}": int(t["id"])
         for t in sorted(open_trades, key=lambda x: int(x.get("id") or 0))

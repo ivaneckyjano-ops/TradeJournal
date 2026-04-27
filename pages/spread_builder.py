@@ -225,6 +225,10 @@ def _sb_render_csv_variant_scanner() -> None:
 
 st.title("Spread Builder")
 st.caption(
+    "**Návod:** Začni **šablónou stratégie** alebo vlastnými nohami; doplň ticker (ideálne zo **Symboly**), spot, IV, expirácie a striky. "
+    "Sleduj P&L diagram, Gréky a APTR. CSV variant skener môže byť hneď pod titulkom. Nič sa neposiela do brokera."
+)
+st.caption(
     "Poskladaj opčný spread z ľubovoľných nôh alebo začni **šablónou** (kalendár, železný kondor, vertikál) — potom uprav striky, expirácie a ceny. "
     "P&L, Greeks, max profit/loss a breakeveny. **APTR (Θ)** = rovnaká logika ako na TWS dashboarde: Θ×365 / (net debet + marža), Theta zo zadaných hodnôt nôh (alebo ručného súčtu)."
 )

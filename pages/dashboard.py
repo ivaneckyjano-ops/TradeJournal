@@ -25,6 +25,10 @@ auto_on = st.session_state.get("auto_refresh_on", False)
 _ib_connected = ibkr.is_connected()
 
 st.title("Dashboard")
+st.caption(
+    "**Návod:** (1) V expandéri **IBKR Pripojenie** zadaj host/port a **Pripojiť**. (2) Stlač **Importuj pozície z IBKR** a prípadne import **Fills**. "
+    "(3) Skontroluj zhodu s denníkom v tabuľkách nižšie. Podrobný zápis Grékov a skupín je v **Journal — Gréky**."
+)
 st.info(
     "**TWS:** pripojenie, import pozícií a fills, kontrola zhody s denníkom. "
     "**Journal (čo TWS nedáva dlhodobo):** zápis a história **Δ, Θ, Vega, IV** po otvorení, skupiny a net súčty — záložka **Journal — Gréky**."
