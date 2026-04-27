@@ -48,6 +48,29 @@ def symbol_sector_select_options() -> tuple[list[str], str | None]:
     return opts, None
 
 
+def symbol_sector_dropdown_options() -> list[str]:
+    """
+    Výber sektora v **Symboly** (pridať / úprava): „—“ + 11 S&P (sk) + hodnoty z ``symbols.sector``,
+    doplnené o **názvy riadkov** z posledných snímok ``sector_performance_snapshots`` (krátky + dlhý horizont),
+    ak existujú — zodpovedá „databáze“ zo stránky **Sektory — insight**.
+    """
+    opts, _ = symbol_sector_select_options()
+    seen: set[str] = set(opts)
+    extra: list[str] = []
+    for horizon in ("short", "long"):
+        snap = db.get_latest_sector_performance_snapshot(horizon)
+        if not snap:
+            continue
+        rows = (snap.get("payload") or {}).get("rows") or []
+        for r in rows:
+            name = str(r.get("sector") or "").strip()
+            if name and name not in seen:
+                seen.add(name)
+                extra.append(name)
+    extra.sort(key=lambda x: x.lower())
+    return opts + extra
+
+
 def barchart_insight_sector_guide_markdown() -> str:
     """
     Markdown pre expander **Prehľad sektorov** na stránke Sektory — insight:

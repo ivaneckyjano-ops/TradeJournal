@@ -10,13 +10,11 @@ from core.symbol_ib_option_sync import (
     run_symbol_ib_option_refresh,
     seconds_since_last_refresh,
 )
-from core.sector_select_options import symbol_sector_edit_options, symbol_sector_table_options
+from core.sector_select_options import symbol_sector_dropdown_options
 from core.yahoo_symbol_sync import YAHOO_SYMBOL_SYNC_SETTING_KEY, sync_all_symbols_from_yahoo
 
 db.init_db()
 set_tradejournal_page("symbols")
-
-SECTOR_OPTS_ADD = symbol_sector_table_options()
 
 ASSET_TYPES = ["Stock", "ETF", "Index Options", "Futures", "Crypto", "Iné"]
 
@@ -56,6 +54,7 @@ tab_add, tab_manage = st.tabs(["Pridať symbol", "Prehľad a úprava"])
 # ─── Tab: Pridať symbol ───────────────────────────────────────────────────────
 with tab_add:
     st.subheader("Nový symbol")
+    _sector_opts_add = symbol_sector_dropdown_options()
 
     with st.form("add_symbol_form", clear_on_submit=True):
         # ── Základné info ──────────────────────────────────────────────────────
@@ -70,9 +69,9 @@ with tab_add:
         c4, c5 = st.columns(2)
         with c4:
             s_sector = st.selectbox(
-                "Sektor (tabuľka S&P — 11 riadkov)",
-                SECTOR_OPTS_ADD,
-                help="Rovnaký zoznam ako v návode na stránke Sektory — insight; nie Yahoo.",
+                "Sektor (z databázy — S&P + symboly + snímok Sektory)",
+                _sector_opts_add,
+                help="„—“ + 11 slovenských sektorov S&P, ďalšie hodnoty už uložené pri symboloch a riadky z posledných snímok **Sektory — insight** (Barchart). Yahoo sektor sa neukladá.",
             )
         with c5:
             s_iv = st.number_input(
@@ -221,6 +220,9 @@ with tab_manage:
                 "Všetky obchody": trade_count,
             })
         df_sym = pd.DataFrame(rows)
+        st.caption(
+            "**Sektor** v tabuľke je len prehľad — zmeníš ho v **expandéri** pri danom tickri (výber z rovnakej databázy ako **Sektory — insight**). "
+        )
         st.caption(
             "**IV %** = implied volatility v **percentách** (napr. 35 = 35 %), typicky ATM call z Yahoo. "
             "**IV Rank** u nás **nie je** presne brokerovský „52‑týždňový“ rank: je to percentil aktuálneho IV % "
@@ -397,6 +399,7 @@ with tab_manage:
 
         st.divider()
         st.subheader("Editácia")
+        _sector_opts_manage = symbol_sector_dropdown_options()
 
         for sym in symbols:
             ticker_trades = [t for t in all_trades if t.get("ticker", "").upper() == sym["ticker"]]
@@ -439,19 +442,22 @@ with tab_manage:
 
                     ec4, ec5 = st.columns(2)
                     with ec4:
-                        sector_opts_edit = symbol_sector_edit_options(sym.get("sector"))
-                        cur_sector = sym.get("sector") or "—"
+                        cur_sector_raw = (sym.get("sector") or "").strip()
+                        cur_sector = cur_sector_raw or "—"
+                        sector_opts_edit = list(_sector_opts_manage)
+                        if cur_sector != "—" and cur_sector not in sector_opts_edit:
+                            sector_opts_edit = sector_opts_edit + [cur_sector]
                         sector_idx = (
                             sector_opts_edit.index(cur_sector)
                             if cur_sector in sector_opts_edit
                             else 0
                         )
                         e_sector = st.selectbox(
-                            "Sektor (tabuľka S&P — 11 riadkov)",
+                            "Sektor (databáza — S&P, symboly, snímky Sektory)",
                             sector_opts_edit,
                             index=sector_idx,
                             key=f"ss_{sym['id']}",
-                            help="Vyber jeden z 11 slovenských názvov indexov S&P 500. Ak má symbol starý text mimo tabuľky, zobrazí sa ako posledná položka — zmeň na riadok z tabuľky.",
+                            help="Rovnaký zdroj ako stránka **Sektory — insight**: 11 slovenských S&P sektorov, hodnoty už použité pri symboloch a názvy riadkov z posledných snímok výkonnosti.",
                         )
                     with ec5:
                         e_iv = st.number_input(

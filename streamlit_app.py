@@ -185,10 +185,16 @@ if auto_on and not _tj_skip_global:
 dashboard = st.Page("pages/dashboard.py",  title="Dashboard",         icon=":material/dashboard:",      default=True)
 portfolio = st.Page("pages/portfolio.py",  title="Journal — Gréky",   icon=":material/analytics:")
 trade_log = st.Page("pages/trade_log.py",  title="Trade Log",         icon=":material/edit_note:")
+trading_commands = st.Page(
+    "pages/trading_commands.py",
+    title="Obchodné príkazy",
+    icon=":material/assignment_add:",
+)
 groups    = st.Page("pages/groups.py",     title="Skupiny",           icon=":material/folder:")
 symbols   = st.Page("pages/symbols.py",    title="Symboly",           icon=":material/bookmarks:")
 notes     = st.Page("pages/notes.py",      title="Konzultácie",       icon=":material/chat_bubble:")
 modeler        = st.Page("pages/modeler.py",          title="Roll Simulátor",      icon=":material/model_training:")
+roll_breakeven = st.Page("pages/roll_breakeven.py",   title="Rolovanie — breakeven spot", icon=":material/anchor:")
 spread_bld     = st.Page("pages/spread_builder.py",   title="Spread Builder",      icon=":material/construction:")
 portfolio_agent= st.Page("pages/portfolio_agent.py",  title="Portfolio Agent",     icon=":material/smart_toy:")
 portfolio_dash = st.Page("pages/portfolio_dashboard.py", title="TWS Dashboard",    icon=":material/monitor_heart:")
@@ -203,8 +209,8 @@ help_page      = st.Page("pages/help.py",             title="Pomocník",        
 pg = st.navigation(
     {
         "Prehľad":  [dashboard, portfolio, calendar],
-        "Obchody":  [trade_log, groups, symbols],
-        "Analýza":  [notes, modeler, spread_bld, csv_variants, greeks_db, delta_diag, sector_ins, steady_yields, portfolio_agent, portfolio_dash],
+        "Obchody":  [trade_log, trading_commands, groups, symbols],
+        "Analýza":  [notes, modeler, roll_breakeven, spread_bld, csv_variants, greeks_db, delta_diag, sector_ins, steady_yields, portfolio_agent, portfolio_dash],
         "Info":     [help_page],
     },
     position="sidebar",

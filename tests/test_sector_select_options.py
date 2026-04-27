@@ -3,6 +3,7 @@ from __future__ import annotations
 from core.journal_sectors import SP500_SLOVAK_SECTOR_INDEX_ROWS
 from core.sector_select_options import (
     barchart_insight_sector_guide_markdown,
+    symbol_sector_dropdown_options,
     symbol_sector_edit_options,
     symbol_sector_select_options,
     symbol_sector_table_options,
@@ -14,6 +15,13 @@ def test_symbol_sector_select_options_has_dash_first():
     assert opts and opts[0] == "—"
     assert note is None
     assert opts[1 : 1 + len(SP500_SLOVAK_SECTOR_INDEX_ROWS)] == list(SP500_SLOVAK_SECTOR_INDEX_ROWS)
+
+
+def test_symbol_sector_dropdown_options_extends_select_options():
+    base, _ = symbol_sector_select_options()
+    full = symbol_sector_dropdown_options()
+    assert len(full) >= len(base)
+    assert full[: len(base)] == base
 
 
 def test_symbol_sector_table_options_is_sp500_only():

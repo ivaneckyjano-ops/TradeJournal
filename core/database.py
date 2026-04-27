@@ -98,6 +98,7 @@ def init_db() -> None:
     _migrate_sector_performance_snapshots(get_connection())
     _migrate_ticker_correlation_data(get_connection())
     _migrate_trade_journal_greeks(get_connection())
+    _migrate_trading_commands(get_connection())
     with get_connection() as conn:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_events_date ON events (date)")
         conn.commit()
@@ -175,6 +176,30 @@ def _migrate_trade_journal_greeks(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tgs_trade_time ON trade_greek_snapshots (trade_id, recorded_at)"
     )
+    conn.commit()
+
+
+def _migrate_trading_commands(conn: sqlite3.Connection) -> None:
+    """Poznámky k plánovaným príkazom (nie IBKR rozkazy — lokálny denník)."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS trading_commands (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+            title         TEXT NOT NULL,
+            ticker        TEXT,
+            action        TEXT,
+            order_kind    TEXT,
+            quantity      REAL,
+            limit_price   REAL,
+            stop_price    REAL,
+            body          TEXT,
+            status        TEXT NOT NULL DEFAULT 'draft'
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tc_status ON trading_commands (status, updated_at DESC)")
     conn.commit()
 
 
@@ -2086,5 +2111,156 @@ def get_ticker_corr_matrix_run(run_id: int) -> Optional[dict[str, Any]]:
 def delete_ticker_corr_matrix_run(run_id: int) -> int:
     with get_connection() as conn:
         cur = conn.execute("DELETE FROM ticker_corr_matrix_runs WHERE id = ?", (int(run_id),))
+        conn.commit()
+        return int(cur.rowcount)
+
+
+def insert_trading_command(
+    title: str,
+    *,
+    ticker: Optional[str] = None,
+    action: Optional[str] = None,
+    order_kind: Optional[str] = None,
+    quantity: Optional[float] = None,
+    limit_price: Optional[float] = None,
+    stop_price: Optional[float] = None,
+    body: Optional[str] = None,
+    status: str = "draft",
+) -> int:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    tit = (title or "").strip()
+    if not tit:
+        raise ValueError("Názov (title) je povinný.")
+    st0 = (status or "draft").strip().lower()
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO trading_commands
+            (created_at, updated_at, title, ticker, action, order_kind, quantity, limit_price, stop_price, body, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                now,
+                now,
+                tit,
+                (ticker or "").strip().upper() or None,
+                (action or "").strip().lower() or None,
+                (order_kind or "").strip().lower() or None,
+                quantity,
+                limit_price,
+                stop_price,
+                (body or "").strip() or None,
+                st0,
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def _row_trading_command(r: sqlite3.Row) -> dict[str, Any]:
+    return dict(r)
+
+
+def list_trading_commands(*, status: Optional[str] = None, limit: int = 200) -> list[dict[str, Any]]:
+    lim = max(1, min(int(limit), 500))
+    q = "SELECT * FROM trading_commands"
+    args: list[Any] = []
+    if status is not None and str(status).strip():
+        q += " WHERE status = ?"
+        args.append(str(status).strip().lower())
+    q += " ORDER BY updated_at DESC, id DESC LIMIT ?"
+    args.append(lim)
+    with get_connection() as conn:
+        rows = conn.execute(q, args).fetchall()
+    return [_row_trading_command(r) for r in rows]
+
+
+def get_trading_command(cmd_id: int) -> Optional[dict[str, Any]]:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM trading_commands WHERE id = ?", (int(cmd_id),)).fetchone()
+    return _row_trading_command(row) if row else None
+
+
+def update_trading_command(
+    cmd_id: int,
+    *,
+    title: Optional[str] = None,
+    ticker: Optional[str] = None,
+    action: Optional[str] = None,
+    order_kind: Optional[str] = None,
+    quantity: Optional[float] = None,
+    limit_price: Optional[float] = None,
+    stop_price: Optional[float] = None,
+    body: Optional[str] = None,
+    status: Optional[str] = None,
+    _all_fields: bool = False,
+) -> int:
+    """
+    Ak ``_all_fields`` je True, berú sa vždy poskytnuté kľúče (vrátane ``0.0`` / None na vyčistenie);
+    inak sa menia len ne-``None`` argumenty (staršie správanie).
+    """
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    cur0 = get_trading_command(cmd_id)
+    if not cur0:
+        return 0
+    m: dict[str, Any] = {k: cur0.get(k) for k in cur0}
+    if _all_fields:
+        m["title"] = (title or "").strip() or m["title"]
+        m["ticker"] = (ticker or "").strip().upper() or None
+        m["action"] = (action or "").strip().lower() or None
+        m["order_kind"] = (order_kind or "").strip().lower() or None
+        m["quantity"] = quantity
+        m["limit_price"] = limit_price
+        m["stop_price"] = stop_price
+        m["body"] = (body or "").strip() or None
+        m["status"] = (status or "").strip().lower() or "draft"
+    else:
+        if title is not None:
+            m["title"] = (title or "").strip() or m["title"]
+        if ticker is not None:
+            m["ticker"] = (ticker or "").strip().upper() or None
+        if action is not None:
+            m["action"] = (action or "").strip().lower() or None
+        if order_kind is not None:
+            m["order_kind"] = (order_kind or "").strip().lower() or None
+        if quantity is not None:
+            m["quantity"] = quantity
+        if limit_price is not None:
+            m["limit_price"] = limit_price
+        if stop_price is not None:
+            m["stop_price"] = stop_price
+        if body is not None:
+            m["body"] = (body or "").strip() or None
+        if status is not None:
+            m["status"] = (status or "").strip().lower() or m.get("status", "draft")
+    with get_connection() as conn:
+        conn.execute(
+            """
+            UPDATE trading_commands SET
+                updated_at = ?, title = ?, ticker = ?, action = ?, order_kind = ?,
+                quantity = ?, limit_price = ?, stop_price = ?, body = ?, status = ?
+            WHERE id = ?
+            """,
+            (
+                now,
+                m["title"],
+                m["ticker"],
+                m["action"],
+                m["order_kind"],
+                m["quantity"],
+                m["limit_price"],
+                m["stop_price"],
+                m["body"],
+                m["status"],
+                int(cmd_id),
+            ),
+        )
+        conn.commit()
+        return 1
+
+
+def delete_trading_command(cmd_id: int) -> int:
+    with get_connection() as conn:
+        cur = conn.execute("DELETE FROM trading_commands WHERE id = ?", (int(cmd_id),))
         conn.commit()
         return int(cur.rowcount)
