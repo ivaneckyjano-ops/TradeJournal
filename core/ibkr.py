@@ -1971,13 +1971,16 @@ def _pos_key(ticker, strike, expiry, leg_type, option_type) -> str:
     return f"{ticker}|{sk}|{e}|{leg_type}|{option_type}"
 
 
-def sync_positions_to_db(positions: list[dict], db_module) -> dict:
+def sync_positions_to_db(positions: list[dict], db_module, *, close_missing: bool = False) -> dict:
     """
-    Porovná IBKR pozície s DB:
+    Porovná IBKR pozície s DB.
+
     1. Pridá nové pozície.
     2. Aktualizuje contracts + avg_cost pre existujúce.
-    3. Detekuje pozície, ktoré sú v DB ako Open ale v IBKR chýbajú
-       (pravdepodobne uzavreté) → uloží do zoznamu 'possibly_closed'.
+    3. Voliteľne uzavrie Open pozície, ktoré v IBKR chýbajú.
+
+    `close_missing=True` je vhodné pri ručnom importe z Dashboardu.
+    `close_missing=False` necháva chýbajúce riadky otvorené.
     """
     existing_open = db_module.get_open_trades()
     ibkr_opts = [p for p in positions if p["sec_type"] == "OPT"]
@@ -1996,8 +1999,8 @@ def sync_positions_to_db(positions: list[dict], db_module) -> dict:
                      t.get("leg_type"), t.get("option_type"))
         db_map[k] = t
 
-    added = updated = skipped = 0
-    possibly_closed: list[dict] = []
+    added = updated = skipped = closed = 0
+    closed_trades: list[dict] = []
 
     # 1. IBKR → DB: pridaj nové, aktualizuj existujúce
     for k, pos in ibkr_map.items():
@@ -2039,7 +2042,7 @@ def sync_positions_to_db(positions: list[dict], db_module) -> dict:
     # 2. DB → IBKR: zisti pozície, ktoré zmizli z IBKR (možno uzavreté)
     for k, t in db_map.items():
         if k not in ibkr_map:
-            possibly_closed.append({
+            closed_trades.append({
                 "id": t["id"],
                 "ticker": t["ticker"],
                 "leg_type": t.get("leg_type"),
@@ -2048,12 +2051,20 @@ def sync_positions_to_db(positions: list[dict], db_module) -> dict:
                 "expiry": t.get("expiry"),
                 "entry_price": t.get("entry_price"),
             })
+            if close_missing:
+                db_module.update_trade(
+                    t["id"],
+                    status="Closed",
+                    exit_date=date.today().isoformat(),
+                )
+                closed += 1
 
     return {
         "added": added,
         "updated": updated,
         "skipped": skipped,
-        "possibly_closed": possibly_closed,
+        "closed": closed,
+        "closed_trades": closed_trades,
     }
 
 

@@ -155,16 +155,10 @@ if auto_on and not _tj_skip_global:
             _sync = ibkr.sync_positions_to_db(_fetched_positions, db)
             st.session_state["last_sync"] = datetime.now().strftime("%H:%M:%S")
             st.session_state["sync_count"] = st.session_state.get("sync_count", 0) + 1
-            st.session_state["possibly_closed"] = _sync.get("possibly_closed", [])
             if _sync.get("added", 0) > 0:
                 st.toast(f"Auto-sync: +{_sync['added']} nových pozícií", icon="🔄")
             if _sync.get("updated", 0) > 0:
                 st.toast(f"Auto-sync: {_sync['updated']} pozícií aktualizovaných", icon="🔄")
-            if _sync.get("possibly_closed"):
-                st.toast(
-                    f"⚠️ {len(_sync['possibly_closed'])} pozícií chýba v IBKR — skontroluj Dashboard",
-                    icon="⚠️"
-                )
         # Objednávky z cache (openTrades) – bez sieťového volania, bezpečné
         _live_orders = ibkr.get_ib().openTrades() if ibkr.get_ib() else []
         st.session_state["live_orders"] = [
@@ -185,7 +179,7 @@ if auto_on and not _tj_skip_global:
 dashboard = st.Page("pages/dashboard.py",  title="Dashboard",         icon=":material/dashboard:",      default=True)
 journal_main = st.Page(
     "pages/journal_main.py",
-    title="Journal — Gréky",
+    title="Casopis — Gréky",
     icon=":material/analytics:",
 )
 trading_commands = st.Page(

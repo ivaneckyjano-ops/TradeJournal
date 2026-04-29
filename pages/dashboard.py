@@ -1,12 +1,10 @@
 import streamlit as st
 import pandas as pd
-from datetime import date, datetime
+from datetime import datetime
 
 from core import database as db
 from core import ibkr
 from core.page_context import set_tradejournal_page
-from core.portfolio_data import journal_position_key, normalize_expiry
-
 db.init_db()
 set_tradejournal_page("dashboard")
 
@@ -27,11 +25,11 @@ _ib_connected = ibkr.is_connected()
 st.title("Dashboard")
 st.caption(
     "**Návod:** (1) V expandéri **IBKR Pripojenie** zadaj host/port a **Pripojiť**. (2) Stlač **Importuj pozície z IBKR** a prípadne import **Fills**. "
-    "(3) Skontroluj zhodu s denníkom v tabuľkách nižšie. Podrobný zápis Grékov a skupín je v **Journal — Gréky**."
+    "(3) Skontroluj zhodu s denníkom v tabuľkách nižšie. Podrobný zápis Grékov a skupín je v **Casopise — Gréky**."
 )
 st.info(
     "**TWS:** pripojenie, import pozícií a fills, kontrola zhody s denníkom. "
-    "**Journal (čo TWS nedáva dlhodobo):** zápis a história **Δ, Θ, Vega, IV** po otvorení, skupiny a net súčty — záložka **Journal — Gréky**."
+    "**Casopis (čo TWS nedáva dlhodobo):** zápis a história **Δ, Θ, Vega, IV** po otvorení, skupiny a net súčty — stránka **Casopis — Gréky**."
 )
 
 # ─── IBKR Panel ───────────────────────────────────────────────────────────────
@@ -95,20 +93,15 @@ if sync_btn:
     if res["error"]:
         st.error(res["error"])
     else:
-        sync_result = ibkr.sync_positions_to_db(res["positions"], db)
+        sync_result = ibkr.sync_positions_to_db(res["positions"], db, close_missing=True)
         st.session_state["last_sync"] = datetime.now().strftime("%H:%M:%S")
-        st.session_state["possibly_closed"] = sync_result.get("possibly_closed", [])
         st.success(
             f"Synchronizácia hotová — "
             f"pridané: **{sync_result['added']}** &nbsp;·&nbsp; "
             f"aktualizované: **{sync_result.get('updated', 0)}** &nbsp;·&nbsp; "
-            f"nezmenené: **{sync_result['skipped']}**"
+            f"nezmenené: **{sync_result['skipped']}** &nbsp;·&nbsp; "
+            f"uzavreté: **{sync_result.get('closed', 0)}**"
         )
-        if sync_result.get("possibly_closed"):
-            st.warning(
-                f"⚠️ **{len(sync_result['possibly_closed'])} pozícií** je v denníku ako *Open*, "
-                f"ale v IBKR portfóliu ich nenašiel. Môžu byť uzavreté. Pozri nižšie."
-            )
         st.rerun()
 
 fills_btn = st.button(
@@ -139,38 +132,6 @@ if fills_btn:
         else:
             st.info(msg + " Ak čakáš uzavretie nohy, skontroluj v denníku rovnaký ticker, strike, expiráciu (YYYYMMDD) a typ nohy (Short+BOT / Long+SLD).")
         st.rerun()
-
-# ─── Possibly Closed Alert ────────────────────────────────────────────────────
-possibly_closed = st.session_state.get("possibly_closed", [])
-if possibly_closed:
-    with st.container(border=True):
-        st.markdown("### ⚠️ Pozície chýbajúce v IBKR portfóliu")
-        st.caption(
-            "Tieto obchody sú v denníku ako **Open**, ale IBKR ich neukazuje. "
-            "Môžu byť uzavreté. Zadaj exit cenu a uzavri ich, alebo ignoruj ak sú IBKR dáta oneskorené."
-        )
-        for pc in possibly_closed:
-            c1, c2, c3 = st.columns([3, 1, 1])
-            with c1:
-                st.markdown(
-                    f"**#{pc['id']}** &nbsp; {pc['ticker']} "
-                    f"{pc['leg_type']} {pc['option_type']} "
-                    f"${pc['strike']:.0f} &nbsp; exp {pc['expiry']}"
-                )
-            with c2:
-                close_price = st.number_input(
-                    "Exit $", min_value=0.0, step=0.01,
-                    key=f"pc_price_{pc['id']}", label_visibility="collapsed",
-                    placeholder="0.00"
-                )
-            with c3:
-                if st.button("Uzavrieť", key=f"pc_close_{pc['id']}", type="secondary"):
-                    db.close_trade(pc["id"], close_price, date.today().isoformat())
-                    st.success(f"Trade #{pc['id']} uzavretý za ${close_price:.2f}")
-                    st.session_state["possibly_closed"] = [
-                        x for x in possibly_closed if x["id"] != pc["id"]
-                    ]
-                    st.rerun()
 
 if show_ibkr_raw and _ib_connected:
     with st.spinner("Načítavam..."):
@@ -279,303 +240,75 @@ if show_ibkr_raw and _ib_connected:
 
 st.divider()
 
-# ─── Kontrola: Porovnanie Denník ↔ TWS ────────────────────────────────────────
-st.subheader("Kontrola zhody Denník ↔ TWS")
-st.caption(
-    "Porovnáva len **opcie (OPT)** z TWS s otvorenými nohami v denníku. "
-    "Nohy, ktoré v TWS vôbec nie sú, sa v hlavnej tabuľke **nezobrazujú**."
-)
-with st.expander("Prečo môže byť nezhoda Denník ↔ TWS?", expanded=False):
-    st.markdown(
-        """
-- **Iný kľúč nohy** — musí sedieť ticker, strike (na 2 des.), expirácia **YYYYMMDD** (alebo `YYYY-MM-DD` v denníku),
-  typ **Call/Put** (aj `C`/`P` sa teraz zjednotí) a **Long/Short** ako v TWS (záporná pozícia = Short).
-- **V TWS je kontrakt, v denníku nie** — chýba import alebo zápis; použi **Importuj pozície z IBKR** alebo dopln Trade Log.
-- **V denníku je Open, v TWS už nie** — uzavrel si v brokrovi bez importu fills / bez uzavretia v denníku; zapni checkbox *Zobraziť aj nohy…* nižšie.
-- **FOP vs OPT** — kontrola zhody berie len **OPT**; futures opcie v TWS sa v tejto tabuľke ignorujú.
-- **Rôzny účet / paper vs live** — TWS API vráti len aktuálne pripojený účet; denník môže obsahovať staršie záznamy z iného režimu.
-"""
-    )
+# ─── Otvorené pozície ─────────────────────────────────────────────────────────
+st.subheader("Aktuálny stav v TWS")
 
 if not _ib_connected:
-    st.info("Pripoj sa na IBKR pre živé porovnanie.")
+    st.info("Pripoj sa na IBKR, aby sa zobrazil aktuálny stav z TWS.")
 else:
-    check_btn = st.button("Skontroluj zhodu s TWS", type="secondary", use_container_width=False)
-    if check_btn or st.session_state.get("show_check"):
-        st.session_state["show_check"] = True
-        with st.spinner("Porovnávam..."):
-            live_chk = ibkr.fetch_positions(use_historical_last=False)
-
-        if live_chk["error"]:
-            st.error(live_chk["error"])
-        else:
-            tws_opts = [p for p in live_chk["positions"] if p["sec_type"] == "OPT"]
-            db_open  = db.get_open_trades()
-
-            tws_keys  = {
-                journal_position_key(p["ticker"], p["strike"], p["expiry"], p["option_type"], p["leg_type"]): p
-                for p in tws_opts
-            }
-            db_keys   = {
-                journal_position_key(t["ticker"], t["strike"] or 0, t["expiry"] or "", t["option_type"] or "", t["leg_type"] or ""): t
-                for t in db_open
-            }
-
-            rows_cmp = []
-            journal_only: list[dict] = []
-            # Porovnávame len kľúče z TWS (OPT). Nohy len v denníku bez zodpovedajúcej OPT v TWS
-            # neuvádzame ako „chybu“ — zobrazia sa voliteľne v expanderi.
-
-            for k in sorted(tws_keys):
-                tws_p = tws_keys[k]
-                db_p = db_keys.get(k)
-
-                if tws_p and db_p:
-                    tws_c = float(abs(tws_p.get("contracts", 1)))
-                    db_c  = float(db_p.get("contracts", 1))
-                    if abs(tws_c - db_c) < 1e-6:
-                        status = "✅ OK"
-                    else:
-                        status = f"⚠️ Kontrakt: TWS={tws_c} / Denník={db_c}"
-                    rows_cmp.append({
-                        "Stav": status,
-                        "ID": db_p["id"],
-                        "Ticker": k[0],
-                        "Noha": k[4],
-                        "Typ": k[3],
-                        "Strike": float(k[1]),
-                        "Expiry": k[2],
-                        "Kontr. TWS": tws_c if tws_p else "—",
-                        "Kontr. Denník": db_c if db_p else "—",
-                        "Group": db_p.get("group_id") or "—",
-                    })
-                elif tws_p and not db_p:
-                    rows_cmp.append({
-                        "Stav": "❌ Chýba v denníku",
-                        "ID": "—",
-                        "Ticker": k[0],
-                        "Noha": k[4],
-                        "Typ": k[3],
-                        "Strike": float(k[1]),
-                        "Expiry": k[2],
-                        "Kontr. TWS": float(abs(tws_p.get("contracts", 1))),
-                        "Kontr. Denník": "—",
-                        "Group": "—",
-                    })
-
-            for k in sorted(set(db_keys) - set(tws_keys)):
-                db_p = db_keys.get(k)
-                if db_p:
-                    journal_only.append(
-                        {
-                            "ID": db_p["id"],
-                            "Ticker": k[0],
-                            "Noha": k[4],
-                            "Typ": k[3],
-                            "Strike": float(k[1]),
-                            "Expiry": k[2],
-                            "Kontr.": float(db_p.get("contracts", 1)),
-                            "Group": db_p.get("group_id") or "—",
-                        }
-                    )
-
-            if not tws_opts and not db_open:
-                st.success("Žiadne otvorené opcie v denníku ani OPT v TWS.")
-            elif not tws_opts and db_open:
-                st.info(
-                    "V TWS momentálne **nie sú žiadne opčné pozície** — kontrola zhody sa netýka TWS. "
-                    "Nohy len v denníku sú v expanderi nižšie (nie sú chybou)."
-                )
-            elif not rows_cmp and not journal_only:
-                st.success("Žiadne OPT v TWS na porovnanie.")
-            elif rows_cmp:
-                ok_count = sum(1 for r in rows_cmp if r["Stav"].startswith("✅"))
-                warn_count = sum(1 for r in rows_cmp if r["Stav"].startswith("⚠️"))
-                err_count = sum(1 for r in rows_cmp if r["Stav"].startswith("❌"))
-
-                col_s1, col_s2, col_s3 = st.columns(3)
-                col_s1.metric("✅ Zhoduje sa", ok_count)
-                col_s2.metric("⚠️ Rozdiel kontraktov", warn_count)
-                col_s3.metric("❌ Chýba v denníku", err_count)
-
-                if warn_count == 0 and err_count == 0:
-                    st.success("Všetky TWS opčné nohy majú zodpovedajúci záznam v denníku (vrátane kontraktov).")
-                else:
-                    st.warning("Nájdené rozdiely — pozri tabuľku.")
-
-                df_cmp = pd.DataFrame(rows_cmp)
-                st.dataframe(
-                    df_cmp,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "Strike": st.column_config.NumberColumn(format="$%.2f"),
-                        "Stav": st.column_config.TextColumn(width="medium"),
-                    },
-                )
-
-                missing_in_db = [r for r in rows_cmp if r["Stav"] == "❌ Chýba v denníku"]
-                if missing_in_db:
-                    st.caption(
-                        "❌ = v TWS je OPT, v denníku chýba rovnaký kľúč. Použi **Importuj pozície z IBKR**."
-                    )
-            else:
-                st.caption("Žiadny riadok TWS↔denník na zhodnom kľúči (skontroluj formát expirácie v denníku: YYYYMMDD).")
-
-            if journal_only:
-                with st.expander(f"Nohy len v denníku (bez zodpovedajúcej OPT v TWS) — {len(journal_only)}", expanded=False):
-                    st.caption(
-                        "Toto **nie je chyba**, ak nohy vedieš len v journali alebo už nie sú v TWS. "
-                        "Kontrola vyššie sa týka iba toho, čo TWS vráti ako OPT."
-                    )
-                    st.dataframe(pd.DataFrame(journal_only), use_container_width=True, hide_index=True)
-
-st.divider()
-
-# ─── Otvorené pozície ─────────────────────────────────────────────────────────
-st.subheader("Otvorené pozície")
-
-open_trades = db.get_open_trades()
-show_all_off_tws = False
-if _ib_connected and open_trades:
-    show_all_off_tws = st.checkbox(
-        "Zobraziť aj nohy z denníka, ktoré **nie sú** v TWS ako OPT (napr. už uzavreté v brokrovi)",
-        value=False,
-        key="dash_show_journal_not_in_tws",
-        help="Predvolene Dashboard zobrazí len to, čo TWS aktuálne vráti ako opčnú pozíciu — aby sa nelíšalo od horného bloku.",
-    )
-
-display_trades = open_trades
-off_tws_trades: list[dict] = []
-if _ib_connected and open_trades and not show_all_off_tws:
     live_tbl = ibkr.fetch_positions(use_historical_last=False)
-    _pos_list = live_tbl.get("positions")
-    if not live_tbl.get("error") and _pos_list is not None:
-        tws_opt_list = [p for p in _pos_list if p["sec_type"] == "OPT"]
-        in_tws = {
-            journal_position_key(p["ticker"], p["strike"], p["expiry"], p["option_type"], p["leg_type"])
-            for p in tws_opt_list
-        }
-        display_trades = []
-        for t in open_trades:
-            k = journal_position_key(
-                t.get("ticker"),
-                t.get("strike") or 0,
-                t.get("expiry") or "",
-                t.get("option_type") or "",
-                t.get("leg_type") or "",
-            )
-            if k in in_tws:
-                display_trades.append(t)
-            else:
-                off_tws_trades.append(t)
-    elif live_tbl.get("error"):
-        st.caption(f"TWS pozície sa nepodarilo načítať na filter tabuľky: {live_tbl['error']}")
-
-if not open_trades:
-    st.info("Žiadne otvorené pozície. Použi **Importuj pozície z IBKR** alebo pridaj manuálne v **Trade Log**.")
-elif _ib_connected and not show_all_off_tws and not display_trades and off_tws_trades:
-    st.warning(
-        "V denníku máš otvorené nohy, ale **žiadna nezodpovedá** aktuálnym OPT v TWS (horný blok). "
-        "Skontroluj import, alebo nohy uzavri / oprav v Trade Logu. Zatiaľ môžeš zapnúť checkbox vyššie a zobraziť celý denník."
-    )
-else:
-    if _ib_connected and not show_all_off_tws:
+    if live_tbl.get("error"):
+        st.error(live_tbl["error"])
+    else:
+        pos_list = live_tbl.get("positions") or []
+        tws_opts = [p for p in pos_list if p.get("sec_type") == "OPT"]
         st.caption(
-            "Tabuľka nižšie = **iba nohy**, ktoré TWS momentálne hlási ako OPT (rovnaký kľúč ako kontrola zhody). "
-            "Ostatné sú v expanderi."
+            f"Z TWS načítané pozície: **{len(pos_list)}**, z toho opčné (**OPT**): **{len(tws_opts)}**. "
+            "Tento blok je čisto live stav brokera, bez denníka."
         )
-    rows = []
-    for t in display_trades:
-        dte_val = None
-        th_val = t.get("theta_at_entry")
 
-        if t.get("expiry"):
-            try:
-                exp_str = t["expiry"]
-                exp_date = date.fromisoformat(
-                    f"{exp_str[:4]}-{exp_str[4:6]}-{exp_str[6:8]}"
-                    if len(exp_str) == 8 else exp_str
-                )
-                dte_val = (exp_date - date.today()).days
-            except Exception:
-                pass
-
-        rows.append({
-            "ID": t["id"],
-            "Group": t.get("group_id", "") or "",
-            "Ticker": t["ticker"],
-            "Stratégia": t.get("strategy", ""),
-            "Noha": t.get("leg_type", ""),
-            "Typ": t.get("option_type", ""),
-            "Strike": t.get("strike"),
-            "Expiry": t.get("expiry", ""),
-            "DTE": dte_val,
-            "Kontrakty": t.get("contracts", 1),
-            "Entry cena": t.get("entry_price"),
-            "Θ (entry) $/deň": f"${float(th_val):+.3f}" if th_val is not None else "—",
-            "Entry dátum": t.get("entry_date", ""),
-        })
-
-    df = pd.DataFrame(rows)
-    st.dataframe(
-        df,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Strike": st.column_config.NumberColumn(format="$%.2f"),
-            "Entry cena": st.column_config.NumberColumn(format="$%.2f"),
-        },
-    )
-
-    if off_tws_trades and not show_all_off_tws:
-        with st.expander(
-            f"Otvorené v denníku, ale nie v TWS OPT ({len(off_tws_trades)} nôh)",
-            expanded=False,
-        ):
-            st.caption(
-                "Tieto záznamy sú v denníku stále **Open**, ale v odpovedi TWS pre opcie sa neobjavujú "
-                "(iný účet, už zatvorené v TWS, alebo nepresná zhoda kľúča). Úprava v **Trade Log** / **Journal — Gréky**."
-            )
-            rows2 = []
-            for t in off_tws_trades:
-                dte_val = None
-                th_val = t.get("theta_at_entry")
-                if t.get("expiry"):
-                    try:
-                        exp_str = t["expiry"]
-                        exp_date = date.fromisoformat(
-                            f"{exp_str[:4]}-{exp_str[4:6]}-{exp_str[6:8]}"
-                            if len(exp_str) == 8
-                            else exp_str
-                        )
-                        dte_val = (exp_date - date.today()).days
-                    except Exception:
-                        pass
-                rows2.append(
+        if not tws_opts:
+            st.info("TWS momentálne nevrátil žiadne opčné pozície (OPT).")
+        else:
+            rows = []
+            for p in sorted(
+                tws_opts,
+                key=lambda x: (
+                    str(x.get("ticker") or ""),
+                    str(x.get("expiry") or ""),
+                    float(x.get("strike") or 0),
+                    str(x.get("option_type") or ""),
+                    str(x.get("leg_type") or ""),
+                ),
+            ):
+                exp = str(p.get("expiry") or "")
+                exp_disp = f"{exp[:4]}-{exp[4:6]}-{exp[6:8]}" if len(exp) >= 8 and "-" not in exp else exp
+                rows.append(
                     {
-                        "ID": t["id"],
-                        "Group": t.get("group_id", "") or "",
-                        "Ticker": t["ticker"],
-                        "Stratégia": t.get("strategy", ""),
-                        "Noha": t.get("leg_type", ""),
-                        "Typ": t.get("option_type", ""),
-                        "Strike": t.get("strike"),
-                        "Expiry": t.get("expiry", ""),
-                        "DTE": dte_val,
-                        "Kontrakty": t.get("contracts", 1),
-                        "Entry cena": t.get("entry_price"),
-                        "Θ (entry) $/deň": f"${float(th_val):+.3f}" if th_val is not None else "—",
-                        "Entry dátum": t.get("entry_date", ""),
+                        "Ticker": p.get("ticker") or "",
+                        "Expirácia": exp_disp,
+                        "Strike": p.get("strike"),
+                        "Typ": p.get("option_type") or "",
+                        "Noha": p.get("leg_type") or "",
+                        "Kontrakty": int(float(p.get("contracts") or 1)),
+                        "Trh. cena": p.get("market_price"),
+                        "Mkt hodnota": p.get("market_value"),
+                        "U P&L": p.get("unrealized_pnl"),
+                        "Zdroj ceny": p.get("price_source") or "",
+                        "TWS Δ (odhad)": p.get("delta"),
+                        "TWS Θ $/deň": p.get("theta"),
+                        "TWS Vega": p.get("vega"),
+                        "TWS IV": p.get("iv"),
                     }
                 )
+
+            df = pd.DataFrame(rows)
+            for c in ("TWS Δ (odhad)", "TWS Θ $/deň", "TWS Vega", "TWS IV", "Trh. cena", "Mkt hodnota", "U P&L"):
+                if c in df.columns:
+                    df[c] = df[c].astype("Float64")
             st.dataframe(
-                pd.DataFrame(rows2),
+                df,
                 use_container_width=True,
                 hide_index=True,
                 column_config={
                     "Strike": st.column_config.NumberColumn(format="$%.2f"),
-                    "Entry cena": st.column_config.NumberColumn(format="$%.2f"),
+                    "Trh. cena": st.column_config.NumberColumn(format="$%.4f"),
+                    "Mkt hodnota": st.column_config.NumberColumn(format="$%.2f"),
+                    "U P&L": st.column_config.NumberColumn(format="$%.2f"),
+                    "TWS Δ (odhad)": st.column_config.NumberColumn(format="%.4f"),
+                    "TWS Θ $/deň": st.column_config.NumberColumn(format="$%.3f"),
+                    "TWS Vega": st.column_config.NumberColumn(format="%.2f"),
+                    "TWS IV": st.column_config.NumberColumn(format="%.4f"),
                 },
             )
 
