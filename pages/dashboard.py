@@ -285,6 +285,17 @@ st.caption(
     "Porovnáva len **opcie (OPT)** z TWS s otvorenými nohami v denníku. "
     "Nohy, ktoré v TWS vôbec nie sú, sa v hlavnej tabuľke **nezobrazujú**."
 )
+with st.expander("Prečo môže byť nezhoda Denník ↔ TWS?", expanded=False):
+    st.markdown(
+        """
+- **Iný kľúč nohy** — musí sedieť ticker, strike (na 2 des.), expirácia **YYYYMMDD** (alebo `YYYY-MM-DD` v denníku),
+  typ **Call/Put** (aj `C`/`P` sa teraz zjednotí) a **Long/Short** ako v TWS (záporná pozícia = Short).
+- **V TWS je kontrakt, v denníku nie** — chýba import alebo zápis; použi **Importuj pozície z IBKR** alebo dopln Trade Log.
+- **V denníku je Open, v TWS už nie** — uzavrel si v brokrovi bez importu fills / bez uzavretia v denníku; zapni checkbox *Zobraziť aj nohy…* nižšie.
+- **FOP vs OPT** — kontrola zhody berie len **OPT**; futures opcie v TWS sa v tejto tabuľke ignorujú.
+- **Rôzny účet / paper vs live** — TWS API vráti len aktuálne pripojený účet; denník môže obsahovať staršie záznamy z iného režimu.
+"""
+    )
 
 if not _ib_connected:
     st.info("Pripoj sa na IBKR pre živé porovnanie.")

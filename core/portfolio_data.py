@@ -49,14 +49,28 @@ def normalize_expiry(exp: str) -> str:
     return exp
 
 
+def _canon_option_type_for_key(opt_type: str | None) -> str:
+    """
+    TWS / import používajú „Call“ / „Put“; v denníku býva často „C“ / „P“.
+    Bez normalizácie by ``str('P').capitalize()`` ostalo „P“ a kľúč sa s TWS nezhodoval.
+    """
+    s = str(opt_type or "").strip().lower()
+    if s.startswith("c"):
+        return "Call"
+    if s.startswith("p"):
+        return "Put"
+    return str(opt_type or "").strip().capitalize() or ""
+
+
 def journal_position_key(ticker, strike, expiry, opt_type, leg_type) -> tuple:
-    """Kľúč pre zhodu denník ↔ TWS OPT (expirácia vždy YYYYMMDD)."""
-    exp_c = normalize_expiry(str(expiry or "")).replace("-", "")
+    """Kľúč pre zhodu denník ↔ TWS OPT (expirácia kompaktná YYYYMMDD)."""
+    raw_exp = str(expiry or "").strip().split()[0]
+    exp_c = normalize_expiry(raw_exp).replace("-", "")
     return (
         str(ticker).upper(),
         f"{float(strike or 0):.2f}",
         exp_c,
-        str(opt_type).capitalize(),
+        _canon_option_type_for_key(opt_type),
         str(leg_type).capitalize(),
     )
 

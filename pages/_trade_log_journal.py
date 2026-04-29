@@ -7,6 +7,7 @@ from datetime import date, datetime
 from core import database as db
 from core import ibkr
 from core.page_context import set_tradejournal_page
+from core.portfolio_data import journal_position_key
 
 db.init_db()
 set_tradejournal_page("trade_log")
@@ -105,7 +106,12 @@ def _group_select_options(trades_for_orphans: list[dict]) -> list[str]:
 
 
 def _group_id_from_select(cell_value: str) -> Optional[str]:
-    s = (cell_value or "").strip()
+    # Streamlit data_editor niekedy vracia selectbox hodnotu ako jednoprvkový list.
+    if isinstance(cell_value, (list, tuple)) and len(cell_value) == 1:
+        cell_value = cell_value[0]
+    if cell_value is None:
+        return None
+    s = str(cell_value).strip()
     if not s or s == GROUP_NONE_LABEL:
         return None
     return s
@@ -174,39 +180,31 @@ with tab_add:
                 help="Celková komisia brokera za otvorenie (napr. 0.65 × počet kontraktov)"
             )
 
-        st.markdown("**Voliteľné — IV a Theta**")
+        st.markdown("**Voliteľné — IV, Δ a Θ pri vstupe**")
         iv_input = st.number_input(
             "IV pri vstupe (napr. 0.30)",
             min_value=0.0,
             max_value=5.0,
             step=0.01,
             value=0.0,
-            help="Uloží sa do denníka ako desatinný zlomok (0,30 = 30 %).",
+            help="Uloží sa ako zlomok (0,30 = 30 %). Nechaj 0 ak nechceš ukladať IV.",
         )
 
-        use_theta_entry = st.checkbox("Doplniť Θ pri vstupe (USD/deň za nohu, napr. z TWS)", value=False)
-        theta_entry_input = st.number_input(
-            "Theta pri vstupe ($/deň)",
-            min_value=-9999.0,
-            max_value=9999.0,
-            step=0.001,
-            format="%.3f",
-            value=0.0,
-            disabled=not use_theta_entry,
-            help="Súčet theta pre túto nohu v dolároch za deň (ako v portfóliu TWS).",
-        )
-
-        use_delta_entry = st.checkbox("Doplniť Δ pri vstupe (z TWS / vlastná poznámka)", value=False)
-        delta_entry_input = st.number_input(
-            "Delta pri vstupe (−1 … 1)",
-            min_value=-1.0,
-            max_value=1.0,
-            step=0.01,
-            format="%.4f",
-            value=0.0,
-            disabled=not use_delta_entry,
-            help="Delta kontraktu pri otvorení. Zapni checkbox vyššie, ak chceš hodnotu uložiť.",
-        )
+        o1, o2 = st.columns(2)
+        with o1:
+            delta_entry_text = st.text_input(
+                "Δ pri vstupe (−1 … 1, voliteľné)",
+                value="",
+                placeholder="napr. 0.42 alebo prázdne",
+                help="Prázdne = Δ sa neuloží. Z TWS alebo vlastná hodnota.",
+            )
+        with o2:
+            theta_entry_text = st.text_input(
+                "Θ pri vstupe ($/deň za nohu, voliteľné)",
+                value="",
+                placeholder="napr. -12.5 alebo prázdne",
+                help="Prázdne = θ sa neuloží. Suma theta za pozíciu ako v TWS.",
+            )
 
         submitted = st.form_submit_button("Uložiť obchod", type="primary", use_container_width=True)
 
@@ -215,6 +213,29 @@ with tab_add:
             st.error("Vyplň: Ticker, Strike a Entry cenu.")
         else:
             expiry_str = expiry_date.strftime("%Y%m%d")
+
+            ds = str(delta_entry_text or "").strip().replace(",", ".")
+            theta_at_entry_out: Optional[float] = None
+            delta_at_entry_out: Optional[float] = None
+
+            if ds:
+                try:
+                    dv = float(ds)
+                    if dv < -1.0 or dv > 1.0:
+                        st.error("Δ pri vstupe musí byť medzi −1 a 1.")
+                        st.stop()
+                    delta_at_entry_out = dv
+                except ValueError:
+                    st.error("Δ pri vstupe nie je platné číslo.")
+                    st.stop()
+
+            ts = str(theta_entry_text or "").strip().replace(",", ".")
+            if ts:
+                try:
+                    theta_at_entry_out = float(ts)
+                except ValueError:
+                    st.error("Θ pri vstupe nie je platné číslo.")
+                    st.stop()
 
             trade_id = db.add_trade(
                 ticker=ticker,
@@ -230,8 +251,8 @@ with tab_add:
                 iv_at_entry=iv_input if iv_input > 0 else None,
                 pop_at_entry=None,
                 commission=commission_input if commission_input > 0 else None,
-                delta_at_entry=float(delta_entry_input) if use_delta_entry else None,
-                theta_at_entry=float(theta_entry_input) if use_theta_entry else None,
+                delta_at_entry=delta_at_entry_out,
+                theta_at_entry=theta_at_entry_out,
             )
             st.success(f"Obchod #{trade_id} uložený — {ticker} {leg_type} {option_type} ${strike:.0f}.")
             st.rerun()
@@ -244,6 +265,48 @@ with tab_open:
         "úprava viacerých polí je v záložke **Upraviť / Zoskupiť**."
     )
     open_trades = db.get_open_trades()
+
+    # Keď je IB pripojené, veľa ľudí chce vidieť v „Obchodoch“ iba to,
+    # čo broker reálne hlási ako OPT/FOP. Toto je ne-destruktívny filter.
+    if ibkr.is_connected() and open_trades:
+        only_in_tws = st.checkbox(
+            "Zobraziť len nohy prítomné v TWS (OPT/FOP)",
+            value=True,
+            help="Keď zapnuté: otvorené nohy v DB sa ukážu len vtedy, ak existuje zodpovedajúca OPT/FOP v TWS podľa rovnakého kľúča.",
+            key="tl_only_in_tws_open",
+        )
+        if only_in_tws:
+            live_tbl = ibkr.fetch_positions(use_historical_last=False)
+            if live_tbl.get("error"):
+                st.caption(f"Filter TWS zlyhal: {live_tbl['error']} — zobrazím všetky open nohy.")
+            else:
+                tws_opts = [p for p in live_tbl.get("positions", []) if p.get("sec_type") in ("OPT", "FOP")]
+                in_tws_keys = {
+                    journal_position_key(
+                        p.get("ticker"),
+                        p.get("strike") or 0,
+                        p.get("expiry") or "",
+                        p.get("option_type") or "",
+                        p.get("leg_type") or "",
+                    )
+                    for p in tws_opts
+                }
+                before_n = len(open_trades)
+                open_trades = [
+                    t
+                    for t in open_trades
+                    if journal_position_key(
+                        t.get("ticker"),
+                        t.get("strike") or 0,
+                        t.get("expiry") or "",
+                        t.get("option_type") or "",
+                        t.get("leg_type") or "",
+                    )
+                    in in_tws_keys
+                ]
+                after_n = len(open_trades)
+                if before_n != after_n:
+                    st.caption(f"Filtrované podľa TWS: {before_n} → {after_n} open nôh.")
 
     if not open_trades:
         st.info("Žiadne otvorené pozície.")
@@ -387,6 +450,8 @@ with tab_edit:
         for t in edit_trades_filtered:
             raw_gid = (t.get("group_id") or "").strip()
             gid_cell = raw_gid if raw_gid in group_opts_editor else GROUP_NONE_LABEL
+            _d_e = t.get("delta_at_entry")
+            _d_c = t.get("delta_current")
             edit_rows.append({
                 "ID": t["id"],
                 "Ticker": t["ticker"],
@@ -402,11 +467,15 @@ with tab_edit:
                 "Exit Date": t.get("exit_date", ""),
                 "Skupina": gid_cell,
                 "Stratégia": t.get("strategy") or "",
+                "Δ vstup": pd.NA if _d_e is None else float(_d_e),
+                "Δ akt.": pd.NA if _d_c is None else float(_d_c),
             })
 
         _edit_df = pd.DataFrame(edit_rows)
         for _num_col in ("Strike", "Entry $", "Exit $", "Komisia $"):
             _edit_df[_num_col] = _edit_df[_num_col].astype("float64")
+        for _delta_col in ("Δ vstup", "Δ akt."):
+            _edit_df[_delta_col] = _edit_df[_delta_col].astype("Float64")
 
         edited_df = st.data_editor(
             _edit_df,
@@ -429,6 +498,22 @@ with tab_edit:
                     "Skupina",
                     options=group_opts_editor,
                     help="Zoznam zo záložky Skupiny",
+                ),
+                "Δ vstup": st.column_config.NumberColumn(
+                    "Δ vstup",
+                    format="%.4f",
+                    step=0.0001,
+                    min_value=-1.0,
+                    max_value=1.0,
+                    help="Delta pri otvorení. Prázdne = neuložená.",
+                ),
+                "Δ akt.": st.column_config.NumberColumn(
+                    "Δ akt.",
+                    format="%.4f",
+                    step=0.0001,
+                    min_value=-1.0,
+                    max_value=1.0,
+                    help="Aktuálna delta.",
                 ),
             },
             key="edit_table_v2",
@@ -473,6 +558,48 @@ with tab_edit:
 
                 if updates:
                     db.update_trade(trade_id=tid, **updates)
+                    changed += 1
+
+                # Delta vstup a aktuálna — uložiť zvlášť.
+                # Dôležité: prázdna bunka (NA/None) = "nezmenené", nie prepísať na NULL.
+                def _parse_delta_cell(v, orig_val) -> Optional[float]:
+                    if v is None:
+                        return orig_val
+                    try:
+                        if pd.isna(v):
+                            return orig_val
+                    except (TypeError, ValueError):
+                        pass
+                    try:
+                        return float(v)
+                    except (TypeError, ValueError):
+                        return orig_val
+
+                orig_d_e = orig.get("delta_at_entry")
+                orig_d_c = orig.get("delta_current")
+                new_d_e = _parse_delta_cell(row.get("Δ vstup"), orig_d_e)
+                new_d_c = _parse_delta_cell(row.get("Δ akt."), orig_d_c)
+
+                def _feq(a, b) -> bool:
+                    if a is None and b is None:
+                        return True
+                    if a is None or b is None:
+                        return False
+                    return abs(float(a) - float(b)) < 1e-9
+
+                delta_changed = not _feq(orig_d_e, new_d_e) or not _feq(orig_d_c, new_d_c)
+                if delta_changed:
+                    db.set_trade_portfolio_greeks(
+                        tid,
+                        orig.get("iv_at_entry"),
+                        new_d_e,
+                        orig.get("theta_at_entry"),
+                        new_d_c,
+                        vega_at_entry=orig.get("vega_at_entry"),
+                        vega_current=orig.get("vega_current"),
+                        iv_current=orig.get("iv_current"),
+                        theta_current=orig.get("theta_current"),
+                    )
                     changed += 1
             
             if changed:

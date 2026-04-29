@@ -1613,7 +1613,20 @@ def fetch_positions(
         return {"positions": [], "error": "Nie je pripojenie na IBKR"}
 
     try:
+        # Nepoužívaj ib.reqPositions() pred portfolio(): v niektorých verziách API to vyprázdni cache
+        # a portfolio() vráti [] do ďalšieho update cyklu → používateľ „nemá nič“.
+        try:
+            ib.sleep(0.15)
+        except Exception:
+            time.sleep(0.15)
+
         raw = ib.portfolio()
+        if not raw:
+            try:
+                ib.sleep(0.65)
+            except Exception:
+                time.sleep(0.65)
+            raw = ib.portfolio()
         if not raw:
             return {"positions": [], "error": None}
 
@@ -1677,7 +1690,7 @@ def fetch_positions(
             except Exception:
                 pass
 
-        # Podklad pre Greeks: prvý STK (po snapshot)
+        # Podklad pre Greeks: prvý STK (po snapshot), alebo spot z prvého podkladového tickeru OPT (bez STK v účte)
         under_price: float | None = None
         for p in positions:
             if p.get("sec_type") == "STK":
@@ -1685,6 +1698,25 @@ def fetch_positions(
                 if mp is not None and not math.isnan(float(mp)) and float(mp) > 0:
                     under_price = float(mp)
                     break
+
+        if with_greeks and under_price is None:
+            seen_syms: list[str] = []
+            for p in positions:
+                if p.get("sec_type") not in ("OPT", "FOP"):
+                    continue
+                sym = str(p.get("ticker") or "").strip().upper()
+                if sym and sym not in seen_syms:
+                    seen_syms.append(sym)
+            # Len prvý ticker — vyhneme sa dlhému blokovaniu pri každom načítaní stránky.
+            for sym in seen_syms[:1]:
+                try:
+                    sp = fetch_underlying(sym, timeout=5.0)
+                    px = sp.get("price")
+                    if px is not None and float(px) > 0:
+                        under_price = float(px)
+                        break
+                except Exception:
+                    continue
 
         if with_greeks and under_price:
             for p in positions:

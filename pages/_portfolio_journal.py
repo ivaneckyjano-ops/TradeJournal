@@ -33,8 +33,9 @@ st.caption(
     "Pri IB a OPT v TWS sa v *Zápis journal* zobrazia aj stĺpce **TWS …** (BS z cien IB). Rozbaľ **Návod na použitie** pre detail."
 )
 st.caption(
-    "**TWS (živé):** opčné pozície z IB portfólia (OPT) — rovnaký kľúč ako pri kontrole na Dashboarde. "
-    "**Journal:** len obchody so stavom *Open*; pri pripojenom IB a OPT v TWS **iba nohy, ktoré sú aj v TWS**. "
+    "**TWS (živé):** opčné pozície z IB portfólia (OPT/FOP) — rovnaký kľúč ako na Dashboarde. "
+    "**Journal:** len obchody so stavom *Open* **a zároveň** rovnaká pozícia v TWS. "
+    "Bez pripojenia IB alebo bez opcií v portfóliu sa tu **nezobrazí** žiadna noha z denníka (nie je čo párovať s brokerom). "
     "Zápis **Δ, Θ, Vega, IV** (vstup / aktuál), skupiny, net a história — stĺpce „TWS …“ sú **odhad z BS** z cien IB."
 )
 
@@ -53,6 +54,18 @@ with st.expander("Návod na použitie", expanded=False):
             "Skopíruj z repozitára **docs/journal-greky.md** alebo ho obnov z gitu."
         )
 
+st.divider()
+_hl_col1, _hl_col2 = st.columns([4, 1])
+with _hl_col1:
+    st.checkbox(
+        "Historické Last pre ceny opcií (pomalšie; stabilnejšie, ak sú mark ceny v portfóliu prázdne)",
+        value=False,
+        key="portfolio_use_hist_last",
+        help="Volá reqHistoricalData na každú OPT/FOP pozíciu — často nutné bez streaming market data.",
+    )
+with _hl_col2:
+    st.write("")
+    st.button("Obnoviť z TWS", key="portfolio_refresh_tws_btn", help="Znova načíta pozície z brokera.")
 
 def _dte(expiry_str: str) -> int | None:
     if not expiry_str:
@@ -93,6 +106,29 @@ def _nan_to_none(v) -> float | None:
         return None
     if isinstance(x, float) and math.isnan(x):
         return None
+    return x
+
+
+def _greek_cell_to_db(orig_val: float | None, cell_val) -> float | None:
+    """
+    Bunka z ``data_editor`` s Float64/NA: **prázdna (NA)** = ponechaj ``orig_val`` z DB.
+    Inak sa pri uložení jedného Gréka prepísali ostatné stĺpce hodnotou NULL (delta sa „nezapísala“ / zmazala IV).
+    """
+    if isinstance(cell_val, (list, tuple)) and len(cell_val) == 1:
+        cell_val = cell_val[0]
+    if cell_val is None:
+        return orig_val
+    try:
+        if pd.isna(cell_val):
+            return orig_val
+    except (TypeError, ValueError):
+        pass
+    try:
+        x = float(cell_val)
+    except (TypeError, ValueError):
+        return orig_val
+    if isinstance(x, float) and math.isnan(x):
+        return orig_val
     return x
 
 
@@ -158,6 +194,39 @@ def _leg_key(t: dict) -> tuple:
     )
 
 
+# Rovnaký význam ako GROUP_NONE_LABEL v pages/_trade_log_journal.py (Selectbox v data_editor).
+PF_GROUP_NONE = "— (bez skupiny) —"
+
+
+def _journal_group_select_options(legs: list[dict]) -> list[str]:
+    """Skupiny z DB + group_id z nôh, ktoré ešte nie sú v tabuľke Skupiny (ako v Trade Logu)."""
+    registered = db.get_group_names()
+    reg_set = set(registered)
+    extra = sorted(
+        {
+            (t.get("group_id") or "").strip()
+            for t in legs
+            if (t.get("group_id") or "").strip() and (t.get("group_id") or "").strip() not in reg_set
+        }
+    )
+    return [PF_GROUP_NONE] + registered + extra
+
+
+def _skupina_cell_norm(v) -> str:
+    """Hodnota z data_editor (niekedy jednoprvkový list); NaN → prázdna skupina."""
+    if isinstance(v, (list, tuple)) and len(v) == 1:
+        v = v[0]
+    if v is None:
+        return PF_GROUP_NONE
+    try:
+        if pd.isna(v):
+            return PF_GROUP_NONE
+    except (TypeError, ValueError):
+        pass
+    s = str(v).strip()
+    return s if s else PF_GROUP_NONE
+
+
 with st.expander("Filter", expanded=False):
     _sym_raw = db.get_symbol_tickers()
     _sym_sorted = sorted({str(t).strip().upper() for t in _sym_raw if str(t).strip()})
@@ -188,10 +257,13 @@ live_pkg: dict | None = None
 tws_err: str | None = None
 tws_opts: list = []
 if _ib_connected:
-    live_pkg = ibkr.fetch_positions(with_greeks=True, use_historical_last=False)
+    live_pkg = ibkr.fetch_positions(
+        with_greeks=True,
+        use_historical_last=bool(st.session_state.get("portfolio_use_hist_last", False)),
+    )
     tws_err = live_pkg.get("error")
     if not tws_err:
-        tws_opts = [p for p in live_pkg["positions"] if p.get("sec_type") == "OPT"]
+        tws_opts = [p for p in live_pkg["positions"] if p.get("sec_type") in ("OPT", "FOP")]
 
 tws_by_key: dict = {}
 for p in tws_opts:
@@ -204,23 +276,23 @@ for p in tws_opts:
     )
     tws_by_key[k] = p
 
-tws_cols_active = _ib_connected and bool(tws_opts)
+tws_cols_active = _ib_connected and not tws_err and bool(tws_opts)
 
+# Otvorené pozície v časopise = výhradne prienik denník ↔ TWS (nie celý Trade Log).
 if tws_cols_active:
     open_trades = [t for t in open_trades_raw if _leg_key(t) in tws_by_key]
 else:
-    open_trades = list(open_trades_raw)
+    open_trades = []
 
 by_group: dict[str, list[dict]] = defaultdict(list)
 for t in open_trades:
     gid = (t.get("group_id") or "").strip()
-    label = gid if gid else "— bez skupiny"
+    label = gid if gid else PF_GROUP_NONE
     by_group[label].append(t)
 
-_sort_keys = sorted(by_group.keys(), key=lambda x: (x == "— bez skupiny", x.lower()))
+_sort_keys = sorted(by_group.keys(), key=lambda x: (x == PF_GROUP_NONE, x.lower()))
 
-_extra_gids = {str(t.get("group_id") or "").strip() for t in open_trades if str(t.get("group_id") or "").strip()}
-_grp_opts = ["— bez skupiny"] + sorted(set(groups_meta.keys()) | _extra_gids)
+_grp_opts = _journal_group_select_options(open_trades)
 
 n_legs = len(open_trades)
 n_groups = len(by_group)
@@ -229,14 +301,22 @@ m1, m2, m3 = st.columns(3)
 m1.metric("Otvorené nohy", str(n_legs))
 m2.metric("Skupín (v zobrazení)", str(n_groups))
 if not tws_cols_active:
-    st.caption(
-        "**Bez živého TWS** (nepripojený IB alebo v účte nie sú OPT): aplikácia **neporovnáva** denník s brokerom — "
-        "nezniká zoznam „nepárovaných“ pozícií. Zobrazujú sa **všetky** nohy so stavom *Open* z databázy; stĺpce „TWS …“ sa neukážu."
-    )
-if tws_cols_active and not open_trades and open_trades_raw and tws_opts:
+    if not _ib_connected:
+        st.caption(
+            "**Bez pripojenia na IBKR** sa v tomto časopise **nezobrazujú** otvorené nohy — zdroj pravdy je portfólio TWS. "
+            "Pripoj sa na **Dashboarde** a obnov stránku."
+        )
+    elif tws_err:
+        st.caption(f"**TWS:** načítanie zlyhalo — {tws_err}")
+    else:
+        st.caption(
+            "V účte TWS momentálne **nie sú** žiadne opčné pozície (OPT/FOP) — zoznam otvorených nôh je prázdny "
+            "(aj keď v denníku máš stále *Open* záznamy)."
+        )
+if tws_cols_active and not open_trades and open_trades_raw:
     st.info(
-        "Máš **otvorené** nohy v denníku, ale **žiadna** nezodpovedá OPT v TWS — na tejto stránke sa nezobrazujú. "
-        "Skontroluj expiráciu (formát), strike alebo synchronizáciu z Dashboardu."
+        "Máš **otvorené** nohy v denníku, ale **žiadna** nezodpovedá OPT/FOP v TWS — v časopise sa nezobrazujú. "
+        "Skontroluj expiráciu (YYYYMMDD), strike, typ Call/Put a Long/Short, alebo synchronizáciu z Dashboardu."
     )
 if open_trades:
     notionals = [_notional_per_leg(t) for t in open_trades]
@@ -281,13 +361,19 @@ with st.expander("Sektory — insight (Barchart OCR)", expanded=False):
 st.subheader("Otvorené pozície")
 
 if not open_trades and not tws_opts:
-    st.info(
-        "Nemáš žiadne **otvorené** obchody v denníku ani **opčné (OPT)** pozície v TWS. "
-        "Trade Log / import z Dashboardu (IBKR)."
-    )
     if not _ib_connected:
+        st.warning(
+            "Nie si pripojený na **IBKR** — v časopise Gréky sa otvorené nohy zobrazujú **len** po zhode s portfóliom TWS. "
+            "Pripoj sa na Dashboarde."
+        )
         st.page_link("pages/dashboard.py", label="Otvoriť Dashboard (IBKR)", icon=":material/dashboard:")
-    st.stop()
+    elif tws_err:
+        st.warning(f"Nepodarilo sa načítať portfólio z IBKR: **{tws_err}**")
+    else:
+        st.warning(
+            "V TWS momentálne **nie sú** žiadne opčné pozície (OPT/FOP), preto je zoznam prázdny — "
+            "aj keď v denníku môžeš mať stále *Open* záznamy."
+        )
 
 tab_tws, tab_legs, tab_net, tab_hist = st.tabs(
     ["TWS (živé OPT)", "Zápis journal", "Net podľa skupiny", "Časový vývoj (graf)"]
@@ -318,6 +404,12 @@ with tab_tws:
             st.caption(
                 "Rovnaké polia ako z ``ib.portfolio()`` + **Gréky** dopočítané v aplikácii (BS, podkladové **spot** z prvého STK v portfóliu). "
                 f"Referenčný spot: **{spot_ref:.2f}**."
+            )
+        elif tws_opts:
+            st.caption(
+                "Ak v účte **nemáš akciu podkladu (STK)**, pri načítaní pozícií sa skúsi **spot z tickeru podkladu opcie** "
+                "na dopočítanie Grékov. Ak sú stĺpce Δ/Θ/Vega/IV stále prázdne, zapni **Historické Last** vyššie alebo skontroluj "
+                "market data / mark ceny v TWS."
             )
         else:
             st.caption(
@@ -389,8 +481,8 @@ with tab_legs:
             )
         else:
             st.info(
-                "V denníku nemáš **otvorené** obchody (stav *Open*) — zápis journalu je po importe z IB alebo v Trade Log. "
-                "Po pripojení TWS sa tu zobrazia len nohy, ktoré sú aj v brokerovi."
+                "V denníku nemáš **otvorené** obchody (stav *Open*) **s párom v TWS** — zápis journalu je po importe z IB alebo v Trade Log. "
+                "Po pripojení a zhode kľúča sa nohy zobrazia tu."
             )
     else:
         if tws_cols_active:
@@ -400,7 +492,7 @@ with tab_legs:
             )
         for gname in _sort_keys:
             legs = by_group[gname]
-            meta = groups_meta.get(gname) if gname != "— bez skupiny" else None
+            meta = groups_meta.get(gname) if gname != PF_GROUP_NONE else None
             _gkey = hashlib.sha256(gname.encode("utf-8")).hexdigest()[:16]
             legs_edit = sorted(legs, key=lambda x: (str(x.get("ticker") or ""), int(x.get("id") or 0)))
             if not legs_edit:
@@ -428,10 +520,12 @@ with tab_legs:
                     dlt_c = t.get("delta_current")
                     v_e = t.get("vega_at_entry")
                     v_c = t.get("vega_current")
-                    gid_disp = (t.get("group_id") or "").strip() or "— bez skupiny"
+                    gid_disp = (t.get("group_id") or "").strip() or PF_GROUP_NONE
+                    if gid_disp not in _grp_opts:
+                        gid_disp = PF_GROUP_NONE
                     r = {
                         "ID": tid,
-                        "Skupina": gid_disp if gid_disp in _grp_opts else "— bez skupiny",
+                        "Skupina": gid_disp,
                         "Stratégia": t.get("strategy") or "",
                         "Ticker": t.get("ticker") or "",
                         "Noha": t.get("leg_type") or "",
@@ -468,6 +562,12 @@ with tab_legs:
                             r["TWS IV"] = pd.NA
                     rows.append(r)
                 df = pd.DataFrame(rows)
+                if "Skupina" in df.columns:
+                    _sk_cells = [_skupina_cell_norm(x) for x in df["Skupina"].tolist()]
+                    df["Skupina"] = _sk_cells
+                    _grp_opts_editor = list(dict.fromkeys([*_grp_opts, *_sk_cells]))
+                else:
+                    _grp_opts_editor = list(_grp_opts)
                 _float_cols = [
                     "Θ vstup ($/deň)",
                     "Θ aktuálna ($/deň)",
@@ -507,9 +607,9 @@ with tab_legs:
                 _col_cfg = {
                     "Skupina": st.column_config.SelectboxColumn(
                         "Skupina",
-                        options=_grp_opts,
-                        required=True,
-                        help="Rovnaké mená ako v záložke **Skupiny** / Trade Log.",
+                        options=_grp_opts_editor,
+                        required=False,
+                        help="Rovnaké mená ako v záložke **Skupiny** / Trade Log. Ak sa výber neuloží, skús znova po obnovení stránky.",
                     ),
                     "Strike": st.column_config.NumberColumn(format="$%.2f"),
                     "Entry $": st.column_config.NumberColumn(format="$%.2f"),
@@ -578,21 +678,21 @@ with tab_legs:
                     for _, row in edited.iterrows():
                         tid = int(row["ID"])
                         orig = orig_by_id.get(tid, {})
-                        sk = row.get("Skupina")
-                        new_gid = None if sk in (None, "", "— bez skupiny") else str(sk).strip()
+                        sk = _skupina_cell_norm(row.get("Skupina"))
+                        new_gid = None if sk in (PF_GROUP_NONE, "— bez skupiny") else sk
                         old_gid = (orig.get("group_id") or "").strip() or None
                         if (new_gid or "") != (old_gid or ""):
                             db.update_trade(tid, group_id="" if not new_gid else new_gid)
                             nchg += 1
 
-                        new_iv = _nan_to_none(row["IV vstup"])
-                        new_d = _nan_to_none(row["Δ vstup"])
-                        new_th = _nan_to_none(row["Θ vstup ($/deň)"])
-                        new_dc = _nan_to_none(row["Δ aktuálna"])
-                        new_tc = _nan_to_none(row["Θ aktuálna ($/deň)"])
-                        new_ve = _nan_to_none(row["Vega vstup"])
-                        new_vc = _nan_to_none(row["Vega aktuálna"])
-                        new_ivc = _nan_to_none(row["IV aktuálna"])
+                        new_iv = _greek_cell_to_db(orig.get("iv_at_entry"), row["IV vstup"])
+                        new_d = _greek_cell_to_db(orig.get("delta_at_entry"), row["Δ vstup"])
+                        new_th = _greek_cell_to_db(orig.get("theta_at_entry"), row["Θ vstup ($/deň)"])
+                        new_dc = _greek_cell_to_db(orig.get("delta_current"), row["Δ aktuálna"])
+                        new_tc = _greek_cell_to_db(orig.get("theta_current"), row["Θ aktuálna ($/deň)"])
+                        new_ve = _greek_cell_to_db(orig.get("vega_at_entry"), row["Vega vstup"])
+                        new_vc = _greek_cell_to_db(orig.get("vega_current"), row["Vega aktuálna"])
+                        new_ivc = _greek_cell_to_db(orig.get("iv_current"), row["IV aktuálna"])
 
                         greek_changed = (
                             not _entry_float_eq(orig.get("iv_at_entry"), new_iv)
