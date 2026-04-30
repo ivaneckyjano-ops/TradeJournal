@@ -1,7 +1,5 @@
 """
-Journal — otvorené pozície z denníka: Gréky, IV, Vega v čase, skupiny a net súčty.
-Pri pripojenom IBKR: záložka **TWS (živé OPT)** = rovnaký zdroj ako Dashboard; zápis journalu môže
-zobrazovať stĺpce **TWS** (model BS z cien IB, rovnaká mierka ako stĺpce Δ/Θ/Vega v denníku).
+Casopis — otvorené nohy z denníka: skupiny a ručný zápis Grékov / IV do DB.
 """
 from __future__ import annotations
 
@@ -12,14 +10,10 @@ from pathlib import Path
 from datetime import date
 
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
-from plotly.subplots import make_subplots
 
 from core import database as db
-from core import ibkr
 from core.page_context import set_tradejournal_page
-from core.portfolio_data import ib_opt_greeks_scaled_for_journal, journal_position_key
 
 db.init_db()
 set_tradejournal_page("portfolio")
@@ -29,33 +23,10 @@ _SHORT_DELTA_ALERT_RATIO = 2.0
 
 st.title("Casopis — Gréky a skupiny")
 
-if "pf_journal_advanced" not in st.session_state:
-    st.session_state["pf_journal_advanced"] = False
-
-st.checkbox(
-    "Rozšírené funkcie (živý TWS, Net podľa skupiny, graf histórie Grékov, sektory OCR)",
-    key="pf_journal_advanced",
-    help="Vypnuté = len prehľad a zápis skupín / Grékov v jednej záložke.",
+st.caption(
+    "**Návod:** Uprav **Δ vstup / Δ aktuálna**, **Θ vstup ($/deň) / Θ aktuálna ($/deň)** a ďalšie polia v tabuľke, potom **Uložiť journal** pri skupine. "
+    "Hodnoty sú z denníka (ručný zápis alebo iný import)."
 )
-_pf_adv = bool(st.session_state.get("pf_journal_advanced"))
-
-if _pf_adv:
-    st.caption(
-        "**Návod:** Štyri záložky — **TWS** = živý výpis OPT z brokera; **Zápis journal** = uprav Gréky/skupiny a **Uložiť journal**; **Net** = súčty po skupinách; **Časový vývoj** = graf snímok po uložení. "
-        "Pri IB a OPT v TWS sa v *Zápis journal* zobrazia aj stĺpce **TWS …** (BS z cien IB). Rozbaľ **Návod na použitie** pre detail."
-    )
-    st.caption(
-        "**TWS (živé):** opčné pozície z IB portfólia (OPT/FOP) — rovnaký kľúč ako na Dashboarde. "
-        "**Journal:** len obchody so stavom *Open* **a zároveň** rovnaká pozícia v TWS. "
-        "Bez pripojenia IB alebo bez opcií v portfóliu sa tu **nezobrazí** žiadna noha z denníka (nie je čo párovať s brokerom). "
-        "Zápis **Δ, Θ, Vega, IV** (vstup / aktuál), skupiny, net a história — stĺpce „TWS …“ sú **odhad z BS** z cien IB."
-    )
-else:
-    st.caption(
-        "**Návod:** Najprv vyššie zaškrtni **Zobraziť všetky otvorené nohy**, ak nemáš IB alebo sa nohy s TWS nezhodujú — inak sa tabuľka nemusí vôbec zobraziť. "
-        "Potom v záložke uprav **Δ vstup / Δ aktuálna** a **Θ vstup ($/deň) / Θ aktuálna ($/deň)** a stlač **Uložiť journal** pri skupine. "
-        "Na živé stĺpce **TWS …** treba pripojenie IB a OPT v účte."
-    )
 
 _JOURNAL_GUIDE_PATH = Path(__file__).resolve().parents[1] / "docs" / "journal-greky.md"
 try:
@@ -73,18 +44,7 @@ with st.expander("Návod na použitie", expanded=False):
         )
 
 st.divider()
-if _pf_adv:
-    _hl_col1, _hl_col2 = st.columns([4, 1])
-    with _hl_col1:
-        st.checkbox(
-            "Historické Last pre ceny opcií (pomalšie; stabilnejšie, ak sú mark ceny v portfóliu prázdne)",
-            value=False,
-            key="portfolio_use_hist_last",
-            help="Volá reqHistoricalData na každú OPT/FOP pozíciu — často nutné bez streaming market data.",
-        )
-    with _hl_col2:
-        st.write("")
-        st.button("Obnoviť z TWS", key="portfolio_refresh_tws_btn", help="Znova načíta pozície z brokera.")
+
 
 def _dte(expiry_str: str) -> int | None:
     if not expiry_str:
@@ -170,49 +130,6 @@ def _short_delta_abs_ratio(leg_type: str, entry_d: float | None, curr_d: float |
     return abs(float(curr_d)) / ae
 
 
-def _sum_legs(legs: list[dict], key: str) -> float | None:
-    xs = []
-    for t in legs:
-        v = t.get(key)
-        if v is None:
-            continue
-        try:
-            xs.append(float(v))
-        except (TypeError, ValueError):
-            continue
-    return sum(xs) if xs else None
-
-
-def _avg_legs(legs: list[dict], key: str) -> float | None:
-    xs = []
-    for t in legs:
-        v = t.get(key)
-        if v is None:
-            continue
-        try:
-            xs.append(float(v))
-        except (TypeError, ValueError):
-            continue
-    return sum(xs) / len(xs) if xs else None
-
-
-def _diff_msg(cur: float | None, ent: float | None) -> str:
-    if cur is None or ent is None:
-        return "—"
-    d = cur - ent
-    return f"{d:+.4f}" if abs(d) < 50 else f"{d:+.2f}"
-
-
-def _leg_key(t: dict) -> tuple:
-    return journal_position_key(
-        t.get("ticker"),
-        t.get("strike") or 0,
-        t.get("expiry") or "",
-        t.get("option_type") or "",
-        t.get("leg_type") or "",
-    )
-
-
 # Rovnaký význam ako GROUP_NONE_LABEL inde v UI (Selectbox v data_editor).
 PF_GROUP_NONE = "— (bez skupiny) —"
 
@@ -271,33 +188,6 @@ if ticker_filter:
 
 groups_meta = {g["name"]: g for g in db.get_groups()}
 
-_ib_connected = ibkr.is_connected()
-live_pkg: dict | None = None
-tws_err: str | None = None
-tws_opts: list = []
-if _ib_connected:
-    live_pkg = ibkr.fetch_positions(
-        with_greeks=True,
-        use_historical_last=bool(st.session_state.get("portfolio_use_hist_last", False)),
-    )
-    tws_err = live_pkg.get("error")
-    if not tws_err:
-        tws_opts = [p for p in live_pkg["positions"] if p.get("sec_type") in ("OPT", "FOP")]
-
-tws_by_key: dict = {}
-for p in tws_opts:
-    k = journal_position_key(
-        p.get("ticker"),
-        p.get("strike") or 0,
-        p.get("expiry") or "",
-        p.get("option_type") or "",
-        p.get("leg_type") or "",
-    )
-    tws_by_key[k] = p
-
-tws_cols_active = _ib_connected and not tws_err and bool(tws_opts)
-
-# Tabuľka je vždy z denníka; TWS len dopĺňa stĺpce, keď je dostupné.
 open_trades = list(open_trades_raw)
 
 by_group: dict[str, list[dict]] = defaultdict(list)
@@ -316,23 +206,6 @@ st.divider()
 m1, m2, m3 = st.columns(3)
 m1.metric("Otvorené nohy", str(n_legs))
 m2.metric("Skupín (v zobrazení)", str(n_groups))
-if not tws_cols_active:
-    if not _ib_connected:
-        st.caption(
-            "Bez IBKR sa nezobrazia doplnkové **TWS** stĺpce, ale tabuľka z denníka ostáva k dispozícii na ručný zápis Δ/Θ."
-        )
-    elif tws_err:
-        st.caption(f"**TWS:** načítanie zlyhalo — {tws_err}. Stále môžeš dopĺňať ručné hodnoty do denníka.")
-    else:
-        st.caption(
-            "V účte TWS momentálne **nie sú** žiadne opčné pozície (OPT/FOP) — TWS stĺpce teda nebudú k dispozícii, "
-            "ale ručný zápis Δ/Θ v tabuľke funguje normálne."
-        )
-if tws_cols_active and not open_trades and open_trades_raw:
-    st.info(
-        "Máš otvorené nohy v denníku a vidno aj TWS, ale žiadna sa momentálne nezhoduje s OPT/FOP v TWS. "
-        "Tabuľka z denníka je stále tu na ručný zápis Δ/Θ; TWS stĺpce sa zobrazia len pri zhode kľúča."
-    )
 if open_trades:
     notionals = [_notional_per_leg(t) for t in open_trades]
     m3.metric(
@@ -343,37 +216,6 @@ if open_trades:
 else:
     m3.metric("Σ |vstupná prémia| × 100", "—")
 
-if _pf_adv:
-    with st.expander("Sektory — insight (Barchart OCR)", expanded=False):
-        try:
-            from core import sector_insights_engine as _sie
-            from core import sector_performance_ocr as _spo
-
-            _sh = db.get_latest_sector_performance_snapshot("short")
-            if not _sh:
-                st.caption(
-                    "Zatiaľ nemáš uložený krátkodobý snímok. Stránka **Sektory — insight** v sekcii Analýza."
-                )
-            else:
-                _short_df = _spo.payload_rows_to_dataframe(_sh["payload"])
-                _lo = db.get_latest_sector_performance_snapshot("long")
-                _long_df = _spo.payload_rows_to_dataframe(_lo["payload"]) if _lo else None
-
-                def _sec_tf(tk: str) -> str | None:
-                    r = db.get_symbol(tk)
-                    return (str(r["sector"]).strip() if r and r.get("sector") else None)
-
-                _w = _sie.portfolio_sector_weights(open_trades, _sec_tf)
-                _rep = _sie.build_insight_report(_short_df, _long_df, _w)
-                st.caption(_rep.get("similarity_note", ""))
-                for _x in _rep.get("warnings", [])[:3]:
-                    st.warning(_x)
-                for _x in _rep.get("diversifiers", [])[:2]:
-                    st.info(_x)
-                st.page_link("pages/sector_insights.py", label="Otvoriť Sektory — insight", icon=":material/hub:")
-        except Exception as _e:
-            st.caption(f"Sektorový prehľad: {_e}")
-
 st.subheader("Otvorené pozície")
 
 if not open_trades:
@@ -382,100 +224,7 @@ if not open_trades:
         "Ak čakáš na import, choď na Dashboard a načítaj pozície z IBKR."
     )
 
-if _pf_adv:
-    tab_tws, tab_legs, tab_net, tab_hist = st.tabs(
-        ["TWS (živé OPT)", "Zápis journal", "Net podľa skupiny", "Časový vývoj (graf)"]
-    )
-    with tab_tws:
-        st.caption(
-            "**Návod:** Živý výpis **opčných** pozícií z TWS + dopočítané Gréky (BS). Vyžaduje pripojenie IB na **Dashboarde**. "
-            "Porovnanie s denníkom a úprava hodnôt je v záložke **Zápis journal**."
-        )
-        if not _ib_connected:
-            st.info("Pre živý výpis sa **pripoj na IBKR** (panel na Dashboarde).")
-            st.page_link("pages/dashboard.py", label="Dashboard — IBKR", icon=":material/dashboard:")
-        elif tws_err:
-            st.error(str(tws_err))
-        elif not tws_opts:
-            st.caption("V portfóliu z IB momentálne nie sú žiadne **OPT** pozície.")
-        else:
-            spot_ref = None
-            if live_pkg:
-                for rp in live_pkg["positions"]:
-                    if rp.get("sec_type") == "STK":
-                        mp = rp.get("market_price")
-                        if mp is not None and not (isinstance(mp, float) and math.isnan(mp)) and float(mp) > 0:
-                            spot_ref = float(mp)
-                            break
-            if spot_ref:
-                st.caption(
-                    "Rovnaké polia ako z ``ib.portfolio()`` + **Gréky** dopočítané v aplikácii (BS, podkladové **spot** z prvého STK v portfóliu). "
-                    f"Referenčný spot: **{spot_ref:.2f}**."
-                )
-            elif tws_opts:
-                st.caption(
-                    "Ak v účte **nemáš akciu podkladu (STK)**, pri načítaní pozícií sa skúsi **spot z tickeru podkladu opcie** "
-                    "na dopočítanie Grékov. Ak sú stĺpce Δ/Θ/Vega/IV stále prázdne, zapni **Historické Last** vyššie alebo skontroluj "
-                    "market data / mark ceny v TWS."
-                )
-            else:
-                st.caption(
-                    "Rovnaké polia ako z ``ib.portfolio()`` + **Gréky** dopočítané v aplikácii (BS) **len ak** je v portfóliu STK s kladnou trhovou cenou. "
-                    "Bez toho ostanú stĺpce Δ/Θ/Vega/IV prázdne."
-                )
-            tw_rows = []
-            for p in sorted(
-                tws_opts,
-                key=lambda x: (
-                    str(x.get("ticker") or ""),
-                    str(x.get("expiry") or ""),
-                    float(x.get("strike") or 0),
-                    str(x.get("option_type") or ""),
-                    str(x.get("leg_type") or ""),
-                ),
-            ):
-                g = ib_opt_greeks_scaled_for_journal(p)
-                exp = str(p.get("expiry") or "")
-                exp_disp = f"{exp[:4]}-{exp[4:6]}-{exp[6:8]}" if len(exp) >= 8 and "-" not in exp else exp
-                tw_rows.append(
-                    {
-                        "Ticker": p.get("ticker") or "",
-                        "Expirácia": exp_disp,
-                        "Strike": float(p.get("strike") or 0),
-                        "Typ": p.get("option_type") or "",
-                        "Noha": p.get("leg_type") or "",
-                        "Kontr.": int(float(p.get("contracts") or 1)),
-                        "Trh. cena": p.get("market_price"),
-                        "Mkt hodnota": p.get("market_value"),
-                        "U P&L": p.get("unrealized_pnl"),
-                        "Zdroj ceny": p.get("price_source") or "",
-                        "TWS Δ (odhad)": g["delta"],
-                        "TWS Θ $/deň": g["theta_usd"],
-                        "TWS Vega": g["vega"],
-                        "TWS IV": g["iv"],
-                    }
-                )
-            df_tw = pd.DataFrame(tw_rows)
-            for c in ("TWS Δ (odhad)", "TWS Θ $/deň", "TWS Vega", "TWS IV", "Trh. cena", "Mkt hodnota", "U P&L"):
-                if c in df_tw.columns:
-                    df_tw[c] = df_tw[c].astype("Float64")
-            st.dataframe(
-                df_tw,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Strike": st.column_config.NumberColumn(format="$%.2f"),
-                    "Trh. cena": st.column_config.NumberColumn(format="$%.4f"),
-                    "Mkt hodnota": st.column_config.NumberColumn(format="$%.2f"),
-                    "U P&L": st.column_config.NumberColumn(format="$%.2f"),
-                    "TWS Δ (odhad)": st.column_config.NumberColumn(format="%.4f"),
-                    "TWS Θ $/deň": st.column_config.NumberColumn(format="$%.3f"),
-                    "TWS Vega": st.column_config.NumberColumn(format="%.2f"),
-                    "TWS IV": st.column_config.NumberColumn(format="%.4f"),
-                },
-            )
-else:
-    (tab_legs,) = st.tabs(["Skupiny a Gréky"])
+(tab_legs,) = st.tabs(["Skupiny a Gréky"])
 
 with tab_legs:
     st.caption(
@@ -483,21 +232,11 @@ with tab_legs:
         "Zápis sa uloží do DB a zostane aj na ďalší deň."
     )
     if not open_trades:
-        if tws_cols_active:
-            st.info(
-                "Žiadna **otvorená** noha so stavom *Open* v denníku nezodpovedá OPT v TWS, alebo ešte nemáš otvorené záznamy. "
-                "Skontroluj zhodu (expirácia, strike) alebo záznam v denníku."
-            )
-        else:
-            st.info(
-                "V denníku nemáš **otvorené** obchody (stav *Open*) **s párom v TWS** — zápis journalu je po importe z IB alebo pri manuálnom zápise v denníku. "
-                "Po pripojení a zhode kľúča sa nohy zobrazia tu."
-            )
+        st.info(
+            "Pre aktívny filter nemáš žiadne otvorené nohy (*Open*), alebo v denníku ešte nie sú záznamy. "
+            "Nohy pridáš importom z IBKR na Dashboarde alebo priamo v denníku."
+        )
     else:
-        if tws_cols_active:
-            st.caption(
-                "Keď je pripojené IB a sedí kľúč, pridajú sa aj **TWS …** stĺpce. Inak ostáva iba ručný zápis z denníka."
-            )
         for gname in _sort_keys:
             legs = by_group[gname]
             meta = groups_meta.get(gname) if gname != PF_GROUP_NONE else None
@@ -553,21 +292,6 @@ with tab_legs:
                         "IV vstup": pd.NA if iv_e is None else float(iv_e),
                         "IV aktuálna": pd.NA if iv_c is None else float(iv_c),
                     }
-                    if tws_cols_active:
-                        twp = tws_by_key.get(_leg_key(t))
-                        if twp:
-                            gtw = ib_opt_greeks_scaled_for_journal(twp)
-                            r["TWS kontr."] = int(float(twp.get("contracts") or 1))
-                            r["TWS Δ"] = pd.NA if gtw["delta"] is None else float(gtw["delta"])
-                            r["TWS Θ $/deň"] = pd.NA if gtw["theta_usd"] is None else float(gtw["theta_usd"])
-                            r["TWS Vega"] = pd.NA if gtw["vega"] is None else float(gtw["vega"])
-                            r["TWS IV"] = pd.NA if gtw["iv"] is None else float(gtw["iv"])
-                        else:
-                            r["TWS kontr."] = pd.NA
-                            r["TWS Δ"] = pd.NA
-                            r["TWS Θ $/deň"] = pd.NA
-                            r["TWS Vega"] = pd.NA
-                            r["TWS IV"] = pd.NA
                     rows.append(r)
                 df = pd.DataFrame(rows)
                 if "Skupina" in df.columns:
@@ -586,16 +310,12 @@ with tab_legs:
                     "IV vstup",
                     "IV aktuálna",
                 ]
-                if tws_cols_active:
-                    _float_cols.extend(["TWS Δ", "TWS Θ $/deň", "TWS Vega", "TWS IV"])
                 for _c in _float_cols:
                     if _c in df.columns:
                         df[_c] = df[_c].astype("Float64")
-                if tws_cols_active and "TWS kontr." in df.columns:
-                    df["TWS kontr."] = df["TWS kontr."].astype("Int64")
                 st.caption(
                     "**IV** ako zlomok (0,35 = 35 %). **Θ** = USD/deň za celú nohu. **Vega** = za pozíciu (× kontrakty × 100, znamienko podľa nohy). "
-                    "Po **Uložiť journal** sa z aktuálnych hodnôt uloží aj **bod do histórie** (graf v záložke Časový vývoj)."
+                    "Po **Uložiť journal** sa z aktuálnych hodnôt uloží aj **bod do histórie** snímok Grékov v DB."
                 )
                 _disabled = [
                     "ID",
@@ -610,8 +330,6 @@ with tab_legs:
                     "Entry $",
                     "Entry dátum",
                 ]
-                if tws_cols_active:
-                    _disabled.extend(["TWS kontr.", "TWS Δ", "TWS Θ $/deň", "TWS Vega", "TWS IV"])
                 _col_cfg = {
                     "Skupina": st.column_config.SelectboxColumn(
                         "Skupina",
@@ -633,12 +351,6 @@ with tab_legs:
                     "IV vstup": st.column_config.NumberColumn(format="%.4f", step=0.0001),
                     "IV aktuálna": st.column_config.NumberColumn(format="%.4f", step=0.0001),
                 }
-                if tws_cols_active:
-                    _col_cfg["TWS kontr."] = st.column_config.NumberColumn(format="%d", help="Počet kontraktov z IB.")
-                    _col_cfg["TWS Δ"] = st.column_config.NumberColumn(format="%.4f")
-                    _col_cfg["TWS Θ $/deň"] = st.column_config.NumberColumn(format="$%.3f")
-                    _col_cfg["TWS Vega"] = st.column_config.NumberColumn(format="%.2f")
-                    _col_cfg["TWS IV"] = st.column_config.NumberColumn(format="%.4f")
                 edited = st.data_editor(
                     df,
                     use_container_width=True,
@@ -742,95 +454,3 @@ with tab_legs:
                     else:
                         st.info("Žiadna zmena.")
             st.divider()
-
-if _pf_adv:
-    with tab_net:
-        st.caption(
-            "**Návod:** Len **prehľad** — súčty Δ, Θ, Vega a priemer IV po **skupinách** z hodnôt v denníku (bez priameho editovania). "
-            "Hodnoty meníš v záložke **Zápis journal**."
-        )
-        net_rows = []
-        for gname in _sort_keys:
-            legs = by_group[gname]
-            s_de = _sum_legs(legs, "delta_at_entry")
-            s_dc = _sum_legs(legs, "delta_current")
-            s_the = _sum_legs(legs, "theta_at_entry")
-            s_thc = _sum_legs(legs, "theta_current")
-            s_vee = _sum_legs(legs, "vega_at_entry")
-            s_vec = _sum_legs(legs, "vega_current")
-            a_ive = _avg_legs(legs, "iv_at_entry")
-            a_ivc = _avg_legs(legs, "iv_current")
-            net_rows.append(
-                {
-                    "Skupina": gname,
-                    "Σ Δ vstup": s_de,
-                    "Σ Δ aktuál": s_dc,
-                    "Δ zmena": _diff_msg(s_dc, s_de),
-                    "Σ Θ vstup $/deň": s_the,
-                    "Σ Θ aktuál $/deň": s_thc,
-                    "Θ zmena $/deň": _diff_msg(s_thc, s_the),
-                    "Σ Vega vstup": s_vee,
-                    "Σ Vega aktuál": s_vec,
-                    "Vega zmena": _diff_msg(s_vec, s_vee),
-                    "Priemer IV vstup": a_ive,
-                    "Priemer IV aktuál": a_ivc,
-                    "IV zmena (priemer)": _diff_msg(a_ivc, a_ive) if a_ive is not None and a_ivc is not None else "—",
-                }
-            )
-        df_net = pd.DataFrame(net_rows)
-        st.dataframe(
-            df_net,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Σ Δ vstup": st.column_config.NumberColumn(format="%.4f"),
-                "Σ Δ aktuál": st.column_config.NumberColumn(format="%.4f"),
-                "Σ Θ vstup $/deň": st.column_config.NumberColumn(format="$%.2f"),
-                "Σ Θ aktuál $/deň": st.column_config.NumberColumn(format="$%.2f"),
-                "Σ Vega vstup": st.column_config.NumberColumn(format="%.2f"),
-                "Σ Vega aktuál": st.column_config.NumberColumn(format="%.2f"),
-                "Priemer IV vstup": st.column_config.NumberColumn(format="%.4f"),
-                "Priemer IV aktuál": st.column_config.NumberColumn(format="%.4f"),
-            },
-        )
-
-    with tab_hist:
-        st.caption(
-            "**Návod:** Vyber **nochu** a pozri časový vývoj uložených snímok. Nový bod vznikne pri **Uložiť journal** v **Zápis journal**, "
-            "ak zmeníš aspoň jednu z aktuálnych hodnôt Δ, Θ, Vega alebo IV."
-        )
-        opts = {
-            f"#{t['id']} {t.get('ticker','')} {t.get('option_type','')} {t.get('strike','')}": int(t["id"])
-            for t in sorted(open_trades, key=lambda x: int(x.get("id") or 0))
-        }
-        if not opts:
-            st.info("Žiadne pozície.")
-        else:
-            pick = st.selectbox("Noha", options=list(opts.keys()), key="pf_hist_pick")
-            tid = opts[pick]
-            snaps = db.list_trade_greek_snapshots(tid)
-            if not snaps:
-                st.info("Pre túto nohu zatiaľ nie sú žiadne uložené snímky — ulož journal s vyplnenými aktuálnymi hodnotami.")
-            else:
-                dfp = pd.DataFrame(snaps)
-                dfp["recorded_at"] = pd.to_datetime(dfp["recorded_at"], utc=True, errors="coerce")
-                fig = make_subplots(
-                    rows=4,
-                    cols=1,
-                    shared_xaxes=True,
-                    vertical_spacing=0.06,
-                    subplot_titles=("Δ aktuálna", "Θ $/deň", "Vega", "IV"),
-                )
-                fig.add_trace(go.Scatter(x=dfp["recorded_at"], y=dfp["delta"], name="Δ", mode="lines+markers"), row=1, col=1)
-                fig.add_trace(
-                    go.Scatter(x=dfp["recorded_at"], y=dfp["theta_usd"], name="Θ", mode="lines+markers"), row=2, col=1
-                )
-                fig.add_trace(go.Scatter(x=dfp["recorded_at"], y=dfp["vega"], name="Vega", mode="lines+markers"), row=3, col=1)
-                fig.add_trace(go.Scatter(x=dfp["recorded_at"], y=dfp["iv"], name="IV", mode="lines+markers"), row=4, col=1)
-                fig.update_layout(height=780, showlegend=False, margin=dict(l=8, r=8, t=40, b=8))
-                fig.update_yaxes(title_text="Δ", row=1, col=1)
-                fig.update_yaxes(title_text="Θ $", row=2, col=1)
-                fig.update_yaxes(title_text="Vega", row=3, col=1)
-                fig.update_yaxes(title_text="IV", row=4, col=1)
-                st.plotly_chart(fig, use_container_width=True)
-                st.dataframe(dfp, use_container_width=True, hide_index=True)

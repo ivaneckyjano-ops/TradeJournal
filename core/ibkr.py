@@ -1964,11 +1964,14 @@ def fetch_account_summary() -> dict:
 
 
 def _pos_key(ticker, strike, expiry, leg_type, option_type) -> str:
-    """Unikátny kľúč pre porovnanie pozícií (exp vždy YYYYMMDD – rovnako ako v denníku)."""
-    from core.portfolio_data import normalize_expiry
-    e = normalize_expiry(str(expiry or "")).replace("-", "")
-    sk = round(float(strike or 0), 4)
-    return f"{ticker}|{sk}|{e}|{leg_type}|{option_type}"
+    """
+    Rovnaká normalizácia ako ``journal_position_key`` (poradie: ticker, strike, exp, typ opcie, noha).
+    Denník ↔ TWS ↔ sync musia používať jeden kľúč.
+    """
+    from core.portfolio_data import journal_position_key
+
+    t = journal_position_key(ticker, strike, expiry, option_type, leg_type)
+    return "|".join(str(x) for x in t)
 
 
 def sync_positions_to_db(positions: list[dict], db_module, *, close_missing: bool = False) -> dict:

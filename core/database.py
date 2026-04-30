@@ -200,6 +200,20 @@ def _migrate_trading_commands(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tc_status ON trading_commands (status, updated_at DESC)")
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(trading_commands)").fetchall()}
+    for col, sql in {
+        "plan_group": "ALTER TABLE trading_commands ADD COLUMN plan_group TEXT",
+        "step_index": "ALTER TABLE trading_commands ADD COLUMN step_index INTEGER",
+        "tws_perm_id": "ALTER TABLE trading_commands ADD COLUMN tws_perm_id TEXT",
+        "tws_order_id": "ALTER TABLE trading_commands ADD COLUMN tws_order_id TEXT",
+        "tws_manual_note": "ALTER TABLE trading_commands ADD COLUMN tws_manual_note TEXT",
+        "cond_under_cmp": "ALTER TABLE trading_commands ADD COLUMN cond_under_cmp TEXT",
+        "cond_under_price": "ALTER TABLE trading_commands ADD COLUMN cond_under_price REAL",
+        "cond_after_fill": "ALTER TABLE trading_commands ADD COLUMN cond_after_fill TEXT",
+        "cond_detail": "ALTER TABLE trading_commands ADD COLUMN cond_detail TEXT",
+    }.items():
+        if col not in existing:
+            conn.execute(sql)
     conn.commit()
 
 
@@ -2115,6 +2129,32 @@ def delete_ticker_corr_matrix_run(run_id: int) -> int:
         return int(cur.rowcount)
 
 
+def _tc_step_index(v: Any) -> Optional[int]:
+    if v is None:
+        return None
+    try:
+        i = int(v)
+    except (TypeError, ValueError):
+        return None
+    return i if i > 0 else None
+
+
+_ALLOWED_COND_UNDER_CMP = frozenset({"gt", "lt", "gte", "lte"})
+_ALLOWED_COND_AFTER_FILL = frozenset({"option", "underlying", "option_or_underlying", "custom"})
+
+
+def _tc_cond_under_cmp(raw: Optional[str]) -> Optional[str]:
+    s = (raw or "").strip().lower()
+    return s if s in _ALLOWED_COND_UNDER_CMP else None
+
+
+def _tc_cond_after_fill(raw: Optional[str]) -> Optional[str]:
+    s = (raw or "").strip().lower()
+    if not s:
+        return None
+    return s if s in _ALLOWED_COND_AFTER_FILL else None
+
+
 def insert_trading_command(
     title: str,
     *,
@@ -2126,18 +2166,38 @@ def insert_trading_command(
     stop_price: Optional[float] = None,
     body: Optional[str] = None,
     status: str = "draft",
+    plan_group: Optional[str] = None,
+    step_index: Optional[int] = None,
+    tws_perm_id: Optional[str] = None,
+    tws_order_id: Optional[str] = None,
+    tws_manual_note: Optional[str] = None,
+    cond_under_cmp: Optional[str] = None,
+    cond_under_price: Optional[float] = None,
+    cond_after_fill: Optional[str] = None,
+    cond_detail: Optional[str] = None,
 ) -> int:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     tit = (title or "").strip()
     if not tit:
         raise ValueError("Názov (title) je povinný.")
     st0 = (status or "draft").strip().lower()
+    pg = (plan_group or "").strip() or None
+    si = _tc_step_index(step_index)
+    tperm = (tws_perm_id or "").strip() or None
+    tord = (tws_order_id or "").strip() or None
+    tnote = (tws_manual_note or "").strip() or None
+    ccmp = _tc_cond_under_cmp(cond_under_cmp)
+    cpx = cond_under_price if ccmp is not None else None
+    caf = _tc_cond_after_fill(cond_after_fill)
+    cdt = (cond_detail or "").strip() or None
     with get_connection() as conn:
         cur = conn.execute(
             """
             INSERT INTO trading_commands
-            (created_at, updated_at, title, ticker, action, order_kind, quantity, limit_price, stop_price, body, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (created_at, updated_at, title, ticker, action, order_kind, quantity, limit_price, stop_price, body, status,
+             plan_group, step_index, tws_perm_id, tws_order_id, tws_manual_note,
+             cond_under_cmp, cond_under_price, cond_after_fill, cond_detail)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 now,
@@ -2151,6 +2211,15 @@ def insert_trading_command(
                 stop_price,
                 (body or "").strip() or None,
                 st0,
+                pg,
+                si,
+                tperm,
+                tord,
+                tnote,
+                ccmp,
+                cpx,
+                caf,
+                cdt,
             ),
         )
         conn.commit()
@@ -2161,14 +2230,27 @@ def _row_trading_command(r: sqlite3.Row) -> dict[str, Any]:
     return dict(r)
 
 
-def list_trading_commands(*, status: Optional[str] = None, limit: int = 200) -> list[dict[str, Any]]:
+def list_trading_commands(
+    *,
+    status: Optional[str] = None,
+    limit: int = 200,
+    sort_by: str = "updated",
+) -> list[dict[str, Any]]:
     lim = max(1, min(int(limit), 500))
     q = "SELECT * FROM trading_commands"
     args: list[Any] = []
     if status is not None and str(status).strip():
         q += " WHERE status = ?"
         args.append(str(status).strip().lower())
-    q += " ORDER BY updated_at DESC, id DESC LIMIT ?"
+    sb = (sort_by or "updated").strip().lower()
+    if sb == "plan":
+        q += (
+            " ORDER BY CASE WHEN IFNULL(TRIM(plan_group), '') = '' THEN 1 ELSE 0 END, "
+            "UPPER(TRIM(plan_group)), COALESCE(step_index, 999999), updated_at DESC, id DESC"
+        )
+    else:
+        q += " ORDER BY updated_at DESC, id DESC"
+    q += " LIMIT ?"
     args.append(lim)
     with get_connection() as conn:
         rows = conn.execute(q, args).fetchall()
@@ -2193,6 +2275,15 @@ def update_trading_command(
     stop_price: Optional[float] = None,
     body: Optional[str] = None,
     status: Optional[str] = None,
+    plan_group: Optional[str] = None,
+    step_index: Optional[int] = None,
+    tws_perm_id: Optional[str] = None,
+    tws_order_id: Optional[str] = None,
+    tws_manual_note: Optional[str] = None,
+    cond_under_cmp: Optional[str] = None,
+    cond_under_price: Optional[float] = None,
+    cond_after_fill: Optional[str] = None,
+    cond_detail: Optional[str] = None,
     _all_fields: bool = False,
 ) -> int:
     """
@@ -2214,6 +2305,15 @@ def update_trading_command(
         m["stop_price"] = stop_price
         m["body"] = (body or "").strip() or None
         m["status"] = (status or "").strip().lower() or "draft"
+        m["plan_group"] = (plan_group or "").strip() or None
+        m["step_index"] = _tc_step_index(step_index)
+        m["tws_perm_id"] = (tws_perm_id or "").strip() or None
+        m["tws_order_id"] = (tws_order_id or "").strip() or None
+        m["tws_manual_note"] = (tws_manual_note or "").strip() or None
+        m["cond_under_cmp"] = _tc_cond_under_cmp(cond_under_cmp)
+        m["cond_under_price"] = cond_under_price if m["cond_under_cmp"] else None
+        m["cond_after_fill"] = _tc_cond_after_fill(cond_after_fill)
+        m["cond_detail"] = (cond_detail or "").strip() or None
     else:
         if title is not None:
             m["title"] = (title or "").strip() or m["title"]
@@ -2233,12 +2333,31 @@ def update_trading_command(
             m["body"] = (body or "").strip() or None
         if status is not None:
             m["status"] = (status or "").strip().lower() or m.get("status", "draft")
+        if plan_group is not None:
+            m["plan_group"] = (plan_group or "").strip() or None
+        if step_index is not None:
+            m["step_index"] = _tc_step_index(step_index)
+        if tws_perm_id is not None:
+            m["tws_perm_id"] = (tws_perm_id or "").strip() or None
+        if tws_order_id is not None:
+            m["tws_order_id"] = (tws_order_id or "").strip() or None
+        if tws_manual_note is not None:
+            m["tws_manual_note"] = (tws_manual_note or "").strip() or None
+        if cond_under_cmp is not None:
+            m["cond_under_cmp"] = _tc_cond_under_cmp(cond_under_cmp)
+            m["cond_under_price"] = cond_under_price if m["cond_under_cmp"] else None
+        if cond_after_fill is not None:
+            m["cond_after_fill"] = _tc_cond_after_fill(cond_after_fill)
+        if cond_detail is not None:
+            m["cond_detail"] = (cond_detail or "").strip() or None
     with get_connection() as conn:
         conn.execute(
             """
             UPDATE trading_commands SET
                 updated_at = ?, title = ?, ticker = ?, action = ?, order_kind = ?,
-                quantity = ?, limit_price = ?, stop_price = ?, body = ?, status = ?
+                quantity = ?, limit_price = ?, stop_price = ?, body = ?, status = ?,
+                plan_group = ?, step_index = ?, tws_perm_id = ?, tws_order_id = ?, tws_manual_note = ?,
+                cond_under_cmp = ?, cond_under_price = ?, cond_after_fill = ?, cond_detail = ?
             WHERE id = ?
             """,
             (
@@ -2252,6 +2371,15 @@ def update_trading_command(
                 m["stop_price"],
                 m["body"],
                 m["status"],
+                m.get("plan_group"),
+                m.get("step_index"),
+                m.get("tws_perm_id"),
+                m.get("tws_order_id"),
+                m.get("tws_manual_note"),
+                m.get("cond_under_cmp"),
+                m.get("cond_under_price"),
+                m.get("cond_after_fill"),
+                m.get("cond_detail"),
                 int(cmd_id),
             ),
         )
