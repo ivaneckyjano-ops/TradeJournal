@@ -1,11 +1,12 @@
 """
-Import a prehľad lokálnej SQLite databázy reťazcov opcií (Gréky z Barchart CSV).
+Import a prehľad lokálnej SQLite databázy reťazcov opcií (Barchart CSV alebo IBKR sync).
 Jeden súbor DB na ticker: data/option_chains/<TICKER>.db
 """
 
 from __future__ import annotations
 
 import io
+from datetime import date
 from collections import defaultdict
 
 import pandas as pd
@@ -18,16 +19,14 @@ set_tradejournal_page("option_chain_greeks")
 
 st.title("Databáza Grékov")
 st.caption(
-    "**Návod:** Záložka **Import CSV** — nahraj páry Barchart súborov (options + greeks) a importuj do per-ticker DB. **Prehľad** — čítaj uložené reťazce. "
-    "Tieto dáta používa napr. **Hľadanie delty — diagonály**."
+    "**Návod:** **Import CSV** — Barchart (options + greeks). **IBKR** — jeden ticker, Call/Put, expirácie z TWS. **Prehľad** — uložené reťazce (diagonály a pod.)."
 )
 st.caption(
     "Samostatná databáza **mimo journal.db**: jeden súbor `data/option_chains/<TICKER>.db` na symbol. "
-    "Nahraj Barchart CSV — názov musí obsahovať `options-exp` alebo `volatility-greeks-exp`, dátum expirácie "
-    "a na konci snímku `-MM-DD-YYYY.csv`."
+    "Barchart: názov s `options-exp` alebo `volatility-greeks-exp`, dátum expirácie a snímka `-MM-DD-YYYY.csv`."
 )
 
-tab_import, tab_view = st.tabs(["Import CSV", "Prehľad"])
+tab_import, tab_ibkr, tab_view = st.tabs(["Import CSV", "IBKR", "Prehľad"])
 
 
 def _status_label(has_options: bool, has_greeks: bool, in_db: bool) -> str:
@@ -352,13 +351,151 @@ with tab_import:
             }
             st.rerun()
 
+
+with tab_ibkr:
+    from core import ibkr as ibkr_ocg
+    from core.option_chain_ibkr_sync import (
+        parse_expiry_text,
+        sync_chain_snapshot,
+        validate_expiries_against_secdef,
+    )
+
+    st.caption(
+        "**IBKR:** jeden ticker, len **Call** alebo **Put**, zoznam expirácií a počet strike-ov okolo ATM. "
+        "Vyžaduje pripojený TWS / IB Gateway. **Najprv** „Skontrolovať expirácie“; ak niektorá dátum nie je v reťazci, "
+        "zaškrtni súhlas a potom „Synchronizovať do DB“."
+    )
+    cib = ibkr_ocg.is_connected()
+    if cib:
+        st.success("IBKR je pripojený.")
+    else:
+        st.warning("IBKR **nie je** pripojený — spusti TWS alebo IB Gateway a v aplikácii sa pripoj.")
+
+    t_ib = st.text_input("Ticker", max_chars=12, key="ocg_ib_ticker", placeholder="SPY").strip().upper()
+    side_ib = st.radio("Strana", ["Call", "Put"], horizontal=True, key="ocg_ib_side")
+    exp_ib = st.text_area(
+        "Expirácie (YYYY-MM-DD; čiarky alebo nový riadok)",
+        height=100,
+        key="ocg_ib_exp",
+        placeholder="2026-06-19\n2026-07-17",
+    )
+    nstrikes_ib = st.number_input(
+        "Počet strike-ov okolo ATM", min_value=1, max_value=300, value=11, step=1, key="ocg_ib_nst"
+    )
+    pause_ib = st.number_input(
+        "Pauza medzi kontrakty (s)", min_value=0.0, max_value=3.0, value=0.2, step=0.05, key="ocg_ib_pause"
+    )
+    asof_ib = st.date_input("Dátum snímky (as-of)", value=date.today(), key="ocg_ib_asof")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        btn_check_ib = st.button("Skontrolovať expirácie", key="ocg_ib_btn_check")
+    with c2:
+        btn_sync_ib = st.button("Synchronizovať do DB", type="primary", key="ocg_ib_btn_sync")
+
+    snap_ib = st.session_state.get("ocg_ib_val")
+    form_changed_ib = (
+        snap_ib is None
+        or snap_ib.get("ticker") != t_ib
+        or snap_ib.get("exps_raw") != exp_ib
+        or snap_ib.get("side") != side_ib
+        or int(snap_ib.get("nstrikes", -1)) != int(nstrikes_ib)
+        or float(snap_ib.get("pause", -1.0)) != float(pause_ib)
+        or snap_ib.get("asof") != asof_ib.isoformat()
+    )
+
+    if btn_check_ib:
+        if not cib:
+            st.error("Najprv pripoj IBKR.")
+        elif not t_ib:
+            st.error("Zadaj ticker.")
+        else:
+            raw_ib = parse_expiry_text(exp_ib)
+            if not raw_ib:
+                st.error("Zadaj aspoň jednu expiráciu.")
+            else:
+                v_ib, m_ib, err_ib = validate_expiries_against_secdef(t_ib, raw_ib)
+                st.session_state["ocg_ib_val"] = {
+                    "ticker": t_ib,
+                    "exps_raw": exp_ib,
+                    "valid": v_ib,
+                    "missing": m_ib,
+                    "err": err_ib,
+                    "side": side_ib,
+                    "nstrikes": int(nstrikes_ib),
+                    "pause": float(pause_ib),
+                    "asof": asof_ib.isoformat(),
+                }
+                st.rerun()
+
+    snap_ib = st.session_state.get("ocg_ib_val")
+    if snap_ib and snap_ib.get("ticker") == t_ib and snap_ib.get("exps_raw") == exp_ib:
+        if snap_ib.get("err"):
+            st.error(f"SecDef: {snap_ib['err']}")
+        else:
+            st.info(f"**Platné** expirácie ({len(snap_ib['valid'])}): `{', '.join(snap_ib['valid']) or '—'}`")
+            if snap_ib.get("missing"):
+                st.warning(
+                    f"**Nie sú v IBKR reťazci** ({len(snap_ib['missing'])}): `{', '.join(snap_ib['missing'])}`"
+                )
+                st.checkbox(
+                    "Beriem to na vedomie — pri synchronizácii použiť **iba platné** expirácie",
+                    key="ocg_ib_allow_partial",
+                )
+
+    if btn_sync_ib:
+        if not cib:
+            st.error("Najprv pripoj IBKR.")
+        elif not t_ib:
+            st.error("Zadaj ticker.")
+        elif form_changed_ib:
+            st.error("Údaje sa zmenili oproti poslednej kontrole — klikni znova **Skontrolovať expirácie**.")
+        else:
+            raw_ib = parse_expiry_text(exp_ib)
+            v_ib, m_ib, err_ib = validate_expiries_against_secdef(t_ib, raw_ib)
+            if err_ib:
+                st.error(f"SecDef: {err_ib}")
+            elif not v_ib:
+                st.error("Žiadna platná expirácia.")
+            elif m_ib and not st.session_state.get("ocg_ib_allow_partial", False):
+                st.error(
+                    "Sú expirácie, ktoré IBKR v tomto reťazci nemá — zaškrtni súhlas vyššie "
+                    "(po **Skontrolovať expirácie**) alebo uprav zoznam."
+                )
+            else:
+                with st.spinner(f"Synchronizujem {t_ib} …"):
+                    res_ib = sync_chain_snapshot(
+                        t_ib,
+                        right="call" if side_ib == "Call" else "put",
+                        expiries_yyyy_mm_dd=v_ib,
+                        strike_count=int(nstrikes_ib),
+                        as_of_yyyy_mm_dd=asof_ib.isoformat(),
+                        pause_s=float(pause_ib),
+                    )
+                for w in res_ib.warnings:
+                    st.warning(w)
+                for e in res_ib.errors:
+                    st.error(e)
+                if res_ib.rows_written:
+                    st.success(
+                        f"Zapísaných **{res_ib.rows_written}** riadkov do `{odb.db_path_for_ticker(t_ib)}`. "
+                        f"Expirácie: {', '.join(res_ib.expiries_processed)}"
+                    )
+                elif res_ib.ok:
+                    st.success("Hotovo.")
+                else:
+                    st.warning("Nič sa neimportovalo — skontroluj chyby vyššie alebo trhové dáta.")
+
 with tab_view:
     st.caption(
         "**Návod:** Vyber **ticker** a prípadne filtre expirácie / dátumu snímky — prehliadaš dáta v lokálnej `data/option_chains/<TICKER>.db`, nie v hlavnom journal.db."
     )
     tickers = odb.list_chain_tickers()
     if not tickers:
-        st.info("Zatiaľ nie je žiadna DB — použij záložku **Import CSV** alebo skript `scripts/import_barchart_option_chains.py`.")
+        st.info(
+            "Zatiaľ nie je žiadna DB — záložka **Import CSV**, **IBKR** alebo skript "
+            "`scripts/import_barchart_option_chains.py` / `scripts/sync_option_chains_ibkr.py`."
+        )
     else:
         ticker = st.selectbox("Ticker", options=tickers, key="ocg_view_ticker")
         st.caption(f"Súbor: `{odb.db_path_for_ticker(ticker)}`")

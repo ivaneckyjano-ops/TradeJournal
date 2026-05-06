@@ -33,7 +33,7 @@ StrategyId = Literal[
     "long_put_diagonal",
     "short_put_diagonal",
 ]
-RankMode = Literal["legacy", "score"]
+RankMode = Literal["legacy", "score", "theta_delta_debit"]
 
 
 @dataclass(frozen=True)
@@ -99,8 +99,9 @@ class DiagonalSearchOptions:
     dte_near_max: Optional[int] = None
     dte_far_min: Optional[int] = None
     dte_far_max: Optional[int] = None
-    # Short noha vs spot (OTM)
+    # Short / long noha vs spot (OTM ako podiel: Call (K−S)/S, Put (S−K)/S)
     short_otm_min: Optional[float] = None
+    long_otm_min: Optional[float] = None
     # Debit na akciu / šírka strike
     max_debit_to_strike_width_ratio: Optional[float] = None
     # Relatívny spread (ask-bid)/mid na oboch nohách short/long
@@ -112,6 +113,8 @@ class DiagonalSearchOptions:
     iv_short_ge_long_margin: float = 0.0
     # Ktorá noha má mať strike bližší k spotu (menšie |K−spot|). None = bez filtra. Predvolene long (potrebuje spot > 0).
     strike_proximity_leg: Optional[Literal["long", "short"]] = "long"
+    # Ak True, pri postupnom / kombinovanom zjemnení sa nemenia short_otm_min / long_otm_min.
+    relax_exclude_otm: bool = False
 
 
 OptScalar = Union[float, int, bool, str, None]
@@ -606,12 +609,27 @@ def diagonal_search_why_empty_hint(
             f"Dvojíc vyhovujúcich DTE je **{ok_dte_pairs}** — zvyšok pravdepodobne vyhodili **theta / vega / gamma / OTM / debit** "
             "alebo rel. spready. V Pokročilých ich postupne vypni alebo rozšír pásma."
         )
-    if opt.spot is not None and float(opt.spot) > 0 and opt.short_otm_min is not None:
+    if opt.spot is not None and float(opt.spot) > 0 and (
+        opt.short_otm_min is not None or opt.long_otm_min is not None
+    ):
         spot_f = float(opt.spot)
-        otm_min = float(opt.short_otm_min)
-        parts.append(
-            f"**OTM short** (spot **{spot_f:.2f}**, min. **{otm_min:.2f}**) vie byť prísny — skús vypnúť alebo over spot v **Symboly**."
-        )
+        otm_s = float(opt.short_otm_min) if opt.short_otm_min is not None else None
+        otm_l = float(opt.long_otm_min) if opt.long_otm_min is not None else None
+        if otm_s is not None and otm_l is not None:
+            parts.append(
+                f"**OTM short/long** (spot **{spot_f:.2f}**, min. short **{otm_s:.2f}**, min. long **{otm_l:.2f}**) vie byť prísne — skús vypnúť alebo over spot v **Symboly**."
+            )
+            otm_min = max(otm_s, otm_l)
+        elif otm_s is not None:
+            parts.append(
+                f"**OTM short** (spot **{spot_f:.2f}**, min. **{otm_s:.2f}**) vie byť prísny — skús vypnúť alebo over spot v **Symboly**."
+            )
+            otm_min = otm_s
+        else:
+            parts.append(
+                f"**OTM long** (spot **{spot_f:.2f}**, min. **{otm_l:.2f}**) vie byť prísny — skús vypnúť alebo over spot v **Symboly**."
+            )
+            otm_min = float(otm_l) if otm_l is not None else 0.0
         if spec.option_type == "Call":
             need_k = spot_f * (1.0 + otm_min)
         else:
@@ -621,9 +639,133 @@ def diagonal_search_why_empty_hint(
         if pd.notna(mx) and mx < need_k - 1e-6:
             parts.append(
                 f"**Strike v DB** — max. **{mx:g}** pri **{spec.option_type}**, pri tomto OTM treba aspoň strike **≈ {need_k:.2f}** — "
-                "v importe chýbajú ďaleké OTM strikey (Barchart: rozšír rozsah strike-ov)."
+                "v importe chýbajú ďaleké OTM striky."
+            )
+            parts.append(
+                "Ak chceš OTM zachovať, **neruš OTM filter** — radšej rozšír import strikov v DB až po túto hranicu."
             )
     return " ".join(parts)
+
+
+def _otm_strike_orientation_bullets_sk(
+    opt: DiagonalSearchOptions,
+    *,
+    option_type: Literal["Call", "Put"],
+) -> list[str]:
+    """Orientačné odrážky: požadovaný strike pri min. OTM a zadanom spote (Call vs Put)."""
+    lines: list[str] = []
+    if opt.spot is None or float(opt.spot) <= 0:
+        return lines
+    s = float(opt.spot)
+    if opt.short_otm_min is not None and float(opt.short_otm_min) > 0:
+        p = float(opt.short_otm_min)
+        if option_type == "Call":
+            k = s * (1.0 + p)
+            lines.append(
+                f"- **OTM short (Call):** pri min. **{p:g}** a spote **{s:.2f}** musí mať **short** strike **≥ {k:.2f}** "
+                f"(≈ spot × (1 + {p:g})). Ak v importe chýbajú také OTM striky, prvý beh môže vrátiť **0** riadkov."
+            )
+        else:
+            k = s * (1.0 - p)
+            lines.append(
+                f"- **OTM short (Put):** pri min. **{p:g}** a spote **{s:.2f}** musí mať **short** strike **≤ {k:.2f}** "
+                f"(≈ spot × (1 − {p:g})). Ak v importe chýbajú hlbšie OTM striky, prvý beh môže vrátiť **0** riadkov."
+            )
+    if opt.long_otm_min is not None and float(opt.long_otm_min) > 0:
+        p = float(opt.long_otm_min)
+        if option_type == "Call":
+            k = s * (1.0 + p)
+            lines.append(
+                f"- **OTM long (Call):** pri min. **{p:g}** musí mať **long** strike **≥ {k:.2f}** (≈ spot × (1 + {p:g}))."
+            )
+        else:
+            k = s * (1.0 - p)
+            lines.append(
+                f"- **OTM long (Put):** pri min. **{p:g}** musí mať **long** strike **≤ {k:.2f}** (≈ spot × (1 − {p:g}))."
+            )
+    return lines
+
+
+def _otm_keep_otm_action_bullets_sk(
+    opt: DiagonalSearchOptions,
+    *,
+    strategy: StrategyId,
+) -> list[str]:
+    """Konkrétne kroky: rozšír import strikov tak, aby OTM filter mohol zostať zapnutý."""
+    spec = STRATEGIES.get(strategy)
+    if not spec or opt.spot is None or float(opt.spot) <= 0:
+        return []
+    s = float(opt.spot)
+    out: list[str] = []
+    if opt.short_otm_min is not None and float(opt.short_otm_min) > 0:
+        p = float(opt.short_otm_min)
+        if spec.option_type == "Call":
+            need_k = s * (1.0 + p)
+            out.append(
+                f"- **Nechaj OTM short zapnutý a rozšír import strikov smerom vyššie**: pri spote **{s:.2f}** a min. **{p:g}** potrebuješ v DB short striky aspoň do **{need_k:.2f}**."
+            )
+        else:
+            need_k = s * (1.0 - p)
+            out.append(
+                f"- **Nechaj OTM short zapnutý a rozšír import strikov smerom nižšie**: pri spote **{s:.2f}** a min. **{p:g}** potrebuješ v DB short striky aspoň po **{need_k:.2f}** alebo nižšie."
+            )
+    if opt.long_otm_min is not None and float(opt.long_otm_min) > 0:
+        p = float(opt.long_otm_min)
+        if spec.option_type == "Call":
+            need_k = s * (1.0 + p)
+            out.append(
+                f"- **Nechaj OTM long zapnutý a rozšír import strikov smerom vyššie**: pri min. **{p:g}** potrebuješ long striky aspoň do **{need_k:.2f}**."
+            )
+        else:
+            need_k = s * (1.0 - p)
+            out.append(
+                f"- **Nechaj OTM long zapnutý a rozšír import strikov smerom nižšie**: pri min. **{p:g}** potrebuješ long striky aspoň po **{need_k:.2f}** alebo nižšie."
+            )
+    if out:
+        out.insert(0, "**Čo urobiť, ak chceš zachovať OTM:**")
+    return out
+
+
+def otm_keep_otm_strike_band_suggestion(
+    opt: DiagonalSearchOptions,
+    *,
+    strategy: StrategyId,
+    buffer_points: float = 100.0,
+) -> Optional[dict[str, float]]:
+    """
+    Navrhne strike band, ktorý ostáva OTM, ale rozšíri hľadanie o viac strikov v správnom smere.
+
+    Call: hľadaj od hranice OTM smerom nahor.
+    Put: hľadaj od hranice OTM smerom nadol.
+    """
+    spec = STRATEGIES.get(strategy)
+    if not spec or opt.spot is None or float(opt.spot) <= 0:
+        return None
+    s = float(opt.spot)
+    p_vals = [float(v) for v in (opt.short_otm_min, opt.long_otm_min) if v is not None and float(v) > 0]
+    if not p_vals:
+        return None
+    p = max(p_vals)
+    if spec.option_type == "Call":
+        need_k = s * (1.0 + p)
+        return {"strike_min": float(need_k), "strike_max": float(need_k + buffer_points)}
+    need_k = s * (1.0 - p)
+    return {"strike_min": float(max(0.0, need_k - buffer_points)), "strike_max": float(need_k)}
+
+
+def otm_keep_otm_tuning_suggestion(
+    opt: DiagonalSearchOptions,
+    *,
+    strategy: StrategyId,
+    buffer_points: float = 100.0,
+    max_strikes_per_expiry: int = 120,
+) -> Optional[dict[str, float | int]]:
+    """Rozšírený návrh pre UI: OTM strike band + vyšší limit strike-ov na expiráciu."""
+    band = otm_keep_otm_strike_band_suggestion(opt, strategy=strategy, buffer_points=buffer_points)
+    if not band:
+        return None
+    band["max_strikes_per_expiry"] = int(max(15, min(120, max_strikes_per_expiry)))
+    return band
 
 
 def diagonal_search_precheck_warnings_markdown(
@@ -650,6 +792,7 @@ def diagonal_search_precheck_warnings_markdown(
     df["theta"] = pd.to_numeric(df["theta"], errors="coerce")
     both = df["delta"].notna() & df["theta"].notna()
     lines: list[str] = []
+    lines.extend(_otm_strike_orientation_bullets_sk(opt, option_type=spec.option_type))
     if opt.spot is not None and float(opt.spot) > 0 and opt.short_otm_min is not None:
         spot_f = float(opt.spot)
         otm_min = float(opt.short_otm_min)
@@ -663,6 +806,20 @@ def diagonal_search_precheck_warnings_markdown(
             lines.append(
                 f"- **OTM short:** v DB je max. strike **{mx:g}**, pri min. OTM **{otm_min:g}** a spote **{spot_f:.2f}** by bolo treba aspoň **≈ {need_k:.2f}** — "
                 "doplniť import (širší rozsah strike-ov z Barchartu) alebo znížiť / vypnúť OTM filter."
+            )
+    if opt.spot is not None and float(opt.spot) > 0 and opt.long_otm_min is not None:
+        spot_f = float(opt.spot)
+        otm_min = float(opt.long_otm_min)
+        if spec.option_type == "Call":
+            need_k = spot_f * (1.0 + otm_min)
+        else:
+            need_k = spot_f * (1.0 - otm_min)
+        df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
+        mx = float(df.loc[both, "strike"].max()) if both.any() else float("nan")
+        if pd.notna(mx) and mx < need_k - 1e-6:
+            lines.append(
+                f"- **OTM long:** v DB je max. strike **{mx:g}**, pri min. OTM **{otm_min:g}** a spote **{spot_f:.2f}** by bolo treba aspoň **≈ {need_k:.2f}** — "
+                "doplniť import alebo znížiť / vypnúť OTM long filter."
             )
     if (
         opt.net_vega_max is not None
@@ -718,6 +875,8 @@ def diagonal_relax_suggestions_markdown(opt: DiagonalSearchOptions) -> str:
         bullets.append("**Vega max** zvýš (napr. **0,35**), ak horná hranica reže príliš veľa.")
     if opt.short_otm_min is not None and opt.spot is not None and float(opt.spot) > 0:
         bullets.append("**Min. OTM short** dočasne vypni alebo over **spot** v Symboly.")
+    if opt.long_otm_min is not None and opt.spot is not None and float(opt.spot) > 0:
+        bullets.append("**Min. OTM long** dočasne vypni alebo zníž prah — inak ostávajú len riadky s OTM dlhou nohou.")
     if opt.max_debit_to_strike_width_ratio is not None:
         bullets.append("**Debit/šírka strike** alebo **rel. spready** dočasne vypni, ak likvidita v CSV nie je ideálna.")
     if opt.min_open_interest is not None and int(opt.min_open_interest) >= 100:
@@ -791,8 +950,11 @@ def _compute_score(
     ng = pd.to_numeric(net_gamma, errors="coerce")
     dps = pd.to_numeric(debit_per_share, errors="coerce")
     sw = pd.to_numeric(strike_width, errors="coerce").abs().clip(lower=eps)
-    ratio = dps.abs() / sw
-    return (1.0 / (nd.abs() + eps)) * 30.0 + nt * 10.0 + nv * 2.0 - ng.abs() * 100.0 - ratio * 50.0
+    # Pri rovnakom strike je šírka 0 → sw=eps a |debit|/sw exploduje; orezať ratio, aby bolo „Skóre“ v tabuľke čitateľné.
+    ratio = (dps.abs() / sw).clip(upper=600.0)
+    # Pri |net_delta| ~ 0 (často numerická kompenzácia nôh) exploduje 1/|delta|; orezanie stabilizuje export „Skóre“.
+    nd_abs = nd.abs().fillna(1.0).clip(lower=1e-3)
+    return (1.0 / (nd_abs + eps)) * 30.0 + nt * 10.0 + nv * 2.0 - ng.abs() * 100.0 - ratio * 50.0
 
 
 def _apply_row_filters(
@@ -836,8 +998,13 @@ def _apply_row_filters(
 
     if opt.short_otm_min is not None and opt.spot is not None and float(opt.spot) > 0:
         sk_s, _ = _short_long_strikes(spec, cart)
-        otm = _otm_short_pct(spec.option_type, float(opt.spot), sk_s)
-        m &= otm >= float(opt.short_otm_min)
+        otm_s = _otm_short_pct(spec.option_type, float(opt.spot), sk_s)
+        m &= otm_s >= float(opt.short_otm_min)
+
+    if opt.long_otm_min is not None and opt.spot is not None and float(opt.spot) > 0:
+        _, sk_l = _short_long_strikes(spec, cart)
+        otm_l = _otm_short_pct(spec.option_type, float(opt.spot), sk_l)
+        m &= otm_l >= float(opt.long_otm_min)
 
     if opt.max_debit_to_strike_width_ratio is not None:
         sw = cart["strike_width"].replace(0, np.nan)
@@ -893,7 +1060,8 @@ def search_diagonal_spreads(
     """
     Kombinácie blízka / ďaleká expirácia, kríž strike-ov.
 
-    ``options``: pokročilé filtre a ``rank_mode`` ``legacy`` (delta_err, net_theta) alebo ``score``.
+    ``options``: pokročilé filtre a ``rank_mode``: ``legacy`` (delta_err, net_theta),
+    ``score`` (skóre, delta_err), alebo ``theta_delta_debit`` (net_theta, delta_err, debit_per_share).
     """
     spec = STRATEGIES.get(strategy)
     if not spec:
@@ -1030,8 +1198,10 @@ def search_diagonal_spreads(
 
             if opt.spot is not None and float(opt.spot) > 0:
                 cart["short_otm_pct"] = _otm_short_pct(spec.option_type, float(opt.spot), sk)
+                cart["long_otm_pct"] = _otm_short_pct(spec.option_type, float(opt.spot), lk)
             else:
                 cart["short_otm_pct"] = np.nan
+                cart["long_otm_pct"] = np.nan
 
             cart["score"] = _compute_score(
                 cart["net_delta"], cart["net_theta"], cart["net_vega"], cart["net_gamma"],
@@ -1053,9 +1223,27 @@ def search_diagonal_spreads(
 
     out = pd.concat(blocks, ignore_index=True)
     if opt.rank_mode == "score":
-        out = out.sort_values(by=["score", "delta_err"], ascending=[False, True], kind="mergesort")
+        out = out.sort_values(
+            by=["score", "delta_err"],
+            ascending=[False, True],
+            kind="mergesort",
+            na_position="last",
+        )
+    elif opt.rank_mode == "theta_delta_debit":
+        # Najprv najvyššia čistá theta; pri rovnakej theta najbližšia k cieľovej delte; potom nižší debit (algebraicky).
+        out = out.sort_values(
+            by=["net_theta", "delta_err", "debit_per_share"],
+            ascending=[False, True, True],
+            kind="mergesort",
+            na_position="last",
+        )
     else:
-        out = out.sort_values(by=["delta_err", "net_theta"], ascending=[True, False], kind="mergesort")
+        out = out.sort_values(
+            by=["delta_err", "net_theta"],
+            ascending=[True, False],
+            kind="mergesort",
+            na_position="last",
+        )
     out = out.head(int(max(1, top_n))).reset_index(drop=True)
     return _to_display_spread_table(out, spec, as_of_date)
 
@@ -1161,7 +1349,7 @@ class FilterLog:
         if self.cumulative_relaxed:
             return (
                 "Zjemnené filtre: **kombinované uvoľnenie** ostatných filtrov naraz "
-                "(**DTE min/max** sa nehýbu — ostanú podľa zadania)."
+                "(**DTE min/max**, **min. OTM short/long** a výber **strike k spotu** sa nehýbu — ostanú podľa zadania)."
             )
         relaxed = [s for s in self.steps if not s.passed and s.relaxed_to is not None]
         if not relaxed:
@@ -1181,6 +1369,7 @@ class FilterLog:
         *,
         initial_opt: DiagonalSearchOptions,
         last_tried_opt: DiagonalSearchOptions,
+        strategy: StrategyId | None = None,
     ) -> str:
         """Text pre UI, keď ani postupné zjemnenie nenašlo kombinácie."""
         parts: list[str] = [
@@ -1212,6 +1401,11 @@ class FilterLog:
             parts.append(
                 f"**Posledný spracovaný filter (kde reťazec skončil neúspešne):** **{last.label}** (`{last.field}`)."
             )
+        if strategy is not None:
+            keep_otm = _otm_keep_otm_action_bullets_sk(initial_opt, strategy=strategy)
+            if keep_otm:
+                parts.extend(["", "### Čo spraviť, ak chceš zostať OTM"])
+                parts.extend(keep_otm)
         parts.extend(["", "### Tvoje vstupné kritériá (pred zjemnením)", _format_diagonal_options_markdown_sk(initial_opt)])
         parts.extend(["", "### Posledné vyskúšané kritériá (najhlbší pokus pred návratom filtrov)", _format_diagonal_options_markdown_sk(last_tried_opt)])
         return "\n".join(parts)
@@ -1265,6 +1459,15 @@ def build_delta_search_protocol_markdown(
         f"- **DTE skoršej expirácie:** min **{_fmt_opt_val(initial_options.dte_near_min)}**, max **{_fmt_opt_val(initial_options.dte_near_max)}**",
         f"- **DTE neskoršej expirácie:** min **{_fmt_opt_val(initial_options.dte_far_min)}**, max **{_fmt_opt_val(initial_options.dte_far_max)}**",
         "",
+    ]
+    if spec and initial_options.spot is not None and float(initial_options.spot) > 0:
+        ori = _otm_strike_orientation_bullets_sk(initial_options, option_type=spec.option_type)
+        if ori:
+            lines.extend(["### OTM vs. strike (orientácia pri zadanom spote)", ""])
+            lines.extend(ori)
+            lines.append("")
+    lines.extend(
+        [
         "## Počiatočné možnosti (JSON)",
         "",
         "```json",
@@ -1279,7 +1482,8 @@ def build_delta_search_protocol_markdown(
         + (f" (pokus vykonaný: áno)" if filter_log.cumulative_attempted and not filter_log.cumulative_relaxed else ""),
         f"- **Finálny počet riadkov:** {filter_log.final_rows}",
         "",
-    ]
+        ]
+    )
     if filter_log.steps:
         lines.append("| # | Filter | Pôvodná | Zjemnená | Riadky po |")
         lines.append("|---|--------|---------|----------|-----------|")
@@ -1321,7 +1525,7 @@ def build_delta_search_protocol_markdown(
     if result.empty:
         lines.append("## Výsledok: 0 riadkov")
         lines.append("")
-        lines.append(filter_log.failure_report_markdown(initial_opt=initial_options, last_tried_opt=effective_options))
+        lines.append(filter_log.failure_report_markdown(initial_opt=initial_options, last_tried_opt=effective_options, strategy=strategy))
         lines.append("")
     else:
         lines.append(f"## Výsledok: {len(result)} riadkov")
@@ -1402,6 +1606,8 @@ def _format_diagonal_options_markdown_sk(o: DiagonalSearchOptions) -> str:
         lines.append(f"- DTE neskoršej expirácie: max **{o.dte_far_max}** dní")
     if o.short_otm_min is not None:
         lines.append(f"- OTM short: min **{_fmt_opt_val(o.short_otm_min)}** (potrebný spot)")
+    if o.long_otm_min is not None:
+        lines.append(f"- OTM long: min **{_fmt_opt_val(o.long_otm_min)}** (potrebný spot)")
     if o.max_debit_to_strike_width_ratio is not None:
         lines.append(f"- Debit/šírka strike: max **{_fmt_opt_val(o.max_debit_to_strike_width_ratio)}**")
     if o.max_rel_spread_short is not None:
@@ -1418,6 +1624,10 @@ def _format_diagonal_options_markdown_sk(o: DiagonalSearchOptions) -> str:
         _leg = "Long" if o.strike_proximity_leg == "long" else "Short"
         lines.append(
             f"- **Strike k spotu:** noha **{_leg}** má byť *bližšie* (menšie |strike − spot|) ako druhá noha"
+        )
+    if o.relax_exclude_otm:
+        lines.append(
+            "- **Postupné zjemnenie (1. fáza):** OTM short/long **sa nemeňia**; 2. fáza OTM tiež nemení."
         )
     lines.append(f"- Triedenie: **{o.rank_mode}**")
     if o.spot is not None and float(o.spot) > 0:
@@ -1445,6 +1655,7 @@ FILTER_PRIORITY: list[tuple[str, list[str]]] = [
     ("Delta tolerancia", ["delta_tolerance"]),
     ("Theta", ["net_theta_min", "net_theta_max"]),
     ("OTM short", ["short_otm_min"]),
+    ("OTM long", ["long_otm_min"]),
     ("Strike k spotu (|K−spot|)", ["strike_proximity_leg"]),
     ("Debit/šírka", ["max_debit_to_strike_width_ratio"]),
     ("Vega", ["net_vega_min", "net_vega_max"]),
@@ -1464,6 +1675,7 @@ RELAX_STEPS: dict[str, list[Any]] = {
     "net_theta_min": [3.0, 1.5, 0.5, 0.0, _RELAX_DISABLE],
     "net_theta_max": [8.0, 12.0, 20.0, _RELAX_DISABLE],
     "short_otm_min": [0.10, 0.05, 0.02, _RELAX_DISABLE],
+    "long_otm_min": [0.10, 0.05, 0.02, _RELAX_DISABLE],
     "max_debit_to_strike_width_ratio": [0.25, 0.35, 0.50, _RELAX_DISABLE],
     "net_vega_min": [0.10, 0.05, 0.02, _RELAX_DISABLE],
     "net_vega_max": [0.20, 0.30, 0.50, _RELAX_DISABLE],
@@ -1580,9 +1792,12 @@ def progressive_filter_search(
     Postupné hľadanie s automatickým zjemnením filtrov.
 
     Ak prvé hľadanie s používateľskými filtrami vráti prázdno, prechádza polia v
-    ``FILTER_PRIORITY`` a skúsi ich postupne zjemniť (max. ``max_relax_iterations``
-    krokov na pole). **Výnimka:** polia DTE (``dte_near_*``, ``dte_far_*``) sa
-    **nezjemňujú** — ostanú vždy podľa vstupu. Po neúspechu sa hodnota poľa vráti
+    ``FILTER_PRIORITY`` a skúsi ich postupne zjemniť. Počet krokov na jedno pole je aspoň
+    ``max_relax_iterations`` a aspoň ``len(RELAX_STEPS[pole]) + 4`` (aby sa stihol celý reťazec vrátane vypnutia filtra), max. **48** (ochrana pred prehnaným počtom volaní).
+    **Výnimka:** polia DTE (``dte_near_*``, ``dte_far_*``) sa
+    **nezjemňujú** — ostanú vždy podľa vstupu. **Kumulatívna 2. fáza** tiež **nemení**
+    ``short_otm_min`` / ``long_otm_min`` (aby výsledok po zadanom OTM nebol ticho plný ITM).
+    Ak je ``relax_exclude_otm``, nezjemňujú sa ani v **postupnom** kroku po poliach. Po neúspechu sa hodnota poľa vráti
     späť a pokračuje sa ďalším filtrom. Pri prvom neprázdnom výsledku sa skončí
     a do ``FilterLog`` sa zapíšu len skutočne účinné zjemnenia.
 
@@ -1604,6 +1819,7 @@ def progressive_filter_search(
             "net_gamma_min",
             "net_gamma_max",
             "short_otm_min",
+            "long_otm_min",
             "max_debit_to_strike_width_ratio",
             "max_rel_spread_short",
             "max_rel_spread_long",
@@ -1700,6 +1916,8 @@ def progressive_filter_search(
         for field in fields:
             if field in RELAX_EXCLUDE_FIELDS:
                 continue
+            if opt.relax_exclude_otm and field in ("short_otm_min", "long_otm_min"):
+                continue
             field_start = _get_opt_value(work_opt, field)
             if field_start is None:
                 continue
@@ -1711,7 +1929,12 @@ def progressive_filter_search(
             relaxed_to: Optional[float | int | bool] = None
             values_attempted: list[Optional[float | int | bool]] = []
 
-            for _ in range(max_relax_iterations):
+            _steps_tbl = RELAX_STEPS.get(field, ())
+            _per_field_cap = min(
+                48,
+                max(int(max_relax_iterations), len(_steps_tbl) + 4, 8),
+            )
+            for _ in range(_per_field_cap):
                 next_raw = _next_relax_value(field, current_value)
                 if next_raw is None:
                     break
@@ -1791,6 +2014,9 @@ def progressive_filter_search(
         for _group_name, fields in FILTER_PRIORITY:
             for field in fields:
                 if field in RELAX_EXCLUDE_FIELDS:
+                    continue
+                # OTM v 2. fáze nemeníme — inak by sa pri zachovaných DTE objavili ITM striky bez zjavného dôvodu.
+                if field in ("short_otm_min", "long_otm_min"):
                     continue
                 start0 = _get_opt_value(opt, field)
                 if start0 is None:

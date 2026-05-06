@@ -122,6 +122,84 @@ def _dsd_explain_suggested_dte_mismatch(
     return " **Prečo s tým „nesedí“ tvoj rozsah:** " + " ".join(bits) + "."
 
 
+def _dsd_delta_tolerance_followup_from_opt(
+    search_opts: dss.DiagonalSearchOptions,
+) -> tuple[dict[str, str | float], str] | None:
+    """Ďalší krok z ``RELAX_STEPS`` alebo vypnutie filtra; payload pre ``dsd_pending_delta_tolerance``."""
+    cur = search_opts.delta_tolerance
+    if cur is None:
+        return None
+    nxt_raw = dss._next_relax_value("delta_tolerance", float(cur))
+    if nxt_raw is None:
+        return None
+    if nxt_raw is dss._RELAX_DISABLE:
+        return (
+            {"action": "off"},
+            "vypnúť **toleranciu delty** (žiadny pevný prah — posledný krok z tabuľky zjemnení)",
+        )
+    try:
+        v = float(nxt_raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return ({"action": "set", "tol": v}, f"zvýšiť toleranciu na **{v:g}** (ďalší krok z tabuľky zjemnení)")
+
+
+def _dsd_drain_pending_delta_tolerance() -> None:
+    """Pred widgetmi ``dsd_use_dt`` / ``dsd_delta_tol`` (po tlačidle z prázdneho panela)."""
+    p = st.session_state.pop("dsd_pending_delta_tolerance", None)
+    if not p or not isinstance(p, dict):
+        return
+    if p.get("action") == "off":
+        st.session_state["dsd_use_dt"] = False
+        return
+    if p.get("action") != "set":
+        return
+    try:
+        t = float(p["tol"])
+    except (KeyError, TypeError, ValueError):
+        return
+    if t < 0:
+        return
+    st.session_state["dsd_use_dt"] = True
+    st.session_state["dsd_delta_tol"] = t
+
+
+def _dsd_drain_pending_strike_band_suggestion() -> None:
+    """Pred widgetmi ``dsd_strike_band`` / ``dsd_strike_min`` / ``dsd_strike_max``."""
+    p = st.session_state.pop("dsd_pending_strike_band_suggestion", None)
+    if not p or not isinstance(p, dict):
+        return
+    try:
+        lo = float(p["strike_min"])
+        hi = float(p["strike_max"])
+    except (KeyError, TypeError, ValueError):
+        return
+    if lo > hi:
+        lo, hi = hi, lo
+    st.session_state["dsd_strike_band"] = True
+    st.session_state["dsd_strike_min"] = max(0.0, lo)
+    st.session_state["dsd_strike_max"] = max(max(0.0, lo), hi)
+
+
+def _dsd_drain_pending_otm_tuning_suggestion() -> None:
+    """Pred widgetmi ``dsd_strike_band`` a ``dsd_maxk``."""
+    p = st.session_state.pop("dsd_pending_otm_tuning_suggestion", None)
+    if not p or not isinstance(p, dict):
+        return
+    try:
+        lo = float(p["strike_min"])
+        hi = float(p["strike_max"])
+        max_k = int(p["max_strikes_per_expiry"])
+    except (KeyError, TypeError, ValueError):
+        return
+    if lo > hi:
+        lo, hi = hi, lo
+    st.session_state["dsd_strike_band"] = True
+    st.session_state["dsd_strike_min"] = max(0.0, lo)
+    st.session_state["dsd_strike_max"] = max(max(0.0, lo), hi)
+    st.session_state["dsd_maxk"] = max(15, min(120, max_k))
+
+
 def _dsd_render_empty_search_panel() -> None:
     """Výsledok 0 — mimo tlačidla „Hľadať“ (inak vnorené widgety + ``rerun`` mätú React/Streamlit)."""
     if not st.session_state.get("dsd_post_search_is_empty", False):
@@ -201,9 +279,73 @@ def _dsd_render_empty_search_panel() -> None:
             st.caption(
                 "Hodnoty sa zapíšu do session skôr, než sa vykreslia polia v Pokročilých (inak Streamlit hlási chybu na kľúči). Potom znovu klikni **Hľadať**."
             )
+        if _first.field == "delta_tolerance":
+            st.markdown(
+                "Brána **Delta tolerancia** znamená, že pri tvojom prahu **|čistá delta − cieľ|** nevyhovuje "
+                "**žiadna** kalendárna dvojica v dátach (delta je v **jednotkách z reťazca**, nie ako stĺpec **×100** v tabuľke výsledkov)."
+            )
+            _dt_follow = _dsd_delta_tolerance_followup_from_opt(search_opts)
+            if _dt_follow:
+                _dt_payload, _dt_desc = _dt_follow
+                st.info(
+                    f"**Návrh úpravy:** {_dt_desc}. Tlačidlom nižšie sa nastaví v **Pokročilých**, stránka sa obnoví — potom znovu klikni **Hľadať**."
+                )
+                if st.button(
+                    "Upraviť toleranciu delty a obnoviť stránku",
+                    key="dsd_apply_suggested_delta_tol",
+                    type="secondary",
+                ):
+                    st.session_state["dsd_pending_delta_tolerance"] = dict(_dt_payload)
+                    st.rerun()
+                st.caption(
+                    "Zápis do session prebehne pred vykreslením polí (rovnako ako pri návrhu DTE). Potom **Hľadať**."
+                )
+        _strike_follow = None
+        try:
+            _strike_follow = dss.otm_keep_otm_strike_band_suggestion(search_opts, strategy=_s0)  # type: ignore[arg-type]
+        except Exception:
+            _strike_follow = None
+        if _strike_follow:
+            _spec = dss.STRATEGIES.get(_s0) if _s0 else None
+            _direction = "vyššie" if (_spec and _spec.option_type == "Call") else "nižšie"
+            _desc = (
+                f"**Návrh:** ak chceš zostať OTM, rozšír rozsah strikov smerom **{_direction}**. "
+                f"Toto ponechá OTM filtre zapnuté a len pridá viac strikov z tej správnej strany."
+            )
+            st.info(_desc)
+            if st.button(
+                "Nastaviť odporúčaný OTM strike rozsah a obnoviť stránku",
+                key="dsd_apply_suggested_strike_band",
+                type="secondary",
+            ):
+                st.session_state["dsd_pending_strike_band_suggestion"] = dict(_strike_follow)
+                st.rerun()
+            st.caption(
+                "Predvyplnia sa len striky pre hľadanie; OTM short/long zostanú zapnuté. Potom klikni **Hľadať**."
+            )
+            try:
+                _otm_tune = dss.otm_keep_otm_tuning_suggestion(search_opts, strategy=_s0)  # type: ignore[arg-type]
+            except Exception:
+                _otm_tune = None
+            if _otm_tune:
+                _maxk = int(_otm_tune["max_strikes_per_expiry"])
+                st.info(
+                    f"**Voliteľne:** ak chceš ešte viac OTM strikov bez vypínania OTM, zvýš aj "
+                    f"**Max. strike-ov / expiráciu** na **{_maxk}**."
+                )
+                if st.button(
+                    "Nastaviť OTM rozsah + vyšší max. počet strike-ov a obnoviť stránku",
+                    key="dsd_apply_suggested_otm_tuning",
+                    type="secondary",
+                ):
+                    st.session_state["dsd_pending_otm_tuning_suggestion"] = dict(_otm_tune)
+                    st.rerun()
+                st.caption(
+                    "Nastaví sa aj väčší limit strike-ov na expiráciu, aby bolo v DB viac OTM kandidátov. OTM filtre ostanú zapnuté."
+                )
     else:
         st.error("DTE prešlo, ale ďalšie filtre nenašli kombináciu. Pozri protokol nižšie pre presnú bránu.")
-    st.markdown(filter_log.failure_report_markdown(initial_opt=search_opts, last_tried_opt=effective_opt))
+    st.markdown(filter_log.failure_report_markdown(initial_opt=search_opts, last_tried_opt=effective_opt, strategy=_s0))
     if any(
         getattr(search_opts, f) is not None
         for f in ("dte_near_min", "dte_near_max", "dte_far_min", "dte_far_max")
@@ -240,7 +382,7 @@ _DSD_REC_NOTE = (
     "**Predvolby** — orientačný skríning, nie investičné poradenstvo. "
     "Hľadanie vždy použije **aktuálne** hodnoty v Pokročilých; predvolené sú **striktné** filtre (vhodné napr. pre AMZN). "
     "Theta s **×100** = porovnanie s `čistá theta × 100`. Čistá vega je **na 1 akciu** z reťazca (nie USD z Buildera). "
-    "**Striktné:** DTE **skoršej** exp. **40–55**, **neskoršej** **90–140** (kalendár, nie vždy = stĺpec Short); theta **3–8** pri ×100; vega **0,10–0,20**; OTM short **10 %**; "
+    "**Striktné:** DTE **skoršej** exp. **40–55**, **neskoršej** **90–140** (kalendár, nie vždy = stĺpec Short); theta **3–8** pri ×100; vega **0,10–0,20**; OTM **short aj long 10 %**; "
     "debit/šírka **0,25**; rel. spread **0,08 / 0,05**; min. OI **100** (ak je v CSV). "
     "**Širšie filtre** (tlačidlo): DTE **10–60** / **35–400**, theta **0,5–15**, vega **0,05–0,35** — často pomôže pri **GLD** a kratších reťazcoch."
 )
@@ -271,6 +413,8 @@ _DSD_REC_STRICT = {
     "dsd_dfmax": 140,
     "dsd_use_otm": True,
     "dsd_otm_min": 0.10,
+    "dsd_use_otm_long": True,
+    "dsd_otm_long_min": 0.10,
     "dsd_use_dratio": True,
     "dsd_dratio": 0.25,
     "dsd_use_rss": True,
@@ -279,6 +423,7 @@ _DSD_REC_STRICT = {
     "dsd_rsl": 0.05,
     "dsd_use_minoi": True,
     "dsd_minoi": 100,
+    "dsd_relax_exclude_otm": False,
 }
 _DSD_REC_RELAXED = {
     "dsd_strike_prox_leg": "long",
@@ -307,6 +452,8 @@ _DSD_REC_RELAXED = {
     "dsd_dfmax": 400,
     "dsd_use_otm": True,
     "dsd_otm_min": 0.10,
+    "dsd_use_otm_long": True,
+    "dsd_otm_long_min": 0.10,
     "dsd_use_dratio": True,
     "dsd_dratio": 0.25,
     "dsd_use_rss": True,
@@ -315,6 +462,7 @@ _DSD_REC_RELAXED = {
     "dsd_rsl": 0.05,
     "dsd_use_minoi": True,
     "dsd_minoi": 100,
+    "dsd_relax_exclude_otm": False,
 }
 
 
@@ -377,6 +525,9 @@ def _dsd_apply_diagonal_options_to_session_state(o: dss.DiagonalSearchOptions, t
     st.session_state["dsd_use_otm"] = o.short_otm_min is not None
     if o.short_otm_min is not None:
         st.session_state["dsd_otm_min"] = float(o.short_otm_min)
+    st.session_state["dsd_use_otm_long"] = o.long_otm_min is not None
+    if o.long_otm_min is not None:
+        st.session_state["dsd_otm_long_min"] = float(o.long_otm_min)
     st.session_state["dsd_use_dratio"] = o.max_debit_to_strike_width_ratio is not None
     if o.max_debit_to_strike_width_ratio is not None:
         st.session_state["dsd_dratio"] = float(o.max_debit_to_strike_width_ratio)
@@ -399,6 +550,7 @@ def _dsd_apply_diagonal_options_to_session_state(o: dss.DiagonalSearchOptions, t
         st.session_state["dsd_strike_prox_leg"] = "none"
     else:
         st.session_state["dsd_strike_prox_leg"] = str(o.strike_proximity_leg)
+    st.session_state["dsd_relax_exclude_otm"] = bool(getattr(o, "relax_exclude_otm", False))
     if o.spot is not None and float(o.spot) > 0:
         st.session_state[f"dsd_spot_{tk}"] = float(o.spot)
 
@@ -580,6 +732,9 @@ def _spread_table_column_config(df: pd.DataFrame) -> dict:
 _dsd_inject_tabular_css_once()
 _dsd_drain_rehydrate_after_relaxation()
 _dsd_drain_pending_dte_suggestion()
+_dsd_drain_pending_delta_tolerance()
+_dsd_drain_pending_strike_band_suggestion()
+_dsd_drain_pending_otm_tuning_suggestion()
 st.title("Hľadanie delty — diagonály")
 _flash_ok = st.session_state.pop("dsd_flash_success", None)
 if _flash_ok:
@@ -673,7 +828,7 @@ spot_display = st.number_input(
     value=float(_default_spot_for_ticker(ticker)),
     step=0.25,
     format="%.2f",
-    help="Ak je > 0, dá sa filtrovať **min. OTM short** (v pomere k spotu). Hodnota z lokálnej tabuľky Symbolov pre ticker; môžeš prepísať. **0** = OTM filtre sa neaplikujú.",
+    help="Ak je > 0, dajú sa filtre **min. OTM short** a **min. OTM long** (pomer k spotu). Hodnota z **Symbolov**; môžeš prepísať. **0** = OTM filtre sa neaplikujú.",
     key=f"dsd_spot_{str(ticker).strip().upper()}",
 )
 
@@ -717,10 +872,13 @@ with st.expander("Pokročilé filtre a režim triedenia", expanded=False):
             st.rerun()
     rank_mode = st.radio(
         "Triedenie",
-        options=["legacy", "score"],
-        index=0,
+        options=["legacy", "score", "theta_delta_debit"],
         horizontal=True,
-        format_func=lambda x: "Klasické (delta → theta)" if x == "legacy" else "Skóre (potom delta)",
+        format_func=lambda x: (
+            "Klasické (delta → theta)"
+            if x == "legacy"
+            else ("Skóre (potom delta)" if x == "score" else "Theta → delta → debit")
+        ),
         key="dsd_rank_mode",
     )
     ex1, ex2 = st.columns(2)
@@ -849,6 +1007,12 @@ with st.expander("Pokročilé filtre a režim triedenia", expanded=False):
         "u **long call** diagonálu je long na neskoršej expirácii — ak je long strike vyšší ako short, long často **nie** je bližšie. "
         "Nastavenie sa pri **automatickom zjemnení** filtrov nemení (rovnako ako DTE)."
     )
+    st.checkbox(
+        "Pri 0 výsledkoch **nezjemňovať** OTM short/long (iba postupné zjemnenie po filtroch)",
+        value=False,
+        key="dsd_relax_exclude_otm",
+        help="Kombinovaná 2. fáza **OTM nikdy nemení** (vždy podľa vstupu). Zapni, ak nechceš znižovať OTM ani v **1. fáze** (postupne po jednom filtri).",
+    )
     liq1, liq2, liq3 = st.columns(3)
     with liq1:
         use_otm = st.checkbox(
@@ -865,6 +1029,21 @@ with st.expander("Pokročilé filtre a režim triedenia", expanded=False):
             disabled=not use_otm or float(spot_display) <= 0,
             help="Call: (strike_short − spot)/spot; Put: (spot − strike_short)/spot. **10 %** = zadaj **0,10**. Vyžaduje spot > 0.",
             key="dsd_otm_min",
+        )
+        use_otm_long = st.checkbox(
+            "Min. OTM long (put/call rovnaký vzorec ako short; **odporúč. zapnuté** pri long diagonáli)",
+            value=True,
+            key="dsd_use_otm_long",
+        )
+        long_otm_min = st.number_input(
+            "Min. OTM long",
+            min_value=0.0,
+            value=0.10,
+            step=0.01,
+            format="%.4f",
+            disabled=not use_otm_long or float(spot_display) <= 0,
+            help="Call: (strike_long − spot)/spot; Put: (spot − strike_long)/spot. Vyžaduje spot > 0. Vypnutím ponecháš aj **ITM** dlhú nohu (ak sú v DB).",
+            key="dsd_otm_long_min",
         )
     with liq2:
         use_debit_ratio = st.checkbox(
@@ -949,6 +1128,7 @@ if st.button("Hľadať", type="primary", key="dsd_run"):
             dte_far_min=int(dte_far_min) if use_dfmin else None,
             dte_far_max=int(dte_far_max) if use_dfmax else None,
             short_otm_min=float(short_otm_min) if use_otm and spot_f > 0 else None,
+            long_otm_min=float(long_otm_min) if use_otm_long and spot_f > 0 else None,
             max_debit_to_strike_width_ratio=float(max_debit_to_strike_width_ratio) if use_debit_ratio else None,
             max_rel_spread_short=float(max_rel_spread_short) if use_rss else None,
             max_rel_spread_long=float(max_rel_spread_long) if use_rsl else None,
@@ -957,6 +1137,7 @@ if st.button("Hľadať", type="primary", key="dsd_run"):
             require_iv_short_ge_long=bool(use_iv_sl),
             iv_short_ge_long_margin=float(iv_margin) if use_iv_sl else 0.0,
             strike_proximity_leg=_strike_leg,
+            relax_exclude_otm=bool(st.session_state.get("dsd_relax_exclude_otm", False)),
         )
         _precheck = dss.diagonal_search_precheck_warnings_markdown(
             ticker, as_of_date=as_of, strategy=strategy, opt=search_opts
@@ -1022,7 +1203,12 @@ if st.button("Hľadať", type="primary", key="dsd_run"):
             _succ = (
                 f"Nájdených **{len(res)}** kombinácií — zoradené podľa **skóre** (stĺpec Skóre), potom presnosť delty."
                 if rank_mode == "score"
-                else f"Nájdených **{len(res)}** najlepších kombinácií — zoradené podľa **odchýlky delty**, potom **čistej theta**."
+                else (
+                    f"Nájdených **{len(res)}** kombinácií — zoradené podľa **čistej theta** (najvyššia prvá), "
+                    f"potom **odchýlky delty** od cieľa, potom **debitu** (nižší skôr)."
+                    if rank_mode == "theta_delta_debit"
+                    else f"Nájdených **{len(res)}** najlepších kombinácií — zoradené podľa **odchýlky delty**, potom **čistej theta**."
+                )
             )
             st.session_state["dsd_last_meta"] = {
                 "ticker": ticker,
@@ -1074,8 +1260,11 @@ meta = st.session_state.get("dsd_last_meta") or {}
 last_log = st.session_state.get("dsd_last_filter_log")
 if res is not None and not res.empty:
     _rm = meta.get("rank_mode") or "legacy"
-    _tried = "skóre" if _rm == "score" else "delta → theta"
-    _spot_note = f" · spot **{meta.get('spot')}**" if meta.get("spot") else ""
+    _tried = (
+        "skóre"
+        if _rm == "score"
+        else ("theta → delta → debit" if _rm == "theta_delta_debit" else "delta → theta")
+    )
     _rsum = (meta.get("relax_summary") or "").strip()
     if _rsum:
         st.info(_rsum)
@@ -1124,7 +1313,7 @@ if res is not None and not res.empty:
         )
     st.caption(
         f"_Posledné hľadanie: **{meta.get('ticker', '')}** · snímka **{meta.get('as_of', '')}** · "
-        f"triedenie **{_tried}**{_spot_note} — **Uložiť** je vpravo v poslednom stĺpci; potvrď tlačidlom nižšie._"
+        f"triedenie **{_tried}** — **Uložiť** je vpravo v poslednom stĺpci; potvrď tlačidlom nižšie._"
     )
     st.caption(
         "**Debit/kredit ($/1 lot ×100)** = (Long ask − Short bid) × **100** pri otvorení jedného kontraktu "
@@ -1141,6 +1330,21 @@ if res is not None and not res.empty:
     st.caption(
         "**APR % (rát.):** hrubý pomer očakávaného denného theta (USD/deň na 1 lot) k absolútnej veľkosti debetu; na porovnanie kandidátov, nie zaručený výnos."
     )
+    _spot_meta = meta.get("spot")
+    if _spot_meta is not None:
+        try:
+            _spot_num = float(_spot_meta)
+        except (TypeError, ValueError):
+            _spot_num = None
+        if _spot_num is not None and _spot_num > 0:
+            _tk = str(meta.get("ticker") or "").strip().upper() or "—"
+            st.markdown(
+                f"**Spot podkladu ({_tk}):** **{_spot_num:,.2f}** USD — referencia k strikom v tabuľke."
+            )
+        else:
+            st.caption("Spot podkladu pri tomto hľadaní nie je k dispozícii (skontroluj vstup spotu vo formulári alebo dáta v DB).")
+    else:
+        st.caption("Spot podkladu pri tomto hľadaní nie je v meta (zvyčajne treba zadať spot vo formulári).")
     edit_df = res.copy()
     edit_df["Uložiť"] = False
     _cols = [c for c in edit_df.columns if c != "Uložiť"] + ["Uložiť"]
