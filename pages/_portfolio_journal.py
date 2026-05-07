@@ -4,22 +4,35 @@ Casopis — otvorené nohy z denníka: skupiny a ručný zápis Grékov / IV do 
 from __future__ import annotations
 
 import hashlib
+import inspect
 import math
+import time
 from collections import defaultdict
 from pathlib import Path
 from datetime import date, datetime
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 from core import database as db
 from core import ibkr
-from core.greeks import iv_display_to_bs_fraction, spot_for_abs_delta_bs
+from core.greeks import calc_iv, iv_display_to_bs_fraction, spot_for_abs_delta_bs
 from core.ib_row_extract import ParsedIbRow, ocr_image_to_text, parse_ibkr_row_text
+from core.journal_pnl_curve import (
+    _journal_leg_instrument_label as _journal_leg_instrument_label_ui,
+    _legs_display_order as _legs_display_order_ui,
+    _single_leg_pl_now_usd,
+    journal_group_pl_ladder_tws_style_rows,
+    journal_group_pl_stoploss_short_window,
+    journal_group_pl_vs_spot,
+    journal_spot_levels_descending,
+)
 from core.portfolio_data import (
     find_ibkr_option_for_trade,
     greek_for_trade,
     ib_opt_greeks_scaled_for_journal,
+    unrealized_by_journal_ids_for_ib_legs,
 )
 from core.page_context import set_tradejournal_page
 
@@ -60,10 +73,25 @@ Bez načítaných pozícií z IB je hodnota **—**.
 Súčet **nákladovej bázy** so **znamienkom**, aby bol výsledok blízky **net cost basis** v TWS pri spreadoch: záporné `averageCost` z IB ostávajú; ak je short **kladný** (kredit ako kladné číslo), berie sa ako **odpočet**.  
 Bez IB cache je hodnota **—**.
 
+### Trhová hodnota − náklad (Σ)
+
+**Súčet MV mínus súčet nákladovej bázy** z rovnakých IB riadkov ako vyššie — orientačný **nezrealizovaný P&L** celej skupiny (nie je to samostatné pole z API). Pri neúplnej zhode nôh s IB sú to súčty len z **zhodných** nôh.  
+Bez IB cache je hodnota **—**.
+
 ### Časté problémy
 
 - **Metriky z IB ≠ TWS:** obnov dáta tlačidlom pri skupine; over, že v účte je **STK** podkladu (pre spot) alebo že v **Symboly** je aktuálny **spot**.
 - **Žiadna zhoda IB:** noha v denníku musí sedieť s kontraktom v TWS (ticker, strike, expirácia, typ, Long/Short).
+
+### Graf P&L vs. cena podkladu
+
+Pod tabuľkou skupiny je expander s **orientačným** grafom (Plotly, tmavý motív): **plná čiara** = model P&L pri dnešnom zostávajúcom čase (BS), **čiarkovaná** = model pri dni **najbližšej expirácie** v skupine (pre každú nohu zostávajúci čas do jej expirácie oproti tomu dňu; pri viacerých expiráciách ide o zjednodušenie).  
+**Tenšie farebné čiary (+2, +3, +5 dní):** ten istý BS model, ale ak by už ubehli tieto **kalendárne** dni (kratší čas do expirácie, rovnaká IV z journalu). Pri **rozdielnej Δ** medzi nohami uvidíš, ako sa krivky pod spotom v čase **rozbiehajú** — nohy sa pri pohybe podkladu nekompenzujú rovnako.  
+IV berie z **IV aktuálna / IV vstup** v journali (inak 30 %). **Aktuálny spot** v grafe (ak je IB pripojené): najprv **živý podklad** (`fetch_underlying` — snapshot alebo história, krátka cache), potom **STK** z portfólia (môže meškať oproti TWS), inak **Symboly** — vertikálna **tyrkysová čiara** a **diamanty**; rozsah osi X sa rozšíri okolo spotu.
+
+### Stop-loss graf (podklad okolo K shortu)
+
+Samostatný expander: os **X = cena podkladu (USD)** v úzkom pásme okolo **striku short** nohy. **Šírka** pásma pod a nad K sa predvolene odvodí od **vstupnej prémie** (`entry_price`) short nohy v journali; ak prémia chýba, použije sa širší predvolený rozsah. Zobrazí **P&L dnes** a **+2 / +3 / +5 dní**. Tyrkysová čiara = aktuálny spot, sivá bodkovaná = **K** shortu. Pod grafom je **tabuľka v štýle TWS**: pre každý scenár **spotu** riadky **nožičiek** (kontrakt, noha, ks., P&L) a riadok **Σ NET** — orientačný BS, nie presná kópia TWS.
 """
 
 
@@ -71,7 +99,7 @@ st.title("Casopis — Gréky a skupiny")
 
 st.caption(
     "**Návod:** Uprav **Δ vstup / Δ aktuálna**, **Θ vstup ($/deň) / Θ aktuálna ($/deň)** a ďalšie polia v tabuľke, potom **Uložiť journal** pri skupine. "
-    "Pod tabuľkou sú **súčty za skupinu** (čistá Δ/Θ), **Delta doláre / trhová hodnota / nákladová základňa** (prednostne z IB ako v TWS; inak journal + Symboly). "
+    "Pod tabuľkou sú **súčty za skupinu** (čistá Δ/Θ), **Delta doláre / trhová hodnota / nákladová základňa / rozdiel TH−náklad** (prednostne z IB ako v TWS; inak journal + Symboly). "
     "Hodnoty sú z denníka (ručný zápis alebo iný import)."
 )
 
@@ -576,6 +604,62 @@ def _ib_underlying_spot_from_cache(ib_positions: list[dict], ticker: str) -> flo
         if x is not None and x > 0 and not math.isnan(x):
             return x
     return None
+
+
+_JOURNAL_UND_SPOT_TTL_S = 45.0
+
+
+def _journal_underlying_spot_ib_live(ticker: str) -> tuple[float | None, str | None]:
+    """
+    Aktuálna cena podkladu z IB (snapshot / história — rovnaká vetva ako v TWS pri obnove).
+    Krátka cache v session, aby sa pri každom rerune nevolalo IB opakovane.
+    """
+    tk = (ticker or "").strip().upper()
+    if not tk or not ibkr.is_connected():
+        return None, None
+    cache: dict = st.session_state.setdefault("journal_und_spot_cache", {})
+    ent = cache.get(tk)
+    now_m = time.monotonic()
+    if ent and isinstance(ent, (list, tuple)) and len(ent) >= 3:
+        ts0, px0, lbl0 = ent[0], ent[1], ent[2]
+        if (now_m - ts0) < _JOURNAL_UND_SPOT_TTL_S and px0 is not None:
+            try:
+                pv = float(px0)
+            except (TypeError, ValueError):
+                pv = 0.0
+            if pv > 0 and not math.isnan(pv):
+                return pv, str(lbl0) if lbl0 else "IB live"
+
+    try:
+        r = ibkr.fetch_underlying(tk, timeout=6.0)
+    except Exception:
+        r = {"price": None, "error": "exc"}
+    px = r.get("price")
+    try:
+        pv = float(px) if px is not None else None
+    except (TypeError, ValueError):
+        pv = None
+    if pv is None or pv <= 0 or (isinstance(pv, float) and math.isnan(pv)):
+        return None, None
+    src = str(r.get("source") or "").lower()
+    lbl = "IB live (hist)" if "hist" in src else "IB live"
+    cache[tk] = (now_m, pv, lbl)
+    return pv, lbl
+
+
+def _journal_resolve_spot_for_pl(ticker: str, ib_positions: list[dict]) -> tuple[float | None, str | None]:
+    """Spot pre P&L grafy: IB live → STK v cache → Symboly."""
+    tk = (ticker or "").strip().upper()
+    if not tk:
+        return None, None
+    liv, lbl = _journal_underlying_spot_ib_live(tk)
+    if liv is not None and liv > 0:
+        return float(liv), lbl or "IB live"
+    ibs = _ib_underlying_spot_from_cache(ib_positions, tk)
+    if ibs is not None and ibs > 0:
+        return float(ibs), "IB STK (portfólio)"
+    s = _journal_symbol_spot_usd(tk)
+    return s, "Symboly" if s is not None else None
 
 
 def _journal_group_delta_dollars_ib(
@@ -1142,11 +1226,12 @@ with tab_legs:
                 _mv_sum, _cb_sum, _n_ib = _journal_group_ib_market_value_and_cost_basis(
                     edited, orig_by_id, _pf_live_pos
                 )
-                st.markdown("##### Delta doláre · Trhová hodnota · Nákladová základňa (skupina)")
+                st.markdown("##### Delta doláre · Trhová hodnota · Nákladová základňa · TH − náklad (skupina)")
                 _m_dd = f"${_dd_sum:+,.0f}" if _n_dd else "—"
                 _m_mv = f"${_mv_sum:+,.2f}" if _n_ib else "—"
                 _m_cb = f"${_cb_sum:+,.2f}" if _n_ib else "—"
-                _ib1, _ib2, _ib3 = st.columns(3)
+                _m_th_cb = f"${(_mv_sum - _cb_sum):+,.2f}" if _n_ib else "—"
+                _ib1, _ib2, _ib3, _ib4 = st.columns(4)
                 _ib1.metric(
                     "Delta doláre (Σ)",
                     _m_dd,
@@ -1162,6 +1247,11 @@ with tab_legs:
                     _m_cb,
                     help="Súčet nákladovej bázy so znamienkom (net spread) — expander.",
                 )
+                _ib4.metric(
+                    "TH − náklad (Σ)",
+                    _m_th_cb,
+                    help="Trhová hodnota mínus nákladová základňa (súčty z IB) — nezrealizovaný P&L skupiny; expander.",
+                )
                 if not _pf_live_pos:
                     st.caption(
                         "**IB:** v session nie sú pozície — import z IB alebo **Obnoviť údaje z TWS** pri skupine."
@@ -1172,6 +1262,416 @@ with tab_legs:
                     st.caption(
                         "**Delta doláre:** niektoré nohy chýbajú v výpočte — pozri expander *Vysvetlivky k metrikám* alebo obnov TWS."
                     )
+
+                with st.expander("Graf P&L vs. cena podkladu (BS model, orientačný)", expanded=False):
+                    _tk_pl = str(legs_edit[0].get("ticker") or "").strip().upper() if legs_edit else ""
+                    _s0pl, _pl_marker_src = _journal_resolve_spot_for_pl(_tk_pl, _pf_live_pos)
+                    _plcurve = journal_group_pl_vs_spot(
+                        legs_edit, spot_center=_s0pl, marker_source=_pl_marker_src
+                    )
+                    if _plcurve is None:
+                        st.caption(
+                            "Graf sa nevykreslí, ak skupina má **viac tickerov podkladu**, chýbajú **expirácie**, "
+                            "alebo dáta na výpočet nie sú dostačujúce."
+                        )
+                    else:
+                        _hlab = _plcurve["horizon_date"].strftime("%d.%m.%Y")
+                        fig_pnl = go.Figure()
+                        fig_pnl.add_trace(
+                            go.Scatter(
+                                x=_plcurve["spots"],
+                                y=_plcurve["pl_now"],
+                                mode="lines",
+                                name="P&L (model, dnes)",
+                                line=dict(width=2, color="#e8e8e8"),
+                            )
+                        )
+                        fig_pnl.add_trace(
+                            go.Scatter(
+                                x=_plcurve["spots"],
+                                y=_plcurve["pl_horizon"],
+                                mode="lines",
+                                name=f"P&L pri exp. {_hlab}",
+                                line=dict(width=2, color="#a8a8a8", dash="dash"),
+                            )
+                        )
+                        _fwd_palette = ("#64b5f6", "#9575cd", "#ff8a65", "#4dd0e1", "#aed581")
+                        _fwd_dashes = ("dash", "dot", "longdash", "dashdot", "dot")
+                        _fwd_days_list = list(_plcurve.get("forward_days") or [])
+                        _pl_fwd_by = _plcurve.get("pl_fwd_by_day") or {}
+                        for _fi, _kd in enumerate(_fwd_days_list):
+                            _ys_f = _pl_fwd_by.get(int(_kd))
+                            if not _ys_f:
+                                continue
+                            _c = _fwd_palette[_fi % len(_fwd_palette)]
+                            _d = _fwd_dashes[_fi % len(_fwd_dashes)]
+                            fig_pnl.add_trace(
+                                go.Scatter(
+                                    x=_plcurve["spots"],
+                                    y=_ys_f,
+                                    mode="lines",
+                                    name=f"P&L o +{_kd} dní (model)",
+                                    line=dict(width=1.35, color=_c, dash=_d),
+                                    opacity=0.92,
+                                )
+                            )
+                        _ms = _plcurve.get("marker_spot")
+                        _msrc = _plcurve.get("marker_source") or "spot"
+                        _ym1 = _plcurve.get("pl_now_at_marker")
+                        _ym2 = _plcurve.get("pl_horizon_at_marker")
+                        if _ms is not None and _ym1 is not None and _ym2 is not None:
+                            fig_pnl.add_vline(
+                                x=_ms,
+                                line_width=3,
+                                line_color="#26c6da",
+                                opacity=0.95,
+                                annotation_text=f"Aktuálny spot: {_ms:.2f}",
+                                annotation_position="top",
+                                annotation_font_size=12,
+                                annotation_font_color="#26c6da",
+                            )
+                            fig_pnl.add_trace(
+                                go.Scatter(
+                                    x=[_ms],
+                                    y=[_ym1],
+                                    mode="markers",
+                                    name="Spot → P&L (dnes)",
+                                    marker=dict(size=16, color="#26c6da", symbol="diamond", line=dict(width=2, color="#ffffff")),
+                                    hovertemplate=f"<b>Spot ({_msrc})</b> {_ms:.2f}<br><b>P&L dnes</b>: %{{y:.0f}} USD<extra></extra>",
+                                )
+                            )
+                            fig_pnl.add_trace(
+                                go.Scatter(
+                                    x=[_ms],
+                                    y=[_ym2],
+                                    mode="markers",
+                                    name="Spot → P&L (pri exp.)",
+                                    marker=dict(size=14, color="#ffb74d", symbol="diamond", line=dict(width=2, color="#ffffff")),
+                                    hovertemplate=f"<b>Spot ({_msrc})</b> {_ms:.2f}<br><b>P&L pri exp.</b>: %{{y:.0f}} USD<extra></extra>",
+                                )
+                            )
+                            _pl_fwd_at = _plcurve.get("pl_fwd_at_marker") or {}
+                            for _fi, _kd in enumerate(_fwd_days_list):
+                                _yf = _pl_fwd_at.get(int(_kd))
+                                if _yf is None:
+                                    continue
+                                _c = _fwd_palette[_fi % len(_fwd_palette)]
+                                fig_pnl.add_trace(
+                                    go.Scatter(
+                                        x=[_ms],
+                                        y=[_yf],
+                                        mode="markers",
+                                        marker=dict(size=8, color=_c, symbol="circle", line=dict(width=1, color="#ffffff")),
+                                        showlegend=False,
+                                        hovertemplate=(
+                                            f"<b>Spot ({_msrc})</b> {_ms:.2f}<br>"
+                                            f"<b>P&L o +{_kd} dní</b>: %{{y:.0f}} USD<extra></extra>"
+                                        ),
+                                    )
+                                )
+                        fig_pnl.update_layout(
+                            template="plotly_dark",
+                            xaxis_title="Cena podkladu",
+                            yaxis_title="P&L (USD)",
+                            hovermode="x unified",
+                            margin=dict(l=48, r=24, t=40, b=48),
+                            legend=dict(
+                                yanchor="top",
+                                y=0.99,
+                                xanchor="left",
+                                x=0.01,
+                                bgcolor="rgba(0,0,0,0)",
+                            ),
+                            height=420,
+                        )
+                        st.plotly_chart(fig_pnl, use_container_width=True, key=f"pf_pnl_{_gkey}")
+                        st.caption(_plcurve["note"])
+                        if _plcurve.get("forward_days"):
+                            st.caption(
+                                "**Čiary +2 / +3 / +5 dní:** P&L vs. spot po ubehnutí týchto kalendárnych dňoch (kratší čas do expirácie, rovnaká IV z journalu). "
+                                "Pri **rozdielnej Δ** medzi nohami kompenzácia pri pohybe podkladu v čase **nie je rovnaká** — krivky sa od „dnes“ **rozbiehajú**."
+                            )
+                        if _plcurve.get("marker_spot") is None:
+                            st.caption(
+                                "**Tip:** Na čiaru spotu treba **pripojené IB** (automaticky sa skúsi aktuálny podklad), prípadne **STK** v portfóliu alebo **spot** v **Symboly**."
+                            )
+
+                with st.expander(
+                    "Stop-loss: P&L vs. podklad (rozsah z prémie short nohy)", expanded=False
+                ):
+                    _tk_sl = str(legs_edit[0].get("ticker") or "").strip().upper() if legs_edit else ""
+                    _s0sl, _src_sl = _journal_resolve_spot_for_pl(_tk_sl, _pf_live_pos)
+                    _pl_stop = journal_group_pl_stoploss_short_window(
+                        legs_edit, spot_center=_s0sl, marker_source=_src_sl
+                    )
+                    if _pl_stop is None:
+                        st.caption(
+                            "Tento graf vyžaduje **aspoň jednu short nohu** so strike a expiráciou a **jeden ticker** podkladu."
+                        )
+                    else:
+                        _xxs = _pl_stop["x_spot_minus_short"]
+                        _kss = float(_pl_stop["k_short"])
+                        _s_under = _pl_stop["spots"]
+                        _cd_sl = [[float(s), float(xrk)] for s, xrk in zip(_s_under, _xxs)]
+                        fig_sl = go.Figure()
+                        fig_sl.add_trace(
+                            go.Scatter(
+                                x=_s_under,
+                                y=_pl_stop["pl_now"],
+                                mode="lines",
+                                name="P&L (dnes)",
+                                line=dict(width=2.2, color="#eceff1"),
+                                customdata=_cd_sl,
+                                hovertemplate="Spot=%{customdata[0]:.2f}<br>spot−K=%{customdata[1]:.2f}<br>P&L=%{y:.0f} USD<extra></extra>",
+                            )
+                        )
+                        _pf_sl = ("#64b5f6", "#9575cd", "#ff8a65", "#4dd0e1", "#aed581")
+                        _pd_sl = ("dash", "dot", "longdash", "dashdot", "dot")
+                        for _si, _kd in enumerate(_pl_stop.get("forward_days") or []):
+                            _yfs = (_pl_stop.get("pl_fwd_by_day") or {}).get(int(_kd))
+                            if not _yfs:
+                                continue
+                            fig_sl.add_trace(
+                                go.Scatter(
+                                    x=_s_under,
+                                    y=_yfs,
+                                    mode="lines",
+                                    name=f"P&L o +{_kd} dní",
+                                    line=dict(
+                                        width=1.35,
+                                        color=_pf_sl[_si % len(_pf_sl)],
+                                        dash=_pd_sl[_si % len(_pd_sl)],
+                                    ),
+                                    opacity=0.9,
+                                    customdata=_cd_sl,
+                                    hovertemplate="Spot=%{customdata[0]:.2f}<br>spot−K=%{customdata[1]:.2f}<br>P&L=%{y:.0f} USD<extra></extra>",
+                                )
+                            )
+                        _mspot = _pl_stop.get("marker_spot")
+                        _y0m = _pl_stop.get("pl_now_at_marker")
+                        if _mspot is not None and _y0m is not None:
+                            fig_sl.add_vline(
+                                x=_mspot,
+                                line_width=3,
+                                line_color="#26c6da",
+                                opacity=0.95,
+                                annotation_text=f"Aktuálny spot: {_mspot:.2f}",
+                                annotation_position="top",
+                                annotation_font_size=11,
+                                annotation_font_color="#26c6da",
+                            )
+                            fig_sl.add_trace(
+                                go.Scatter(
+                                    x=[_mspot],
+                                    y=[_y0m],
+                                    mode="markers",
+                                    name="Teraz",
+                                    marker=dict(
+                                        size=15,
+                                        color="#26c6da",
+                                        symbol="diamond",
+                                        line=dict(width=2, color="#ffffff"),
+                                    ),
+                                    hovertemplate=(
+                                        f"<b>Spot</b> {_mspot:.2f}<br><b>spot−K</b> {_mspot - _kss:+.2f}<br>"
+                                        "<b>P&L dnes</b> %{y:.0f} USD<extra></extra>"
+                                    ),
+                                )
+                            )
+                            _fat_sl = _pl_stop.get("pl_fwd_at_marker") or {}
+                            for _si, _kd in enumerate(_pl_stop.get("forward_days") or []):
+                                _yf = _fat_sl.get(int(_kd))
+                                if _yf is None:
+                                    continue
+                                _c = _pf_sl[_si % len(_pf_sl)]
+                                fig_sl.add_trace(
+                                    go.Scatter(
+                                        x=[_mspot],
+                                        y=[_yf],
+                                        mode="markers",
+                                        marker=dict(size=7, color=_c, symbol="circle", line=dict(width=1, color="#ffffff")),
+                                        showlegend=False,
+                                        hovertemplate=f"+{_kd} dní pri tom istom S: %{{y:.0f}} USD<extra></extra>",
+                                    )
+                                )
+                        fig_sl.add_vline(
+                            x=_kss,
+                            line_width=1,
+                            line_color="#888888",
+                            opacity=0.55,
+                            line_dash="dot",
+                        )
+                        fig_sl.update_layout(
+                            template="plotly_dark",
+                            xaxis_title="Cena podkladu (USD) — rozsah z vstupnej prémie short nohy okolo K",
+                            yaxis_title="P&L (USD)",
+                            hovermode="x unified",
+                            margin=dict(l=48, r=24, t=44, b=56),
+                            legend=dict(
+                                yanchor="top",
+                                y=0.99,
+                                xanchor="left",
+                                x=0.01,
+                                bgcolor="rgba(0,0,0,0)",
+                            ),
+                            height=400,
+                        )
+                        st.plotly_chart(fig_sl, use_container_width=True, key=f"pf_pnl_sl_{_gkey}")
+                        st.caption(_pl_stop["note"])
+                        st.caption(
+                            f"**K (short):** {_kss:g}. **Sivá bodkovaná** = strike shortu. "
+                            "Rozsah osi X podľa **vstupnej prémie** short nohy v journali; bez prémie širší základný interval."
+                        )
+                        _hi_tbl = _pl_stop.get("marker_spot") or _s0sl
+                        if _hi_tbl is not None and float(_hi_tbl) > 0:
+                            st.markdown("##### Tabuľka P&L vs. spot (štýl TWS, model BS)")
+                            _tc1, _tc2 = st.columns(2)
+                            with _tc1:
+                                _tbl_lo = st.number_input(
+                                    "Spot až po (USD)",
+                                    min_value=1.0,
+                                    value=170.0,
+                                    step=1.0,
+                                    key=f"pf_sl_tbl_lo_{_gkey}",
+                                )
+                            with _tc2:
+                                _tbl_step = st.number_input(
+                                    "Krok (USD)",
+                                    min_value=0.05,
+                                    value=0.5,
+                                    step=0.05,
+                                    format="%.2f",
+                                    key=f"pf_sl_tbl_st_{_gkey}",
+                                )
+                            _lv = journal_spot_levels_descending(float(_hi_tbl), float(_tbl_lo), float(_tbl_step))
+
+                            # ── Tabuľka P&L: IB-anchored delta aprox. ──────────────────────────────
+                            # Pre každú nohu:
+                            #   P&L(S) = unrealized_pnl_IB  +  delta_IB × (S − S_now) × contracts × 100
+                            # kde S_now = aktuálny spot (z IB / Symboly).
+                            # Výhoda: presné číslo pri aktuálnom spote (zhoduje sa s TWS),
+                            # správny smer (delta z IB) pre ostatné scenáre.
+                            # Fallback na BS model ak IB greky/unrealized nie sú dostupné.
+
+                            _s_now = float(_s0sl) if _s0sl is not None and float(_s0sl or 0) > 0 else None
+                            _tws_rows: list[dict] = []
+                            _used_ib = False
+                            for _sv in _lv:
+                                _spot_r = round(float(_sv), 2)
+                                _leg_rows = []
+                                _net_pl = 0
+                                for _leg in (_legs_display_order_ui(legs_edit) if True else legs_edit):
+                                    _lt = str(_leg.get("leg_type") or "").strip().capitalize()
+                                    _ks = abs(int(round(float(_leg.get("contracts") or 1))))
+                                    _ks_signed = _ks if _lt == "Long" else -_ks
+                                    _lbl = _journal_leg_instrument_label_ui(_leg)
+
+                                    _ib_opt = find_ibkr_option_for_trade(_leg, _pf_live_pos)
+                                    _pl_leg: int | None = None
+                                    if _ib_opt is not None and _s_now is not None:
+                                        try:
+                                            _unrl = float(_ib_opt.get("unrealized_pnl") or 0.0)
+                                            _delta_ps = float(_ib_opt.get("delta") or 0.0)
+                                            _sgn_pos = 1.0 if _lt == "Long" else -1.0
+                                            _dS = float(_sv) - _s_now
+                                            _pl_leg = int(round(_unrl + _sgn_pos * _delta_ps * _dS * _ks * 100.0))
+                                            _used_ib = True
+                                        except Exception:
+                                            _pl_leg = None
+
+                                    if _pl_leg is None:
+                                        # fallback: BS model (pôvodná logika)
+                                        _pl_bs = _single_leg_pl_now_usd(_leg, float(_sv), 0.045)
+                                        _pl_leg = int(round(float(_pl_bs))) if _pl_bs is not None else 0
+
+                                    _net_pl += _pl_leg
+                                    _leg_rows.append({
+                                        "spot": _spot_r,
+                                        "kontrakt": _lbl,
+                                        "noha": _lt or "—",
+                                        "ks": f"{_ks_signed:+d}",
+                                        "pl_usd": _pl_leg,
+                                        "_typ": "noha",
+                                    })
+                                _tws_rows.extend(_leg_rows)
+                                _tws_rows.append({
+                                    "spot": _spot_r,
+                                    "kontrakt": "Σ NET",
+                                    "noha": "",
+                                    "ks": "",
+                                    "pl_usd": _net_pl,
+                                    "_typ": "net",
+                                })
+
+                            if _tws_rows:
+                                _tdf = pd.DataFrame(_tws_rows).drop(columns=["_typ"], errors="ignore")
+                                _tdf = _tdf.rename(
+                                    columns={
+                                        "spot": "Spot",
+                                        "kontrakt": "Kontrakt",
+                                        "noha": "Noha",
+                                        "ks": "Ks.",
+                                        "pl_usd": "P&L (USD)",
+                                    }
+                                )
+                                _cc_tws: dict = {}
+                                if "Spot" in _tdf.columns:
+                                    _cc_tws["Spot"] = st.column_config.NumberColumn(
+                                        "Spot",
+                                        help="Scenár ceny podkladu.",
+                                        format="%.2f",
+                                        width="small",
+                                    )
+                                if "Kontrakt" in _tdf.columns:
+                                    _cc_tws["Kontrakt"] = st.column_config.TextColumn(
+                                        "Kontrakt",
+                                        help="Opčný kontrakt (z denníka).",
+                                        width="large",
+                                    )
+                                if "Noha" in _tdf.columns:
+                                    _cc_tws["Noha"] = st.column_config.TextColumn(
+                                        "Noha",
+                                        help="Long alebo Short.",
+                                        width="small",
+                                    )
+                                if "Ks." in _tdf.columns:
+                                    _cc_tws["Ks."] = st.column_config.TextColumn(
+                                        "Ks.",
+                                        help="Počet kontraktov so znamienkom (+ long, − short).",
+                                        width="small",
+                                    )
+                                if "P&L (USD)" in _tdf.columns:
+                                    _pl_help = (
+                                        "P&L v USD: pri aktuálnom spote z IB (TWS); ostatné spoty = delta aproximácia. "
+                                        "Riadok Σ NET = súčet nôh."
+                                    )
+                                    _pl_kw: dict = {
+                                        "label": "P&L (USD)",
+                                        "help": _pl_help,
+                                        "format": "%d",
+                                        "width": "small",
+                                    }
+                                    if "alignment" in inspect.signature(
+                                        st.column_config.NumberColumn
+                                    ).parameters:
+                                        _pl_kw["alignment"] = "left"
+                                    _cc_tws["P&L (USD)"] = st.column_config.NumberColumn(**_pl_kw)
+                                st.dataframe(
+                                    _tdf,
+                                    # Pevnejšie šírky stĺpcov (TWS štýl) dosiahneme vypnutím automatického
+                                    # roztiahnutia na celú šírku kontajnera.
+                                    use_container_width=False,
+                                    hide_index=True,
+                                    column_config=_cc_tws,
+                                )
+                                _src_note = "IB delta aprox. (baseline = live unrealized P&L z TWS)" if _used_ib else "BS model (IB data nie sú dostupné – klikni Obnoviť údaje z TWS)"
+                                st.caption(
+                                    f"**Layout ako v TWS:** Spot | Kontrakt | Noha | Ks. | P&L. "
+                                    f"P&L pri aktuálnom spote = presné IB číslo; ostatné spoty = lineárna delta aprox. "
+                                    f"**Zdroj:** {_src_note}."
+                                )
+                        else:
+                            st.caption("**Tabuľka:** dopln **spot** (IB / Symboly), aby bolo od čoho počítať krok nadol.")
 
                 _watch_rows: list[dict] = []
                 for _, row in edited.iterrows():
