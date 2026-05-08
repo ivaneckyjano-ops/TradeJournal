@@ -99,8 +99,10 @@ def test_strike_band_filters_rows():
             as_of = "2026-04-16"
             for exp, strike, d, th in [
                 ("2026-06-01", "50", "0.5", "-0.1"),
+                ("2026-06-01", "55", "0.48", "-0.09"),
                 ("2026-06-01", "300", "0.5", "-0.1"),
                 ("2026-09-01", "50", "0.5", "-0.04"),
+                ("2026-09-01", "55", "0.47", "-0.035"),
                 ("2026-09-01", "300", "0.5", "-0.04"),
             ]:
                 odb.import_merged_dataframe(
@@ -287,7 +289,9 @@ def test_net_theta_max_can_empty_results():
             as_of = "2026-04-16"
             for exp, strike, d, th in [
                 ("2026-06-01", "100", "0.50", "-0.10"),
+                ("2026-06-01", "105", "0.48", "-0.09"),
                 ("2026-09-01", "100", "0.52", "-0.04"),
+                ("2026-09-01", "105", "0.50", "-0.03"),
             ]:
                 odb.import_merged_dataframe(
                     conn,
@@ -333,7 +337,9 @@ def test_negative_net_theta_combinations_excluded_from_results():
             as_of = "2026-04-16"
             for exp, strike, d, th in [
                 ("2026-06-01", "100", "0.50", "-0.10"),
+                ("2026-06-01", "105", "0.48", "-0.09"),
                 ("2026-09-01", "100", "0.50", "-0.16"),
+                ("2026-09-01", "105", "0.47", "-0.15"),
             ]:
                 odb.import_merged_dataframe(
                     conn,
@@ -807,7 +813,9 @@ def test_progressive_filter_search_no_op_when_first_search_ok():
             as_of = "2026-04-16"
             for exp, strike, d, th in [
                 ("2026-06-01", "100", "0.50", "-0.10"),
+                ("2026-06-01", "105", "0.48", "-0.09"),
                 ("2026-09-01", "100", "0.52", "-0.04"),
+                ("2026-09-01", "105", "0.50", "-0.03"),
             ]:
                 odb.import_merged_dataframe(
                     conn,
@@ -1162,3 +1170,61 @@ def test_protocol_markdown_includes_otm_orientation_when_spot_and_otm():
     assert "OTM vs. strike" in md
     assert "110.00" in md
     assert "Čo spraviť, ak chceš zostať OTM" in md
+
+
+def test_require_same_strike_keeps_only_calendar_pairs():
+    with tempfile.TemporaryDirectory() as td:
+        old = odb.OPTION_CHAINS_DIR
+        odb.OPTION_CHAINS_DIR = td
+        try:
+            conn = odb.get_connection("CAL")
+            odb.init_schema(conn)
+            as_of = "2026-04-16"
+            for exp, strike, d, th in [
+                ("2026-06-01", "100", "0.50", "-0.10"),
+                ("2026-06-01", "110", "0.45", "-0.11"),
+                ("2026-09-01", "100", "0.52", "-0.04"),
+                ("2026-09-01", "110", "0.48", "-0.05"),
+            ]:
+                odb.import_merged_dataframe(
+                    conn,
+                    expiry=exp,
+                    as_of_date=as_of,
+                    merged=_merged_row(strike, d, th, "Call"),
+                    source_options_csv="o.csv",
+                    source_greeks_csv="g.csv",
+                )
+            conn.close()
+
+            out_all = dss.search_diagonal_spreads(
+                "CAL",
+                as_of_date=as_of,
+                strategy="long_call_diagonal",
+                target_net_delta=0.0,
+                top_n=50,
+                max_strikes_per_expiry=50,
+                options=dss.DiagonalSearchOptions(require_same_strike=False),
+            )
+            out_cal = dss.search_diagonal_spreads(
+                "CAL",
+                as_of_date=as_of,
+                strategy="long_call_diagonal",
+                target_net_delta=0.0,
+                top_n=50,
+                max_strikes_per_expiry=50,
+                options=dss.DiagonalSearchOptions(require_same_strike=True),
+            )
+            assert not out_all.empty
+            sk_a_s = out_all["Short — strike"].astype(float)
+            sk_a_l = out_all["Long — strike"].astype(float)
+            assert ((sk_a_s - sk_a_l).abs() > 0.01).all(), "diagonála nesmie obsahovať kalendár (rovnaký strike)"
+
+            assert not out_cal.empty
+            sk_s = out_cal["Short — strike"].astype(float)
+            sk_l = out_cal["Long — strike"].astype(float)
+            assert (sk_s - sk_l).abs().max() < 0.01
+        finally:
+            odb.OPTION_CHAINS_DIR = old
+            p = os.path.join(td, "CAL.db")
+            if os.path.isfile(p):
+                os.remove(p)

@@ -115,6 +115,8 @@ class DiagonalSearchOptions:
     strike_proximity_leg: Optional[Literal["long", "short"]] = "long"
     # Ak True, pri postupnom / kombinovanom zjemnení sa nemenia short_otm_min / long_otm_min.
     relax_exclude_otm: bool = False
+    # Kalendár vs diagonála: True = len rovnaký strike (kalendár); False = striky sa musia líšiť (diagonála).
+    require_same_strike: bool = False
 
 
 OptScalar = Union[float, int, bool, str, None]
@@ -1175,6 +1177,16 @@ def search_diagonal_spreads(
             cart = near_leg.merge(far_leg, on="_k").drop(columns="_k")
             if cart.empty:
                 continue
+            sn = pd.to_numeric(cart["strike_near"], errors="coerce")
+            sf = pd.to_numeric(cart["strike_far"], errors="coerce")
+            if opt.require_same_strike:
+                # Kalendár: rovnaký strike na oboch expiráciách.
+                cart = cart.loc[(sn - sf).abs() <= 1e-4]
+            else:
+                # Diagonála: striky sa musia líšiť (vylúčiť čistý kalendár 290/290).
+                cart = cart.loc[(sn - sf).abs() > 1e-4]
+            if cart.empty:
+                continue
 
             cart["net_delta"] = spec.w_near * cart["delta_near"] + spec.w_far * cart["delta_far"]
             cart["net_theta"] = spec.w_near * cart["theta_near"] + spec.w_far * cart["theta_far"]
@@ -1581,6 +1593,10 @@ def _fmt_opt_val(v: OptScalar) -> str:
 def _format_diagonal_options_markdown_sk(o: DiagonalSearchOptions) -> str:
     """Zostaví odrážkový zoznam zapnutých filtrov pre diagnostiku v UI."""
     lines: list[str] = []
+    if getattr(o, "require_same_strike", False):
+        lines.append("- **Tvar:** kalendár — rovnaký **strike** na skoršej aj neskoršej expirácii")
+    else:
+        lines.append("- **Tvar:** diagonála — striky **near** a **far** sa musia **líšiť** (kalendár vylúčený)")
     if o.delta_tolerance is not None:
         lines.append(f"- Delta: tolerancia **≤ {_fmt_opt_val(o.delta_tolerance)}** (|čistá delta − cieľ|)")
     th_note = " (×100)" if o.theta_scale_contracts else ""

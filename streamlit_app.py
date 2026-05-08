@@ -189,6 +189,11 @@ trading_commands = st.Page(
 )
 groups    = st.Page("pages/groups.py",     title="Skupiny",           icon=":material/folder:")
 symbols   = st.Page("pages/symbols.py",    title="Symboly",           icon=":material/bookmarks:")
+flex_trades = st.Page(
+    "pages/flex_trades.py",
+    title="Flex Trades",
+    icon=":material/table_chart:",
+)
 notes     = st.Page("pages/notes.py",      title="Konzultácie",       icon=":material/chat_bubble:")
 modeler        = st.Page("pages/modeler.py",          title="Roll Simulátor",      icon=":material/model_training:")
 roll_breakeven = st.Page("pages/roll_breakeven.py",   title="Rolovanie — breakeven spot", icon=":material/anchor:")
@@ -207,7 +212,7 @@ help_page      = st.Page("pages/help.py",             title="Pomocník",        
 pg = st.navigation(
     {
         "Prehľad":  [dashboard, journal_main, calendar],
-        "Obchody":  [trading_commands, groups, symbols],
+        "Obchody":  [trading_commands, groups, symbols, flex_trades],
         "Analýza":  [notes, modeler, roll_breakeven, spread_bld, csv_variants, shot_spread, greeks_db, delta_diag, sector_ins, steady_yields, portfolio_agent, portfolio_dash],
         "Info":     [help_page],
     },

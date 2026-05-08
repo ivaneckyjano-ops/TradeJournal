@@ -200,6 +200,12 @@ def _dsd_drain_pending_otm_tuning_suggestion() -> None:
     st.session_state["dsd_maxk"] = max(15, min(120, max_k))
 
 
+def _dsd_trigger_pending_search_rerun() -> None:
+    """Rovnaký beh ako **Hľadať** — po úprave filtrov z prázdneho panela (bez skrolovania hore)."""
+    st.session_state["dsd_pending_run_search"] = True
+    st.rerun()
+
+
 def _dsd_render_empty_search_panel() -> None:
     """Výsledok 0 — mimo tlačidla „Hľadať“ (inak vnorené widgety + ``rerun`` mätú React/Streamlit)."""
     if not st.session_state.get("dsd_post_search_is_empty", False):
@@ -264,20 +270,28 @@ def _dsd_render_empty_search_panel() -> None:
                 "**Návrh (dvojica v kalendári najbližšia k tvojim pásnam):** "
                 f"skoršia **{_dte_pick['expiry_near']}** (DTE **{_dte_pick['dte_near']}** dní), "
                 f"neskoršia **{_dte_pick['expiry_far']}** (DTE **{_dte_pick['dte_far']}** dní).{_pen} "
-                "Dole **Upraviť** zarovná **DTE pásma** v Pokročilých na túto dvojicu (dni), potom znovu klikni **Hľadať**."
+                "Tlačidlom **Upraviť** zarovnáš **DTE pásma** v Pokročilých na túto dvojicu (dni); **Spustiť znova** spustí hľadanie s aktuálnymi filtrami."
             )
             if st.button(
-                "Upraviť na túto DTE dvojicu a obnoviť stránku",
+                "Upraviť",
                 key="dsd_apply_suggested_dte",
                 type="secondary",
+                help="Zapíše DTE skoršej/neskoršej nohy do Pokročilých a obnoví stránku.",
             ):
                 st.session_state["dsd_pending_dte_suggestion"] = {
                     "dte_near": int(_dte_pick["dte_near"]),
                     "dte_far": int(_dte_pick["dte_far"]),
                 }
                 st.rerun()
+            if st.button(
+                "Spustiť znova",
+                key="dsd_rerun_after_suggested_dte",
+                type="secondary",
+                help="Rovnaké ako **Hľadať** vyššie — znova spustí hľadanie.",
+            ):
+                _dsd_trigger_pending_search_rerun()
             st.caption(
-                "Hodnoty sa zapíšu do session skôr, než sa vykreslia polia v Pokročilých (inak Streamlit hlási chybu na kľúči). Potom znovu klikni **Hľadať**."
+                "Po **Upraviť** sa hodnoty zapíšu do session pred vykreslením polí v Pokročilých. **Spustiť znova** môžeš použiť aj bez úpravy (opakuje posledné kritériá)."
             )
         if _first.field == "delta_tolerance":
             st.markdown(
@@ -288,17 +302,25 @@ def _dsd_render_empty_search_panel() -> None:
             if _dt_follow:
                 _dt_payload, _dt_desc = _dt_follow
                 st.info(
-                    f"**Návrh úpravy:** {_dt_desc}. Tlačidlom nižšie sa nastaví v **Pokročilých**, stránka sa obnoví — potom znovu klikni **Hľadať**."
+                    f"**Návrh úpravy:** {_dt_desc}. **Upraviť** nastaví **Pokročilé** a obnoví stránku; **Spustiť znova** hneď spustí hľadanie."
                 )
                 if st.button(
-                    "Upraviť toleranciu delty a obnoviť stránku",
+                    "Upraviť",
                     key="dsd_apply_suggested_delta_tol",
                     type="secondary",
+                    help="Ďalší krok tolerancie delty (alebo vypnutie) podľa tabuľky zjemnení.",
                 ):
                     st.session_state["dsd_pending_delta_tolerance"] = dict(_dt_payload)
                     st.rerun()
+                if st.button(
+                    "Spustiť znova",
+                    key="dsd_rerun_after_suggested_delta_tol",
+                    type="secondary",
+                    help="Rovnaké ako **Hľadať** vyššie.",
+                ):
+                    _dsd_trigger_pending_search_rerun()
                 st.caption(
-                    "Zápis do session prebehne pred vykreslením polí (rovnako ako pri návrhu DTE). Potom **Hľadať**."
+                    "Zápis do session prebehne pred vykreslením polí (rovnako ako pri návrhu DTE)."
                 )
         _strike_follow = None
         try:
@@ -314,14 +336,22 @@ def _dsd_render_empty_search_panel() -> None:
             )
             st.info(_desc)
             if st.button(
-                "Nastaviť odporúčaný OTM strike rozsah a obnoviť stránku",
+                "Upraviť",
                 key="dsd_apply_suggested_strike_band",
                 type="secondary",
+                help="Rozšíri rozsah strike-ov smerom k OTM (Call vyššie, Put nižšie) a obnoví stránku.",
             ):
                 st.session_state["dsd_pending_strike_band_suggestion"] = dict(_strike_follow)
                 st.rerun()
+            if st.button(
+                "Spustiť znova",
+                key="dsd_rerun_after_suggested_strike_band",
+                type="secondary",
+                help="Rovnaké ako **Hľadať** vyššie.",
+            ):
+                _dsd_trigger_pending_search_rerun()
             st.caption(
-                "Predvyplnia sa len striky pre hľadanie; OTM short/long zostanú zapnuté. Potom klikni **Hľadať**."
+                "Predvyplnia sa striky pre hľadanie; OTM short/long zostanú zapnuté."
             )
             try:
                 _otm_tune = dss.otm_keep_otm_tuning_suggestion(search_opts, strategy=_s0)  # type: ignore[arg-type]
@@ -334,17 +364,32 @@ def _dsd_render_empty_search_panel() -> None:
                     f"**Max. strike-ov / expiráciu** na **{_maxk}**."
                 )
                 if st.button(
-                    "Nastaviť OTM rozsah + vyšší max. počet strike-ov a obnoviť stránku",
+                    "Upraviť",
                     key="dsd_apply_suggested_otm_tuning",
                     type="secondary",
+                    help="Rozšíri strike band a zvýši max. strike-ov / expiráciu podľa odporúčania.",
                 ):
                     st.session_state["dsd_pending_otm_tuning_suggestion"] = dict(_otm_tune)
                     st.rerun()
+                if st.button(
+                    "Spustiť znova",
+                    key="dsd_rerun_after_suggested_otm_tuning",
+                    type="secondary",
+                    help="Rovnaké ako **Hľadať** vyššie.",
+                ):
+                    _dsd_trigger_pending_search_rerun()
                 st.caption(
                     "Nastaví sa aj väčší limit strike-ov na expiráciu, aby bolo v DB viac OTM kandidátov. OTM filtre ostanú zapnuté."
                 )
     else:
         st.error("DTE prešlo, ale ďalšie filtre nenašli kombináciu. Pozri protokol nižšie pre presnú bránu.")
+        if st.button(
+            "Spustiť znova",
+            key="dsd_rerun_empty_no_failure_step",
+            type="secondary",
+            help="Opakuje hľadanie s aktuálnymi filtrami (rovnako ako **Hľadať**).",
+        ):
+            _dsd_trigger_pending_search_rerun()
     st.markdown(filter_log.failure_report_markdown(initial_opt=search_opts, last_tried_opt=effective_opt, strategy=_s0))
     if any(
         getattr(search_opts, f) is not None
@@ -375,6 +420,14 @@ def _dsd_render_empty_search_panel() -> None:
             st.info(_hint)
     except Exception:
         pass
+    st.divider()
+    if st.button(
+        "Spustiť znova",
+        key="dsd_rerun_empty_panel_footer",
+        type="secondary",
+        help="Znova spustí hľadanie s aktuálnymi filtrami (toto isté ako **Hľadať** hore na stránke).",
+    ):
+        _dsd_trigger_pending_search_rerun()
 
 
 # Predvolby: najprv **striktné** (klasický skríning); pri 0 výsledkoch ponúkni **širšie** (ETF / kratší reťazec).
@@ -551,6 +604,7 @@ def _dsd_apply_diagonal_options_to_session_state(o: dss.DiagonalSearchOptions, t
     else:
         st.session_state["dsd_strike_prox_leg"] = str(o.strike_proximity_leg)
     st.session_state["dsd_relax_exclude_otm"] = bool(getattr(o, "relax_exclude_otm", False))
+    st.session_state["dsd_opt_shape"] = "calendar" if bool(getattr(o, "require_same_strike", False)) else "diagonal"
     if o.spot is not None and float(o.spot) > 0:
         st.session_state[f"dsd_spot_{tk}"] = float(o.spot)
 
@@ -735,12 +789,13 @@ _dsd_drain_pending_dte_suggestion()
 _dsd_drain_pending_delta_tolerance()
 _dsd_drain_pending_strike_band_suggestion()
 _dsd_drain_pending_otm_tuning_suggestion()
-st.title("Hľadanie delty — diagonály")
+st.title("Hľadanie delty — diagonály a kalendáre")
 _flash_ok = st.session_state.pop("dsd_flash_success", None)
 if _flash_ok:
     st.success(_flash_ok)
 st.caption(
-    "**Návod:** Najprv import v **DB Grékov**. Vyber **ticker**, **dátum snímky** a typ diagonálu; nastav cieľ delty a filtre, spusti **hľadanie**. Výsledky sú z lokálnych `.db` súborov; detailný postup je v expandéri **Manuál**."
+    "**Návod:** Najprv import v **DB Grékov**. Vyber **ticker**, **dátum snímky**, **Call/Put**, **Long/Short** a **diagonálu alebo kalendár**; nastav cieľ delty a filtre, spusti **hľadanie**. "
+    "**Kalendár** = rovnaký strike na skoršej aj neskoršej expirácii. Výsledky sú z lokálnych `.db` súborov; detailný postup je v expandéri **Manuál**."
 )
 st.caption(
     "Dáta z **DB Grékov** (`data/option_chains/*.db`). Dva kontrakty rovnakého typu (Call alebo Put): "
@@ -762,6 +817,14 @@ if not tickers:
     st.info("Najprv importuj reťazce v **DB Grékov**.")
     st.stop()
 
+# Prepínače stratégie (Call/Put × Long/Short × diagonála/kalendár) — migrácia zo starého ``dsd_strat``.
+if "dsd_opt_right" not in st.session_state:
+    _leg = str(st.session_state.get("dsd_strat", "long_call_diagonal")).strip()
+    st.session_state["dsd_opt_right"] = "Put" if "put" in _leg else "Call"
+    st.session_state["dsd_opt_ls"] = "short" if _leg.startswith("short_") else "long"
+if "dsd_opt_shape" not in st.session_state:
+    st.session_state["dsd_opt_shape"] = "diagonal"
+
 c1, c2, c3 = st.columns([1, 1, 1])
 with c1:
     ticker = st.selectbox(
@@ -778,21 +841,41 @@ with c2:
         st.stop()
     as_of = st.selectbox("Dátum snímky (as-of)", options=dates, key="dsd_asof")
 with c3:
-    strat_labels = {
-        "long_call_diagonal": "Long call diagonál",
-        "short_call_diagonal": "Short call diagonál",
-        "long_put_diagonal": "Long put diagonál",
-        "short_put_diagonal": "Short put diagonál",
-    }
-    strategy = st.selectbox(
-        "Stratégia",
-        options=list(strat_labels.keys()),
-        format_func=lambda k: strat_labels[k],
-        key="dsd_strat",
+    st.radio(
+        "Call / Put",
+        ["Call", "Put"],
+        horizontal=True,
+        key="dsd_opt_right",
     )
+    st.radio(
+        "Smer stratégie",
+        ["long", "short"],
+        horizontal=True,
+        key="dsd_opt_ls",
+        format_func=lambda x: (
+            "Long (+ďaleká exp. −blízka exp.)" if x == "long" else "Short (−ďaleká exp. +blízka exp.)"
+        ),
+    )
+    st.radio(
+        "Tvar spreadu",
+        ["diagonal", "calendar"],
+        horizontal=True,
+        key="dsd_opt_shape",
+        format_func=lambda x: (
+            "Diagonála (rôzne striky)" if x == "diagonal" else "Kalendár (rovnaký strike)"
+        ),
+        help="**Kalendár** ponechá len kombinácie, kde je strike na skoršej a neskoršej expirácii **rovnaký**.",
+    )
+
+_right = str(st.session_state.get("dsd_opt_right", "Call"))
+_ls = str(st.session_state.get("dsd_opt_ls", "long"))
+_shape = str(st.session_state.get("dsd_opt_shape", "diagonal"))
+strategy = f"{_ls}_{'call' if _right == 'Call' else 'put'}_diagonal"
+_require_same_strike = _shape == "calendar"
 
 st.markdown(
     dss.STRATEGIES[strategy].label_sk
+    + (" · **Kalendár:** rovnaký strike na oboch expiráciách." if _require_same_strike else "")
     + " — v kalendári: **skoršia** expirácia = skorší dátum, **neskoršia** = neskorší dátum (viď DTE filtre nižšie, ktorá noha je short/long podľa váh)."
 )
 
@@ -1100,7 +1183,8 @@ st.checkbox(
     key="dsd_debug_protocol_disk",
     help="Protokol (Markdown) sa po každom hľadaní vždy uloží do session a zobrazí v expanderi nižšie — vhodné na kopírovanie. Zapnutím pridáš zápis timestampovaného .md na disk.",
 )
-if st.button("Hľadať", type="primary", key="dsd_run"):
+_dsd_run_search_now = bool(st.session_state.pop("dsd_pending_run_search", False))
+if st.button("Hľadať", type="primary", key="dsd_run") or _dsd_run_search_now:
     try:
         smin = float(strike_od) if use_strike_band else None
         smax = float(strike_do) if use_strike_band else None
@@ -1138,6 +1222,7 @@ if st.button("Hľadať", type="primary", key="dsd_run"):
             iv_short_ge_long_margin=float(iv_margin) if use_iv_sl else 0.0,
             strike_proximity_leg=_strike_leg,
             relax_exclude_otm=bool(st.session_state.get("dsd_relax_exclude_otm", False)),
+            require_same_strike=bool(_require_same_strike),
         )
         _precheck = dss.diagonal_search_precheck_warnings_markdown(
             ticker, as_of_date=as_of, strategy=strategy, opt=search_opts
