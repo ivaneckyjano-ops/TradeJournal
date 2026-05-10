@@ -16,11 +16,13 @@ import streamlit as st
 
 from core import database as db
 from core import ibkr
-from core.greeks import calc_iv, iv_display_to_bs_fraction, spot_for_abs_delta_bs
+from core.greeks import bs_price, calc_iv, iv_display_to_bs_fraction, spot_for_abs_delta_bs
 from core.ib_row_extract import ParsedIbRow, ocr_image_to_text, parse_ibkr_row_text
 from core.journal_pnl_curve import (
+    _iv_fraction_for_leg,
     _journal_leg_instrument_label as _journal_leg_instrument_label_ui,
     _legs_display_order as _legs_display_order_ui,
+    _right_bs,
     _single_leg_pl_now_usd,
     journal_group_pl_ladder_tws_style_rows,
     journal_group_pl_stoploss_short_window,
@@ -28,6 +30,7 @@ from core.journal_pnl_curve import (
     journal_spot_levels_descending,
 )
 from core.portfolio_data import (
+    calc_dte,
     find_ibkr_option_for_trade,
     greek_for_trade,
     ib_opt_greeks_scaled_for_journal,
@@ -690,6 +693,70 @@ def _journal_resolve_spot_for_pl(ticker: str, ib_positions: list[dict]) -> tuple
         return float(ibs), "IB STK (portfólio)"
     s = _journal_symbol_spot_usd(tk)
     return s, "Symboly" if s is not None else None
+
+
+def _journal_long_leg_ib_market_value_usd(trade: dict, ib_positions: list[dict]) -> float | None:
+    """Aktuálna trhová hodnota Long nohy z IB cache (USD za celú pozíciu), alebo None."""
+    if str(trade.get("leg_type") or "").strip().capitalize() != "Long":
+        return None
+    p = find_ibkr_option_for_trade(trade, ib_positions)
+    if not p:
+        return None
+    return _journal_ib_opt_market_value_line(p)
+
+
+def _journal_long_leg_bs_mark_value_usd(trade: dict, spot_anchor: float, r: float = 0.045) -> float | None:
+    """
+    Teoretická hodnota Long nohy (USD): BS cena opcie pri ``spot_anchor`` × kontrakty × 100.
+    IV z journalu rovnako ako pri ostatných BS grafoch v časopise.
+    """
+    if str(trade.get("leg_type") or "").strip().capitalize() != "Long":
+        return None
+    try:
+        sf = float(spot_anchor)
+    except (TypeError, ValueError):
+        return None
+    if sf <= 0 or math.isnan(sf):
+        return None
+    dte = calc_dte(trade.get("expiry"))
+    if dte is None:
+        return None
+    try:
+        K = float(trade.get("strike") or 0)
+        c_abs = abs(float(trade.get("contracts") or 1))
+    except (TypeError, ValueError):
+        return None
+    if K <= 0 or c_abs <= 0:
+        return None
+    iv = _iv_fraction_for_leg(trade)
+    Tn = max(1.0 / 365.0, float(dte) / 365.0)
+    right = _right_bs(trade.get("option_type"))
+    if Tn <= 0.0 or iv <= 0.0:
+        px = bs_price(sf, K, 0.0, max(iv, 1e-6), right, r)
+    else:
+        px = bs_price(sf, K, Tn, iv, right, r)
+    return float(px) * c_abs * 100.0
+
+
+def _journal_long_leg_assignment_column_usd(
+    trade: dict,
+    ib_positions: list[dict],
+    spot_anchor: float | None,
+    r: float = 0.045,
+) -> tuple[float | None, str]:
+    """
+    Hodnota do stĺpca PL pre Long: IB trhová hodnota, inak BS teoretická hodnota pri ``spot_anchor``.
+    Vráti (USD, ``\"ib\"`` | ``\"bs\"`` | ``\"\"``).
+    """
+    mv_ib = _journal_long_leg_ib_market_value_usd(trade, ib_positions)
+    if mv_ib is not None:
+        return float(mv_ib), "ib"
+    if spot_anchor is None:
+        return None, ""
+    bs_mv = _journal_long_leg_bs_mark_value_usd(trade, float(spot_anchor), r=r)
+    if bs_mv is not None:
+        return float(bs_mv), "bs"
+    return None, ""
 
 
 def _assignment_short_pl_usd(trade: dict, spot: float | None) -> float | None:
@@ -1834,18 +1901,74 @@ else:
                         )
 
                     with st.expander(
-                        "Assignment — P/L pri uplatnení (štýl TWS)",
+                        "PL pri uplatnení",
                         expanded=False,
                     ):
                         _tk_asn = str(legs_edit[0].get("ticker") or "").strip().upper() if legs_edit else ""
                         _hi_asn, _src_asn_hi = _journal_resolve_spot_for_pl(_tk_asn, _pf_live_pos)
                         if _hi_asn is not None and float(_hi_asn) > 0:
-                            st.caption(
-                                "Rovnaký layout ako **Tabuľka P&L vs. spot**: pre každý scenár **spot** riadky nôh a **Σ NET** "
-                                "(tu len súčet **short** nôh — jednoduchý scenár **|prémia| + K − spot** na akciu, "
-                                "**× kontrakty × 100**, bez poplatkov). Long nohy: stĺpec P&L prázdny (tento scenár ich netýka). "
-                                f"**Horný spot** v rebríku = **{_hi_asn:.2f}** ({_src_asn_hi or '—'})."
+                            _long_pl_by_tid: dict[int, float] = {}
+                            _long_src_by_tid: dict[int, str] = {}
+                            for _lg in legs_edit:
+                                if str(_lg.get("leg_type") or "").strip().capitalize() != "Long":
+                                    continue
+                                _lid = _lg.get("id")
+                                if _lid is None:
+                                    continue
+                                _val, _src = _journal_long_leg_assignment_column_usd(
+                                    _lg, _pf_live_pos, float(_hi_asn)
+                                )
+                                if _val is not None:
+                                    _long_pl_by_tid[int(_lid)] = float(_val)
+                                    _long_src_by_tid[int(_lid)] = _src
+                            _long_sum = sum(_long_pl_by_tid.values())
+                            _has_any_long = any(
+                                str(lg.get("leg_type") or "").strip().capitalize() == "Long"
+                                for lg in legs_edit
                             )
+                            _src_set = set(_long_src_by_tid.values())
+                            if _long_pl_by_tid:
+                                _sum_note = f" **Σ Long (PL):** {int(round(_long_sum))} USD."
+                                if _src_set == {"ib"}:
+                                    _sum_note += " Všetky Long z IB."
+                                elif _src_set == {"bs"}:
+                                    _sum_note += " Všetky Long z BS modelu (zhoda IB chýba)."
+                                elif _src_set <= {"ib", "bs"} and len(_src_set) > 1:
+                                    _sum_note += " Long: kombinácia IB a BS."
+                            elif _has_any_long:
+                                _sum_note = (
+                                    " Long: dopln **Obnoviť údaje z TWS** alebo úplné údaje nohy "
+                                    "(expirácia, strike, IV), aby sa doplnil PL."
+                                )
+                            else:
+                                _sum_note = ""
+
+                            with st.expander(
+                                "Čo znamenajú čísla — rozšíriť",
+                                expanded=False,
+                            ):
+                                st.markdown(
+                                    """
+**Čo znamenajú čísla** (bez poplatkov, orientačne):
+
+- **Short — PL:** pre **Spot** v danom riadku tabuľky: na 1 akciu podkladu  
+  **|vstupná prémia| + strike − spot**, na celú nohu **× počet kontraktov × 100**.  
+  Ide o zjednodušený scenár uplatnenia dodania podkladu pri **strike**.
+
+- **Long — PL:** najprv **aktuálna trhová hodnota z IB** (cena kontraktu × kontrakty × 100, longové znamienko ako v cache).  
+  Ak sa noha s TWS **nespáruje**, doplní sa **Black–Scholes**: teoretická cena opcie pri **referenčnom spote** (horný riadok rebríka = aktuálny referenčný spot podkladu), čas do expirácie z expirácie nohy, IV z žurnálu (**IV aktuálna / IV vstup**; ak nič — ako pri grafoch v časopise, často základ 30 %).  
+  Hodnota Long je **v celej tabuľke rovnaká** (nezávisí od stĺpca Spot); mení sa len **krátka** časť podľa scenára.
+
+- **Σ NET:** súčet PL všetkých nôh v danom riadku (**krátka** podľa daného Spot + **dlhá** ako vyššie).
+
+**Layout:** rovnaký ako tabuľka **P&L vs. spot** — pre každý scenár spot riadky nôh a **Σ NET**. Krátka noha: PL závisí od **Spot** v riadku. Dlhá noha: PL podľa IB alebo BS.
+"""
+                                )
+                                st.markdown(
+                                    f"**Referenčný spot** (horný v rebríku) = **{_hi_asn:.2f}** ({_src_asn_hi or '—'})."
+                                    + _sum_note
+                                )
+
                             _ac1, _ac2 = st.columns(2)
                             with _ac1:
                                 _asn_lo = st.number_input(
@@ -1876,6 +1999,30 @@ else:
                                     _ks = abs(int(round(float(_leg.get("contracts") or 1))))
                                     _ks_signed = _ks if _lt == "Long" else -_ks
                                     _lbl = _journal_leg_instrument_label_ui(_leg)
+                                    if _lt == "Long":
+                                        _lid2 = _leg.get("id")
+                                        _mv_l = (
+                                            _long_pl_by_tid.get(int(_lid2))
+                                            if _lid2 is not None
+                                            else None
+                                        )
+                                        if _mv_l is not None:
+                                            _pi_l = int(round(float(_mv_l)))
+                                            _net_asn += _pi_l
+                                            _pv_l = float(_pi_l)
+                                        else:
+                                            _pv_l = float("nan")
+                                        _asn_tws_rows.append(
+                                            {
+                                                "spot": _spot_r,
+                                                "kontrakt": _lbl,
+                                                "noha": _lt or "—",
+                                                "ks": f"{_ks_signed:+d}",
+                                                "pl_usd": _pv_l,
+                                                "_typ": "noha",
+                                            }
+                                        )
+                                        continue
                                     if _lt != "Short":
                                         _asn_tws_rows.append(
                                             {
@@ -1923,11 +2070,11 @@ else:
                                         "kontrakt": "Kontrakt",
                                         "noha": "Noha",
                                         "ks": "Ks.",
-                                        "pl_usd": "P&L (USD)",
+                                        "pl_usd": "PL (USD)",
                                     }
                                 )
                                 _adf_asn["Spot"] = _adf_asn["Spot"].map(_journal_fmt_spot_cell_str)
-                                _adf_asn["P&L (USD)"] = _adf_asn["P&L (USD)"].map(_journal_fmt_pl_usd_cell_str)
+                                _adf_asn["PL (USD)"] = _adf_asn["PL (USD)"].map(_journal_fmt_pl_usd_cell_str)
                                 _cc_asn: dict = {}
                                 if "Spot" in _adf_asn.columns:
                                     _cc_asn["Spot"] = st.column_config.TextColumn(
@@ -1952,10 +2099,10 @@ else:
                                         help="Kontrakty so znamienkom.",
                                         width="small",
                                     )
-                                if "P&L (USD)" in _adf_asn.columns:
-                                    _cc_asn["P&L (USD)"] = st.column_config.TextColumn(
-                                        "P&L (USD)",
-                                        help="Short: (|prémia| + K − spot)×ks×100. Σ NET = súčet short nôh. Text = zarovnanie.",
+                                if "PL (USD)" in _adf_asn.columns:
+                                    _cc_asn["PL (USD)"] = st.column_config.TextColumn(
+                                        "PL (USD)",
+                                        help="Short: uplatnenie (|prémia| + K − spot)×ks×100. Long: aktuálna MV z IB. Σ NET = Short + Long.",
                                         width="small",
                                     )
                                 st.dataframe(
@@ -1965,12 +2112,11 @@ else:
                                     column_config=_cc_asn,
                                 )
                                 st.caption(
-                                    "**Layout ako v TWS** — rovnaké stĺpce ako tabuľka P&L vs. spot vyššie; "
-                                    "tu len scenár priradenia podkladu pri strike pre short nohy (bez poplatkov)."
+                                    "Stĺpce PL a Σ NET — význam výpočtov je v rozšíriteľnom texte **„Čo znamenajú čísla“** vyššie."
                                 )
                         else:
                             st.caption(
-                                "**Assignment:** dopln **spot** podkladu (IB / Symboly), aby sa dal zobraziť rebrík scenárov."
+                                "**PL pri uplatnení:** dopln **spot** podkladu (IB / Symboly), aby sa dal zobraziť rebrík scenárov."
                             )
 
                 if st.button("Uložiť journal (Gréky, IV, Vega, skupina)", key=f"pf_sv_{_gkey}", type="primary"):

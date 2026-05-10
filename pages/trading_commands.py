@@ -1,6 +1,6 @@
 """
-Obchodné príkazy — lokálny denník plánovaných príkazov (nie synchronizácia s IBKR).
-Postupnosť a údaje z TWS zapisuješ ručne (bez sťahovania z API).
+Obchodné príkazy — plán v journal.db; voliteľné **odoslanie** jedného príkazu do TWS (transmit),
+ak vyplníš kontrakt na zatvorenie a potvrdíš riziká.
 """
 
 from __future__ import annotations
@@ -8,6 +8,7 @@ from __future__ import annotations
 import streamlit as st
 
 from core import database as db
+from core import ibkr
 from core.page_context import set_tradejournal_page
 
 db.init_db()
@@ -50,6 +51,20 @@ _COND_FILL_OPT: list[tuple[str, str]] = [
     ("option_or_underlying", "Až po obchode s opciou alebo s podkladom"),
     ("custom", "Iné — dopíš do poznámky k podmienkam"),
 ]
+_TRIGGER_OPT: list[tuple[str, str]] = [
+    ("manual", "Manuálne — odoslanie po kontrole"),
+    ("short_leg_assignment", "Po uplatnení / priradení short nohy"),
+]
+_CLOSE_SEC_OPT: list[tuple[str, str]] = [
+    ("", "— iba plán v texte (bez IB kontraktu) —"),
+    ("STK", "Akcia (STK)"),
+    ("OPT", "Opčný kontrakt (OPT)"),
+]
+_CLOSE_RIGHT_OPT: list[tuple[str, str]] = [
+    ("", "—"),
+    ("C", "Call"),
+    ("P", "Put"),
+]
 
 
 def _sk_map(pairs: list[tuple[str, str]]) -> dict[str, str]:
@@ -57,6 +72,31 @@ def _sk_map(pairs: list[tuple[str, str]]) -> dict[str, str]:
 
 
 _STATUS_SK = _sk_map(_STATUS_OPT)
+_TRIGGER_SK = _sk_map(_TRIGGER_OPT)
+
+
+def _trade_link_choices() -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = [("", "— bez väzby na obchod v denníku —")]
+    try:
+        trades = db.get_all_trades()
+    except Exception:
+        trades = []
+    for t in trades[:250]:
+        tid = t.get("id")
+        if tid is None:
+            continue
+        tk = str(t.get("ticker") or "").strip()
+        stv = t.get("strike")
+        out.append((str(int(tid)), f"{tid} · {tk} @ {stv}"))
+    return out
+
+
+def _choice_index_val(choices: list[tuple[str, str]], current: str | None) -> int:
+    cur = str(current or "").strip()
+    for i, (k, _) in enumerate(choices):
+        if k == cur:
+            return i
+    return 0
 
 
 def _ticker_choices_from_symbols(*, ensure_ticker: str | None = None) -> list[tuple[str, str]]:
@@ -90,11 +130,12 @@ def _opt_index(options: list[tuple[str, str]], value: str | None) -> int:
 
 st.title("Obchodné príkazy")
 st.caption(
-    "**Návod:** Plán zapisuješ tu v **journal.db** — aplikácia **nesťahuje** objednávky z TWS. "
+    "**Návod:** Plán je v **journal.db**. Môžeš doplniť **kontrakt na zatvorenie** (STK/OPT) a pri "
+    "pripojenom IB odoslať **jeden** skutočný príkaz do TWS po dvojitom potvrdení (slovom ASSIGN). "
     "Ticker vyberáš zo záložky **Symboly**. "
-    "V sekcii **Podmienky** môžeš ručne zapísať plán: **cena podkladu** voči hranici a či má predchádzať **obchod s opciou / podkladom** (iba zápis pre teba, nie automatika). "
-    "Postupnosť krokov: **Skupina postupnosti** + **Krok**. "
-    "Údaje z TWS po odoslaní: **Perm ID** / **Order ID**."
+    "V sekcii **Podmienky** je len vlastný plán (nie automatika). "
+    "Postupnosť: **Skupina postupnosti** + **Krok**. "
+    "Údaje z TWS: **Perm ID** / **Order ID** (doplnia sa po odoslaní alebo ručne)."
 )
 
 _sym_raw = db.get_symbol_tickers()
@@ -121,6 +162,11 @@ def _fmt_cmd_line(r: dict) -> str:
         bits.append(f"〔{pg}〕")
     if (str(r.get("tws_perm_id") or "")).strip() or (str(r.get("tws_order_id") or "")).strip():
         bits.append("TWS✎")
+    tg = str(r.get("trigger_kind") or "").strip().lower()
+    if tg == "short_leg_assignment":
+        bits.append("Po assign.")
+    if (str(r.get("close_sec_type") or "")).strip():
+        bits.append(str(r.get("close_sec_type")).strip())
     if (
         (str(r.get("cond_under_cmp") or "")).strip()
         or (str(r.get("cond_after_fill") or "")).strip()
@@ -186,6 +232,45 @@ with st.expander("➕ Nový príkaz", expanded=False):
             height=70,
             placeholder="Voliteľné doplnenie k výberom vyššie",
         )
+        st.markdown("**Kontrakt na zatvorenie (IBKR)** — pre odoslanie príkazu do TWS")
+        n_trig = st.selectbox(
+            "Spúšťacia logika pre odoslanie",
+            options=_TRIGGER_OPT,
+            format_func=lambda x: x[1],
+            index=_opt_index(_TRIGGER_OPT, "manual"),
+            help="Pri „Po uplatnení short nohy“ musíš pri odoslaní potvrdiť assignment.",
+        )
+        n_cls = st.selectbox(
+            "Čo obchodovať v TWS",
+            options=_CLOSE_SEC_OPT,
+            format_func=lambda x: x[1],
+            index=0,
+        )
+        oc1, oc2, oc3 = st.columns(3)
+        with oc1:
+            n_cex = st.text_input(
+                "Expirácia (YYYYMMDD)",
+                value="",
+                placeholder="20260320",
+                help="Len pre typ OPT.",
+            )
+        with oc2:
+            n_cst = st.number_input("Strike ($)", value=0.0, step=0.01, format="%.2f")
+        with oc3:
+            n_crt = st.selectbox(
+                "Call / Put",
+                options=_CLOSE_RIGHT_OPT,
+                format_func=lambda x: x[1],
+                index=0,
+            )
+        _lnk_new = _trade_link_choices()
+        n_link = st.selectbox(
+            "Väzba na obchod v denníku",
+            options=_lnk_new,
+            format_func=lambda x: x[1],
+            index=_choice_index_val(_lnk_new, ""),
+            help="Voliteľné.",
+        )
         nb = st.text_area("Detail / čas / vlastný popis príkazu", height=100, placeholder="Voliteľné")
         st.markdown("**Postupnosť** (voliteľné — rovnaký text = jedna logická séria)")
         pc1, pc2 = st.columns(2)
@@ -237,6 +322,14 @@ with st.expander("➕ Nový príkaz", expanded=False):
                         cond_under_price=float(n_cpx) if n_cmp[0] else None,
                         cond_after_fill=n_fill[0] or None,
                         cond_detail=n_cdet.strip() or None,
+                        trigger_kind=n_trig[0],
+                        close_sec_type=n_cls[0] or None,
+                        close_expiry=n_cex.strip() if n_cls[0] == "OPT" else None,
+                        close_strike=n_cst if n_cls[0] == "OPT" else None,
+                        close_right=n_crt[0] if n_cls[0] == "OPT" else None,
+                        linked_trade_id=int(n_link[0])
+                        if str(n_link[0] or "").strip().isdigit()
+                        else None,
                     )
                     st.success("Príkaz uložený.")
                     st.rerun()
@@ -283,6 +376,18 @@ else:
                 st.caption(f"Predchádzajúci obchod: {_lfb}")
             if (str(r.get("cond_detail") or "")).strip():
                 st.caption(f"Doplnenie: {str(r.get('cond_detail') or '').strip()[:200]}{'…' if len(str(r.get('cond_detail') or '')) > 200 else ''}")
+            _tkm = str(r.get("trigger_kind") or "").strip().lower()
+            if _tkm:
+                st.caption(f"Spúšťacia logika: {_TRIGGER_SK.get(_tkm, _tkm)}")
+            _cx = str(r.get("close_sec_type") or "").strip()
+            if _cx:
+                _ex = ""
+                if _cx == "OPT":
+                    _ex = f" · exp **{r.get('close_expiry') or ''}** strike **{r.get('close_strike')}** {r.get('close_right') or ''}"
+                st.caption(f"Kontrakt na zatvorenie: **{_cx}**{_ex}")
+            _lid = r.get("linked_trade_id")
+            if _lid:
+                st.caption(f"Väzba na obchod ID **{_lid}**")
             with st.form(f"tc_edit_{rid}"):
                 et = st.text_input("Názov", value=str(r.get("title") or ""), key=f"t_{rid}_title")
                 _ed_sym = _ticker_choices_from_symbols(ensure_ticker=r.get("ticker"))
@@ -347,6 +452,57 @@ else:
                     value=str(r.get("cond_detail") or ""),
                     height=70,
                     key=f"t_{rid}_cdet",
+                )
+                st.markdown("**Kontrakt na zatvorenie (IBKR)**")
+                etrg = st.selectbox(
+                    "Spúšťacia logika pre odoslanie",
+                    options=_TRIGGER_OPT,
+                    format_func=lambda x: x[1],
+                    index=_opt_index(_TRIGGER_OPT, r.get("trigger_kind")),
+                    key=f"t_{rid}_trg",
+                    help="Pri „Po uplatnení short nohy“ musíš pri odoslaní potvrdiť assignment.",
+                )
+                ecls = st.selectbox(
+                    "Čo obchodovať v TWS",
+                    options=_CLOSE_SEC_OPT,
+                    format_func=lambda x: x[1],
+                    index=_choice_index_val(_CLOSE_SEC_OPT, str(r.get("close_sec_type") or "")),
+                    key=f"t_{rid}_cls",
+                )
+                _ev_cex = str(r.get("close_expiry") or "")
+                _ev_cst = float(r["close_strike"]) if r.get("close_strike") is not None else 0.0
+                ec1, ec2, ec3 = st.columns(3)
+                with ec1:
+                    e_cex = st.text_input(
+                        "Expirácia (YYYYMMDD)",
+                        value=_ev_cex,
+                        key=f"t_{rid}_cex",
+                        placeholder="20260320",
+                    )
+                with ec2:
+                    e_cst = st.number_input(
+                        "Strike ($)",
+                        value=_ev_cst,
+                        step=0.01,
+                        format="%.2f",
+                        key=f"t_{rid}_cstk",
+                    )
+                with ec3:
+                    e_crt = st.selectbox(
+                        "Call / Put",
+                        options=_CLOSE_RIGHT_OPT,
+                        format_func=lambda x: x[1],
+                        index=_choice_index_val(_CLOSE_RIGHT_OPT, str(r.get("close_right") or "").strip()),
+                        key=f"t_{rid}_crt",
+                    )
+                _ed_lnk = _trade_link_choices()
+                _li = str(r.get("linked_trade_id") or "").strip()
+                elink = st.selectbox(
+                    "Väzba na obchod v denníku",
+                    options=_ed_lnk,
+                    format_func=lambda x: x[1],
+                    index=_choice_index_val(_ed_lnk, _li),
+                    key=f"t_{rid}_lnk",
                 )
                 st.markdown("**Postupnosť**")
                 ec1, ec2 = st.columns(2)
@@ -415,6 +571,14 @@ else:
                                 cond_under_price=float(ed_cpx) if ed_cmp[0] else None,
                                 cond_after_fill=ed_fill[0] or None,
                                 cond_detail=ed_cdet.strip() or None,
+                                trigger_kind=etrg[0],
+                                close_sec_type=ecls[0] or None,
+                                close_expiry=e_cex.strip() if ecls[0] == "OPT" else None,
+                                close_strike=e_cst if ecls[0] == "OPT" else None,
+                                close_right=e_crt[0] if ecls[0] == "OPT" else None,
+                                linked_trade_id=int(elink[0])
+                                if str(elink[0] or "").strip().isdigit()
+                                else None,
                                 _all_fields=True,
                             )
                             st.success("Uložené.")
@@ -429,7 +593,81 @@ else:
                         st.rerun()
                     except Exception as e:
                         st.error(f"{type(e).__name__}: {e}")
-
+            if ibkr.is_connected():
+                st.divider()
+                st.markdown("**Odoslanie do TWS** (skutočný príkaz, `transmit=True`)")
+                _row = db.get_trading_command(rid) or r
+                _st = str(_row.get("status") or "").strip().lower()
+                _ttr = str(_row.get("trigger_kind") or "manual").strip().lower()
+                _csk = str(_row.get("close_sec_type") or "").strip().upper()
+                _can = _st in ("draft", "ready") and _csk in ("STK", "OPT")
+                if not _can:
+                    st.caption(
+                        "Odoslanie je možné len v stave **Koncept** alebo **Pripravené** a s typom kontraktu **STK** alebo **OPT**. "
+                        "Najprv **Uložiť zmeny** vo formulári vyššie."
+                    )
+                with st.form(f"tc_send_{rid}"):
+                    st.caption(
+                        "Použijú sa údaje **uložené v DB** (po uložení). Skontroluj smer, typ, množstvo a limity."
+                    )
+                    cb_risk = st.checkbox(
+                        "Beriem na vedomie, že sa odošle skutočný príkaz na účet pripojený v TWS.",
+                        key=f"tc_risk_{rid}",
+                    )
+                    cb_asg = st.checkbox(
+                        "Potvrdzujem uplatnenie / priradenie short nohy (assignment).",
+                        key=f"tc_asg_{rid}",
+                        disabled=_ttr != "short_leg_assignment",
+                    )
+                    typed = st.text_input(
+                        'Potvrdenie: napíš slovo **ASSIGN** (presne)',
+                        key=f"tc_assign_txt_{rid}",
+                        placeholder="ASSIGN",
+                    )
+                    submitted_send = st.form_submit_button("Odoslať príkaz do TWS", type="primary")
+                    if submitted_send:
+                        if not _can:
+                            st.error("Nesplnené podmienky pre odoslanie (stav alebo kontrakt). Ulož zmeny a skontroluj STK/OPT.")
+                        elif not cb_risk:
+                            st.error("Potvrď riziko (prvé zaškrtávacie políčko).")
+                        elif _ttr == "short_leg_assignment" and not cb_asg:
+                            st.error('Pri spúšťacej logike „Po uplatnení short nohy“ potvrď assignment.')
+                        elif (typed or "").strip() != "ASSIGN":
+                            st.error("Pre odoslanie napíš presne ASSIGN.")
+                        else:
+                            snap = db.get_trading_command(rid)
+                            if not snap:
+                                st.error("Záznam sa nenašiel.")
+                            else:
+                                res = ibkr.submit_trading_command_order(snap)
+                                if res.get("error"):
+                                    st.error(res["error"])
+                                else:
+                                    note_prev = (snap.get("tws_manual_note") or "").strip()
+                                    note_add = (
+                                        f"{note_prev}\n" if note_prev else ""
+                                    ) + "Odoslané z TradeJournal (IBKR transmit)."
+                                    try:
+                                        db.update_trading_command(
+                                            rid,
+                                            status="submitted",
+                                            tws_perm_id=res.get("perm_id"),
+                                            tws_order_id=res.get("order_id"),
+                                            tws_manual_note=note_add.strip(),
+                                        )
+                                        st.success(
+                                            f"Odoslané. Perm ID **{res.get('perm_id')}**"
+                                            + (
+                                                f", Order ID **{res.get('order_id')}**"
+                                                if res.get("order_id")
+                                                else ""
+                                            )
+                                        )
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"{type(e).__name__}: {e}")
+            else:
+                st.caption("Pre odoslanie príkazu do TWS pripoj **Interactive Brokers** (sidebar).")
 
 _n = st.session_state.pop("tc_notice", None)
 if _n:

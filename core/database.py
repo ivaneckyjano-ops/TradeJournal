@@ -211,6 +211,12 @@ def _migrate_trading_commands(conn: sqlite3.Connection) -> None:
         "cond_under_price": "ALTER TABLE trading_commands ADD COLUMN cond_under_price REAL",
         "cond_after_fill": "ALTER TABLE trading_commands ADD COLUMN cond_after_fill TEXT",
         "cond_detail": "ALTER TABLE trading_commands ADD COLUMN cond_detail TEXT",
+        "trigger_kind": "ALTER TABLE trading_commands ADD COLUMN trigger_kind TEXT",
+        "close_sec_type": "ALTER TABLE trading_commands ADD COLUMN close_sec_type TEXT",
+        "close_expiry": "ALTER TABLE trading_commands ADD COLUMN close_expiry TEXT",
+        "close_strike": "ALTER TABLE trading_commands ADD COLUMN close_strike REAL",
+        "close_right": "ALTER TABLE trading_commands ADD COLUMN close_right TEXT",
+        "linked_trade_id": "ALTER TABLE trading_commands ADD COLUMN linked_trade_id INTEGER",
     }.items():
         if col not in existing:
             conn.execute(sql)
@@ -2141,6 +2147,9 @@ def _tc_step_index(v: Any) -> Optional[int]:
 
 _ALLOWED_COND_UNDER_CMP = frozenset({"gt", "lt", "gte", "lte"})
 _ALLOWED_COND_AFTER_FILL = frozenset({"option", "underlying", "option_or_underlying", "custom"})
+_ALLOWED_TRIGGER_KIND = frozenset({"manual", "short_leg_assignment"})
+_ALLOWED_CLOSE_SEC_TYPE = frozenset({"STK", "OPT"})
+_ALLOWED_CLOSE_RIGHT = frozenset({"C", "P"})
 
 
 def _tc_cond_under_cmp(raw: Optional[str]) -> Optional[str]:
@@ -2153,6 +2162,95 @@ def _tc_cond_after_fill(raw: Optional[str]) -> Optional[str]:
     if not s:
         return None
     return s if s in _ALLOWED_COND_AFTER_FILL else None
+
+
+def _tc_trigger_kind(raw: Optional[str]) -> str:
+    s = (raw or "").strip().lower()
+    if not s:
+        return "manual"
+    if s not in _ALLOWED_TRIGGER_KIND:
+        raise ValueError(f"Neplatný trigger_kind: {raw!r}. Povolené: {sorted(_ALLOWED_TRIGGER_KIND)}.")
+    return s
+
+
+def _tc_close_sec_type(raw: Optional[str]) -> Optional[str]:
+    s = (raw or "").strip().upper()
+    if not s:
+        return None
+    if s not in _ALLOWED_CLOSE_SEC_TYPE:
+        raise ValueError(f"Neplatný close_sec_type: {raw!r}. Povolené: {sorted(_ALLOWED_CLOSE_SEC_TYPE)}.")
+    return s
+
+
+def _tc_close_right(raw: Optional[str]) -> Optional[str]:
+    s = (raw or "").strip().upper()[:1]
+    if not s:
+        return None
+    if s not in _ALLOWED_CLOSE_RIGHT:
+        raise ValueError(f"Neplatný close_right: {raw!r}. Povolené: C, P.")
+    return s
+
+
+def _tc_close_expiry_yyyymmdd(raw: Optional[str]) -> Optional[str]:
+    """Normalizuje na YYYYMMDD alebo None."""
+    if raw is None:
+        return None
+    s = str(raw).strip().replace("-", "")
+    if not s:
+        return None
+    if len(s) >= 8 and s[:8].isdigit():
+        return s[:8]
+    raise ValueError(f"Neplatná expirácia (očakávam YYYYMMDD): {raw!r}.")
+
+
+def _tc_linked_trade_id(raw: Any) -> Optional[int]:
+    if raw is None:
+        return None
+    try:
+        i = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return i if i > 0 else None
+
+
+def _normalize_tc_close_fields(
+    *,
+    close_sec_type: Optional[str],
+    close_expiry: Optional[str],
+    close_strike: Any,
+    close_right: Optional[str],
+) -> tuple[Optional[str], Optional[str], Optional[float], Optional[str]]:
+    """Vráti (close_sec_type, close_expiry, close_strike, close_right) pre zápis do DB."""
+    cst = _tc_close_sec_type(close_sec_type)
+    cex: Optional[str] = None
+    csr: Optional[str] = None
+    cstk: Optional[float] = None
+    if cst == "OPT":
+        cex = _tc_close_expiry_yyyymmdd(close_expiry)
+        csr = _tc_close_right(close_right)
+        if cex is None or csr is None:
+            raise ValueError("Pre kontrakt OPT vyplň expiráciu (YYYYMMDD) a typ (Call/Put).")
+        try:
+            cstk = float(close_strike) if close_strike is not None else None
+        except (TypeError, ValueError) as e:
+            raise ValueError("Neplatný strike pre OPT.") from e
+        if cstk is None or cstk <= 0:
+            raise ValueError("Pre kontrakt OPT vyplň strike väčší ako 0.")
+    else:
+        hx = str(close_expiry or "").strip()
+        hr = str(close_right or "").strip()
+        hs_raw = close_strike
+        hs = 0.0
+        try:
+            if hs_raw is not None and str(hs_raw).strip() != "":
+                hs = float(hs_raw)
+        except (TypeError, ValueError) as e:
+            raise ValueError("Neplatný strike — vyber typ OPT alebo vymaž strike.") from e
+        if cst is None and (hx or hr or hs > 0):
+            raise ValueError(
+                "Vyber **Typ kontraktu na zatvorenie** „Opčný kontrakt (OPT)“, ak chceš vyplniť expiráciu/strike."
+            )
+    return cst, cex, cstk, csr
 
 
 def insert_trading_command(
@@ -2175,6 +2273,12 @@ def insert_trading_command(
     cond_under_price: Optional[float] = None,
     cond_after_fill: Optional[str] = None,
     cond_detail: Optional[str] = None,
+    trigger_kind: Optional[str] = None,
+    close_sec_type: Optional[str] = None,
+    close_expiry: Optional[str] = None,
+    close_strike: Optional[float] = None,
+    close_right: Optional[str] = None,
+    linked_trade_id: Any = None,
 ) -> int:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     tit = (title or "").strip()
@@ -2190,14 +2294,26 @@ def insert_trading_command(
     cpx = cond_under_price if ccmp is not None else None
     caf = _tc_cond_after_fill(cond_after_fill)
     cdt = (cond_detail or "").strip() or None
+    tk = _tc_trigger_kind(trigger_kind)
+    cst, cex, cstk, csr = _normalize_tc_close_fields(
+        close_sec_type=close_sec_type,
+        close_expiry=close_expiry,
+        close_strike=close_strike,
+        close_right=close_right,
+    )
+    ltid = _tc_linked_trade_id(linked_trade_id)
+    if ltid is not None:
+        if get_trade_by_id(ltid) is None:
+            raise ValueError(f"Obchod linked_trade_id={ltid} neexistuje.")
     with get_connection() as conn:
         cur = conn.execute(
             """
             INSERT INTO trading_commands
             (created_at, updated_at, title, ticker, action, order_kind, quantity, limit_price, stop_price, body, status,
              plan_group, step_index, tws_perm_id, tws_order_id, tws_manual_note,
-             cond_under_cmp, cond_under_price, cond_after_fill, cond_detail)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             cond_under_cmp, cond_under_price, cond_after_fill, cond_detail,
+             trigger_kind, close_sec_type, close_expiry, close_strike, close_right, linked_trade_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 now,
@@ -2220,6 +2336,12 @@ def insert_trading_command(
                 cpx,
                 caf,
                 cdt,
+                tk,
+                cst,
+                cex,
+                cstk,
+                csr,
+                ltid,
             ),
         )
         conn.commit()
@@ -2284,6 +2406,12 @@ def update_trading_command(
     cond_under_price: Optional[float] = None,
     cond_after_fill: Optional[str] = None,
     cond_detail: Optional[str] = None,
+    trigger_kind: Optional[str] = None,
+    close_sec_type: Optional[str] = None,
+    close_expiry: Optional[str] = None,
+    close_strike: Optional[float] = None,
+    close_right: Optional[str] = None,
+    linked_trade_id: Any = None,
     _all_fields: bool = False,
 ) -> int:
     """
@@ -2314,6 +2442,21 @@ def update_trading_command(
         m["cond_under_price"] = cond_under_price if m["cond_under_cmp"] else None
         m["cond_after_fill"] = _tc_cond_after_fill(cond_after_fill)
         m["cond_detail"] = (cond_detail or "").strip() or None
+        m["trigger_kind"] = _tc_trigger_kind(trigger_kind)
+        cst_u, cex_u, cstk_u, csr_u = _normalize_tc_close_fields(
+            close_sec_type=close_sec_type,
+            close_expiry=close_expiry,
+            close_strike=close_strike,
+            close_right=close_right,
+        )
+        m["close_sec_type"] = cst_u
+        m["close_expiry"] = cex_u
+        m["close_strike"] = cstk_u
+        m["close_right"] = csr_u
+        lt_u = _tc_linked_trade_id(linked_trade_id)
+        if lt_u is not None and get_trade_by_id(lt_u) is None:
+            raise ValueError(f"Obchod linked_trade_id={lt_u} neexistuje.")
+        m["linked_trade_id"] = lt_u
     else:
         if title is not None:
             m["title"] = (title or "").strip() or m["title"]
@@ -2350,6 +2493,24 @@ def update_trading_command(
             m["cond_after_fill"] = _tc_cond_after_fill(cond_after_fill)
         if cond_detail is not None:
             m["cond_detail"] = (cond_detail or "").strip() or None
+        if trigger_kind is not None:
+            m["trigger_kind"] = _tc_trigger_kind(trigger_kind)
+        if close_sec_type is not None or close_expiry is not None or close_strike is not None or close_right is not None:
+            cst_u, cex_u, cstk_u, csr_u = _normalize_tc_close_fields(
+                close_sec_type=close_sec_type if close_sec_type is not None else m.get("close_sec_type"),
+                close_expiry=close_expiry if close_expiry is not None else m.get("close_expiry"),
+                close_strike=close_strike if close_strike is not None else m.get("close_strike"),
+                close_right=close_right if close_right is not None else m.get("close_right"),
+            )
+            m["close_sec_type"] = cst_u
+            m["close_expiry"] = cex_u
+            m["close_strike"] = cstk_u
+            m["close_right"] = csr_u
+        if linked_trade_id is not None:
+            lt_u = _tc_linked_trade_id(linked_trade_id)
+            if lt_u is not None and get_trade_by_id(lt_u) is None:
+                raise ValueError(f"Obchod linked_trade_id={lt_u} neexistuje.")
+            m["linked_trade_id"] = lt_u
     with get_connection() as conn:
         conn.execute(
             """
@@ -2357,7 +2518,8 @@ def update_trading_command(
                 updated_at = ?, title = ?, ticker = ?, action = ?, order_kind = ?,
                 quantity = ?, limit_price = ?, stop_price = ?, body = ?, status = ?,
                 plan_group = ?, step_index = ?, tws_perm_id = ?, tws_order_id = ?, tws_manual_note = ?,
-                cond_under_cmp = ?, cond_under_price = ?, cond_after_fill = ?, cond_detail = ?
+                cond_under_cmp = ?, cond_under_price = ?, cond_after_fill = ?, cond_detail = ?,
+                trigger_kind = ?, close_sec_type = ?, close_expiry = ?, close_strike = ?, close_right = ?, linked_trade_id = ?
             WHERE id = ?
             """,
             (
@@ -2380,6 +2542,12 @@ def update_trading_command(
                 m.get("cond_under_price"),
                 m.get("cond_after_fill"),
                 m.get("cond_detail"),
+                m.get("trigger_kind") or "manual",
+                m.get("close_sec_type"),
+                m.get("close_expiry"),
+                m.get("close_strike"),
+                m.get("close_right"),
+                m.get("linked_trade_id"),
                 int(cmd_id),
             ),
         )

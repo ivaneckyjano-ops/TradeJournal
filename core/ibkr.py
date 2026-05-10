@@ -2243,6 +2243,140 @@ def sync_fills_to_db(fills: list[dict], db_module) -> dict:
     return {"added": added, "skipped": skipped, "closed": closed}
 
 
+def submit_trading_command_order(cmd: dict) -> dict:
+    """
+    Odošle jeden príkaz z uloženého záznamu (``trading_commands``) do TWS s ``transmit=True``.
+
+    Očakáva polia: ``ticker``, ``action`` (buy/sell), ``order_kind``, ``quantity``,
+    voliteľne ``limit_price``, ``stop_price``, ``close_sec_type`` (STK|OPT),
+    pre OPT: ``close_expiry`` (YYYYMMDD), ``close_strike``, ``close_right`` (C|P).
+    """
+    ib = get_ib()
+    if not ib or not ib.isConnected():
+        return {"error": "Nie je pripojenie na IBKR.", "perm_id": None, "order_id": None}
+
+    _ib_ready()
+    from ib_insync import LimitOrder, MarketOrder, Option as IBOption, StopOrder, Stock
+
+    sym = (cmd.get("ticker") or "").strip().upper()
+    if not sym:
+        return {"error": "Chýba ticker.", "perm_id": None, "order_id": None}
+
+    action_raw = (cmd.get("action") or "").strip().lower()
+    if action_raw not in ("buy", "sell"):
+        return {"error": "Vyber smer príkazu (nákup / predaj).", "perm_id": None, "order_id": None}
+    ib_action = "BUY" if action_raw == "buy" else "SELL"
+
+    okind = (cmd.get("order_kind") or "").strip().lower()
+    if okind == "bracket":
+        return {
+            "error": "Typ „Bracket / combo“ zatiaľ nie je podporovaný pre priame odoslanie — zvoľ Limit, Trh alebo Stop.",
+            "perm_id": None,
+            "order_id": None,
+        }
+    if okind not in ("market", "limit", "stop"):
+        return {"error": "Vyber typ príkazu (Limit / Trh / Stop).", "perm_id": None, "order_id": None}
+
+    try:
+        qty_f = float(cmd.get("quantity") or 0)
+    except (TypeError, ValueError):
+        qty_f = 0.0
+    if qty_f <= 0:
+        return {"error": "Množstvo musí byť väčšie ako 0.", "perm_id": None, "order_id": None}
+
+    sec = (cmd.get("close_sec_type") or "").strip().upper()
+    if sec not in ("STK", "OPT"):
+        return {"error": "Vyber kontrakt na zatvorenie: Akcia (STK) alebo Opčný kontrakt (OPT).", "perm_id": None, "order_id": None}
+
+    try:
+        if sec == "STK":
+            contract = Stock(sym, "SMART", "USD")
+        else:
+            exp = str(cmd.get("close_expiry") or "").strip().replace("-", "")[:8]
+            if len(exp) != 8 or not exp.isdigit():
+                return {"error": "Pre OPT vyplň expiráciu YYYYMMDD.", "perm_id": None, "order_id": None}
+            try:
+                strike = float(cmd.get("close_strike") or 0)
+            except (TypeError, ValueError):
+                strike = 0.0
+            if strike <= 0:
+                return {"error": "Pre OPT vyplň platný strike.", "perm_id": None, "order_id": None}
+            right = (cmd.get("close_right") or "").strip().upper()[:1]
+            if right not in ("C", "P"):
+                return {"error": "Pre OPT vyber Call alebo Put.", "perm_id": None, "order_id": None}
+            contract = IBOption(sym, exp, strike, right, "SMART", currency="USD")
+    except Exception as e:
+        return {"error": f"Kontrakt: {type(e).__name__}: {e}", "perm_id": None, "order_id": None}
+
+    try:
+        qualified = ib.qualifyContracts(contract)
+        c = qualified[0] if qualified else contract
+        if not getattr(c, "conId", None):
+            return {"error": "Kontrakt sa nepodarilo kvalifikovať v IB.", "perm_id": None, "order_id": None}
+    except Exception as e:
+        return {"error": f"qualifyContracts: {type(e).__name__}: {e}", "perm_id": None, "order_id": None}
+
+    try:
+        lp = cmd.get("limit_price")
+        sp = cmd.get("stop_price")
+        lf = float(lp) if lp is not None else None
+        sf = float(sp) if sp is not None else None
+    except (TypeError, ValueError):
+        lf = sf = None
+
+    if okind == "market":
+        order = MarketOrder(ib_action, qty_f)
+    elif okind == "limit":
+        if lf is None or lf <= 0:
+            return {"error": "Pri limite vyplň kladnú cenu limitu.", "perm_id": None, "order_id": None}
+        order = LimitOrder(ib_action, qty_f, lf)
+    else:
+        if sf is None or sf <= 0:
+            return {"error": "Pri stop príkaze vyplň kladnú stop cenu.", "perm_id": None, "order_id": None}
+        order = StopOrder(ib_action, qty_f, sf)
+
+    order.transmit = True
+
+    try:
+        trade = ib.placeOrder(c, order)
+        perm_out = None
+        oid_out = None
+        for _ in range(80):
+            ib.sleep(0.15)
+            po = getattr(trade, "order", None)
+            ps = getattr(trade, "orderStatus", None)
+            if po is not None:
+                pid = getattr(po, "permId", 0) or 0
+                if pid and int(pid) > 0:
+                    perm_out = str(int(pid))
+                    oid_out = getattr(po, "orderId", None)
+                    if oid_out not in (None, 0):
+                        oid_out = str(int(oid_out))
+                    else:
+                        oid_out = None
+                    break
+            if ps is not None:
+                pid = getattr(ps, "permId", 0) or 0
+                if pid and int(pid) > 0:
+                    perm_out = str(int(pid))
+                    oid_out = getattr(ps, "orderId", None)
+                    if oid_out not in (None, 0):
+                        oid_out = str(int(oid_out))
+                    break
+        if not perm_out:
+            why = ""
+            if ps:
+                why = getattr(ps, "whyHeld", "") or getattr(ps, "warningText", "") or ""
+            return {
+                "error": "IB nepotvrdil Perm ID včas." + (f" ({why})" if why else ""),
+                "perm_id": None,
+                "order_id": None,
+            }
+        return {"error": None, "perm_id": perm_out, "order_id": oid_out}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}", "perm_id": None, "order_id": None}
+
+
 # ─── Expirácie ─────────────────────────────────────────────────────────────────
 
 def generate_expirations_local(months: int = 12) -> dict:

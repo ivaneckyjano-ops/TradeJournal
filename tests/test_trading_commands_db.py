@@ -64,3 +64,39 @@ def test_trading_commands_manual_tws_fields(monkeypatch, tmp_path: Path) -> None
     assert r["cond_under_cmp"] == "gt"
     assert r["cond_under_price"] == 400.0
     assert r["cond_after_fill"] == "option"
+    assert (r.get("trigger_kind") or "manual") == "manual"
+
+    i3 = db.insert_trading_command(
+        "Zatvoriť akciu po assign",
+        ticker="SPY",
+        action="sell",
+        order_kind="market",
+        quantity=100.0,
+        status="ready",
+        trigger_kind="short_leg_assignment",
+        close_sec_type="STK",
+    )
+    r3 = db.get_trading_command(i3)
+    assert r3 is not None
+    assert r3["trigger_kind"] == "short_leg_assignment"
+    assert r3["close_sec_type"] == "STK"
+
+    i4 = db.insert_trading_command(
+        "Zatvoriť opciu",
+        ticker="QQQ",
+        action="sell",
+        order_kind="limit",
+        quantity=1.0,
+        limit_price=2.5,
+        status="ready",
+        close_sec_type="OPT",
+        close_expiry="20260320",
+        close_strike=400.0,
+        close_right="C",
+    )
+    r4 = db.get_trading_command(i4)
+    assert r4 is not None
+    assert r4["close_sec_type"] == "OPT"
+    assert r4["close_expiry"] == "20260320"
+    assert r4["close_strike"] == 400.0
+    assert r4["close_right"] == "C"
