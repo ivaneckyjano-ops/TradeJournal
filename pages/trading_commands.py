@@ -524,35 +524,121 @@ def _fmt_cmd_line(r: dict) -> str:
     t = str(r.get("title") or "")
     tk = str(r.get("ticker") or "").strip()
     stt = _STATUS_SK.get(str(r.get("status") or ""), r.get("status"))
-    bits = [f"**{r['id']}** · {t}"]
+    bits = [f"**{r['id']}**", t[:60] if t else "—"]
     if tk:
         bits.append(tk)
-    pg = (str(r.get("plan_group") or "")).strip()
-    si = r.get("step_index")
-    if pg and si is not None:
-        try:
-            bits.append(f"〔{pg}〕 #{int(si)}")
-        except (TypeError, ValueError):
-            bits.append(f"〔{pg}〕")
-    elif pg:
-        bits.append(f"〔{pg}〕")
-    if (str(r.get("tws_perm_id") or "")).strip() or (str(r.get("tws_order_id") or "")).strip():
-        bits.append("TWS✎")
-    tg = str(r.get("trigger_kind") or "").strip().lower()
-    if tg == "short_leg_assignment":
-        bits.append("Po assign.")
-    if (str(r.get("assignment_watch_trade_id") or "")).strip().isdigit():
-        bits.append("Watch short")
-    if (str(r.get("close_sec_type") or "")).strip():
-        bits.append(str(r.get("close_sec_type")).strip())
-    if (
-        (str(r.get("cond_under_cmp") or "")).strip()
-        or (str(r.get("cond_after_fill") or "")).strip()
-        or (str(r.get("cond_detail") or "")).strip()
-    ):
-        bits.append("Podm.")
     bits.append(f"_{stt}_")
     return " · ".join(bits)
+
+
+def _tc_status_counts(rows: list[dict]) -> dict[str, int]:
+    out = {"total": len(rows), "draft_ready": 0, "submitted": 0, "watch": 0}
+    for r in rows:
+        stt = str(r.get("status") or "").strip().lower()
+        if stt in ("draft", "ready"):
+            out["draft_ready"] += 1
+        if stt == "submitted":
+            out["submitted"] += 1
+        if str(r.get("assignment_watch_trade_id") or "").strip().isdigit():
+            out["watch"] += 1
+    return out
+
+
+def _tc_render_command_details(r: dict) -> None:
+    created = str(r.get("created_at") or "").strip()
+    updated = str(r.get("updated_at") or "").strip()
+    st.caption(f"Vytvorené: **{created or '—'}** · Upravené: **{updated or '—'}**")
+
+    meta1, meta2, meta3, meta4 = st.columns(4)
+    with meta1:
+        st.caption("Stav")
+        st.markdown(f"**{_STATUS_SK.get(str(r.get('status') or ''), r.get('status') or '—')}**")
+    with meta2:
+        st.caption("Smer")
+        st.markdown(f"**{_ACTION_OPT[_opt_index(_ACTION_OPT, r.get('action'))][1]}**")
+    with meta3:
+        st.caption("Typ")
+        st.markdown(f"**{_ORDER_OPT[_opt_index(_ORDER_OPT, r.get('order_kind'))][1]}**")
+    with meta4:
+        st.caption("Množstvo")
+        q = r.get("quantity")
+        st.markdown(f"**{q:g}**" if isinstance(q, (int, float)) and q is not None else "**—**")
+
+    st.divider()
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Podmienky**")
+        _lc = (str(r.get("cond_under_cmp") or "")).strip()
+        _lp = r.get("cond_under_price")
+        if _lc and _lp is not None:
+            _lbl = next((b for a, b in _COND_UNDER_OPT if a == _lc), _lc)
+            st.caption(f"Cena podkladu: **{_lbl}** **{_lp:g}** $")
+        _lf = (str(r.get("cond_after_fill") or "")).strip()
+        if _lf:
+            _lfb = next((b for a, b in _COND_FILL_OPT if a == _lf), _lf)
+            st.caption(f"Predchádzajúci obchod: {_lfb}")
+        _detail = (str(r.get("cond_detail") or "")).strip()
+        if _detail:
+            st.caption(f"Doplnenie: {_detail[:220]}{'…' if len(_detail) > 220 else ''}")
+    with right:
+        st.markdown("**Kontrakt / IB**")
+        _tkm = str(r.get("trigger_kind") or "").strip().lower()
+        if _tkm:
+            st.caption(f"Spúšťacia logika: {_TRIGGER_SK.get(_tkm, _tkm)}")
+        _cx = str(r.get("close_sec_type") or "").strip()
+        if _cx:
+            _ex = ""
+            if _cx == "OPT":
+                _ex = f" · exp **{r.get('close_expiry') or ''}** strike **{r.get('close_strike')}** {r.get('close_right') or ''}"
+            st.caption(f"Kontrakt na zatvorenie: **{_cx}**{_ex}")
+        _lid = r.get("linked_trade_id")
+        if _lid:
+            st.caption(f"Väzba na obchod ID **{_lid}**")
+        _awx = r.get("assignment_watch_trade_id")
+        if _awx:
+            st.caption(f"Sledovaná short noha (denník): **ID {_awx}**")
+        _ac_at = r.get("assignment_check_at")
+        _ac_sum = (str(r.get("assignment_check_summary") or "")).strip()
+        if _ac_at or _ac_sum:
+            st.caption(
+                f"Posledná kontrola short vs IB: **{_ac_at or '—'}** — {_ac_sum[:180]}{'…' if len(_ac_sum) > 180 else ''}"
+            )
+
+    st.divider()
+    left2, right2 = st.columns(2)
+    with left2:
+        st.markdown("**Postupnosť**")
+        pg = (str(r.get("plan_group") or "")).strip()
+        si = r.get("step_index")
+        if pg:
+            if si is not None:
+                try:
+                    st.caption(f"Skupina: **{pg}** · krok **{int(si)}**")
+                except (TypeError, ValueError):
+                    st.caption(f"Skupina: **{pg}**")
+            else:
+                st.caption(f"Skupina: **{pg}**")
+        else:
+            st.caption("Skupina: —")
+    with right2:
+        st.markdown("**TWS ručne**")
+        etperm = str(r.get("tws_perm_id") or "").strip()
+        etord = str(r.get("tws_order_id") or "").strip()
+        etwsn = str(r.get("tws_manual_note") or "").strip()
+        if etperm or etord:
+            st.caption(
+                f"Perm ID: **{etperm or '—'}** · Order ID: **{etord or '—'}**"
+            )
+        else:
+            st.caption("Perm ID / Order ID: —")
+        if etwsn:
+            st.caption(f"Poznámka: {etwsn[:180]}{'…' if len(etwsn) > 180 else ''}")
+
+    _body = (str(r.get("body") or "")).strip()
+    if _body:
+        st.divider()
+        st.markdown("**Detail príkazu**")
+        st.write(_body)
 
 
 def _render_tc_new_command_expander_body() -> None:
@@ -852,7 +938,7 @@ with _tc_col_new:
     with st.expander("➕ Nový príkaz", expanded=False):
         _render_tc_new_command_expander_body()
 with _tc_col_edit:
-    with st.expander("✏️ Upraviť príkazy — koncepty", expanded=False):
+    with st.expander("✏️ Rýchle filtre", expanded=False):
         st.caption(
             "Úpravy sú v **zozname nižšie** — rozbaľ riadok. Tu len nastavíš filter."
         )
@@ -921,6 +1007,17 @@ if _only_assign:
         and str(x.get("status") or "").strip().lower() in ("draft", "ready")
     ]
 
+_stats = _tc_status_counts(rows)
+s1, s2, s3, s4 = st.columns(4)
+with s1:
+    st.metric("Záznamy", _stats["total"])
+with s2:
+    st.metric("Koncept + pripravené", _stats["draft_ready"])
+with s3:
+    st.metric("Odoslané", _stats["submitted"])
+with s4:
+    st.metric("Sledované short", _stats["watch"])
+
 if st.session_state.get(TC_RESTRICT_DRAFT_READY):
     st.caption(
         "📌 Zapnutý filter **Koncept + Pripravené** (z pravého expandera). Zrušíš ho zmenou „Filtrovať podľa stavu“ alebo **Všetky záznamy**."
@@ -932,41 +1029,7 @@ else:
     for r in rows:
         rid = int(r["id"])
         with st.expander(_fmt_cmd_line(r), expanded=False):
-            st.caption(
-                f"Vytvorené: **{r.get('created_at', '')}** · Upravené: **{r.get('updated_at', '')}**"
-            )
-            _lc = (str(r.get("cond_under_cmp") or "")).strip()
-            _lp = r.get("cond_under_price")
-            _lf = (str(r.get("cond_after_fill") or "")).strip()
-            if _lc and _lp is not None:
-                _lbl = next((b for a, b in _COND_UNDER_OPT if a == _lc), _lc)
-                st.caption(f"Cena podkladu: **{_lbl}** **{_lp:g}** $")
-            if _lf:
-                _lfb = next((b for a, b in _COND_FILL_OPT if a == _lf), _lf)
-                st.caption(f"Predchádzajúci obchod: {_lfb}")
-            if (str(r.get("cond_detail") or "")).strip():
-                st.caption(f"Doplnenie: {str(r.get('cond_detail') or '').strip()[:200]}{'…' if len(str(r.get('cond_detail') or '')) > 200 else ''}")
-            _tkm = str(r.get("trigger_kind") or "").strip().lower()
-            if _tkm:
-                st.caption(f"Spúšťacia logika: {_TRIGGER_SK.get(_tkm, _tkm)}")
-            _cx = str(r.get("close_sec_type") or "").strip()
-            if _cx:
-                _ex = ""
-                if _cx == "OPT":
-                    _ex = f" · exp **{r.get('close_expiry') or ''}** strike **{r.get('close_strike')}** {r.get('close_right') or ''}"
-                st.caption(f"Kontrakt na zatvorenie: **{_cx}**{_ex}")
-            _lid = r.get("linked_trade_id")
-            if _lid:
-                st.caption(f"Väzba na obchod ID **{_lid}**")
-            _awx = r.get("assignment_watch_trade_id")
-            if _awx:
-                st.caption(f"Sledovaná short noha (denník): **ID {_awx}**")
-            _ac_at = r.get("assignment_check_at")
-            _ac_sum = (str(r.get("assignment_check_summary") or "")).strip()
-            if _ac_at or _ac_sum:
-                st.caption(
-                    f"Posledná kontrola short vs IB: **{_ac_at or '—'}** — {_ac_sum[:180]}{'…' if len(_ac_sum) > 180 else ''}"
-                )
+            _tc_render_command_details(r)
             _ib_cache_ed = st.session_state.get(_tc_ib_pos_cache_key()) or []
             _ib_err_ed = st.session_state.get(_tc_ib_pos_err_key())
             st.markdown("##### Z Interactive Brokers")

@@ -59,18 +59,46 @@ STRATEGIES = [
     "Cash-Secured Put", "Iné",
 ]
 
+
+def _ticker_choices_from_symbols(*, ensure_ticker: str | None = None) -> list[tuple[str, str]]:
+    """Ticker pre skupiny berieme zo Symbolov; ak chýba, doplníme existujúcu hodnotu ako fallback."""
+    choices: list[tuple[str, str]] = [("", "— vyber ticker zo Symboly —")]
+    raw = db.get_symbol_tickers()
+    known = sorted({str(t).strip().upper() for t in raw if str(t).strip()})
+    ensure = (ensure_ticker or "").strip().upper()
+    if ensure and ensure not in known:
+        choices.append((ensure, f"{ensure} (nie je v Symboly)"))
+    choices.extend((t, t) for t in known)
+    return choices
+
+
+def _ticker_choice_index(choices: list[tuple[str, str]], current: str | None) -> int:
+    cur = (current or "").strip().upper()
+    for i, (val, _) in enumerate(choices):
+        if val == cur:
+            return i
+    return 0
+
 # ─── Tab: Vytvoriť skupinu ────────────────────────────────────────────────────
 with tab_create:
     st.caption(
         "**Návod:** Zadaj jedinečný **Group ID** (odporúčaný formát v pomocníku). Tento názov potom vyberáš v **Trade Log**, "
-        "**Konzultáciách** a pri hromadnom priradení. Ticker a stratégia sú orientačné metadáta."
+        "**Konzultáciách** a pri hromadnom priradení. Ticker vyberaj zo **Symboly** a stratégia je len orientačné metadáta."
     )
     st.subheader("Nová skupina")
+    _ticker_opts_new = _ticker_choices_from_symbols()
 
     with st.form("new_group_form", clear_on_submit=True):
         c1, c2 = st.columns(2)
         with c1:
-            g_ticker = st.text_input("Ticker", placeholder="napr. AMZN", value="AMZN").upper()
+            g_ticker_pair = st.selectbox(
+                "Ticker zo záložky Symboly",
+                options=_ticker_opts_new,
+                format_func=lambda x: x[1],
+                index=0,
+                help="Symbol pridaj najprv na stránke **Symboly**. Tu už len vyberáš existujúci ticker.",
+            )
+            g_ticker = (g_ticker_pair[0] or "").strip().upper()
         with c2:
             g_strategy = st.selectbox("Stratégia", STRATEGIES)
 
@@ -261,11 +289,20 @@ with tab_manage:
                 f"&nbsp; · &nbsp; {trade_count} nôh &nbsp; · &nbsp; {note_count} poznámok",
                 expanded=False,
             ):
+                _ticker_opts_edit = _ticker_choices_from_symbols(ensure_ticker=g.get("ticker"))
+                _ticker_idx_edit = _ticker_choice_index(_ticker_opts_edit, g.get("ticker"))
                 with st.form(f"edit_group_{g['id']}"):
                     ec1, ec2 = st.columns(2)
                     with ec1:
-                        e_ticker = st.text_input("Ticker", value=g.get("ticker", ""),
-                                                  key=f"gt_{g['id']}")
+                        e_ticker_pair = st.selectbox(
+                            "Ticker zo záložky Symboly",
+                            options=_ticker_opts_edit,
+                            format_func=lambda x: x[1],
+                            index=_ticker_idx_edit,
+                            key=f"gt_{g['id']}",
+                            help="Ak ticker chýba v Symboly, doplň ho najprv tam.",
+                        )
+                        e_ticker = (e_ticker_pair[0] or "").strip().upper()
                     with ec2:
                         strat_idx = STRATEGIES.index(g["strategy"]) if g.get("strategy") in STRATEGIES else len(STRATEGIES)-1
                         e_strategy = st.selectbox("Stratégia", STRATEGIES, index=strat_idx,
@@ -643,6 +680,7 @@ with tab_assign:
     else:
         group_options = {g["name"]: g["name"] for g in groups_assign}
         sel_group = st.selectbox("Vyber skupinu", list(group_options.keys()), key="assign_group")
+        st.caption("Pri priraďovaní nezabudni, že správny ticker si spravuj v **Symboly**. Tu sa len viaže už existujúca noha ku skupine.")
 
         all_trades_assign = db.get_all_trades()
         trade_labels = {
