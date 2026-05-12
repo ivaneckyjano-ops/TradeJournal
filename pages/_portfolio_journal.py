@@ -209,6 +209,23 @@ def _greek_cell_to_db(orig_val: float | None, cell_val) -> float | None:
     return x
 
 
+def _greek_entry_from_current_when_missing(
+    orig_entry: float | None,
+    entry_cell,
+    current_cell,
+) -> float | None:
+    """
+    Ak je vstupný grécky údaj prázdny a používateľ doplnil aktuálnu hodnotu, použij ju aj ako vstup.
+    Zachováva pôvodný DB zápis, keď už existuje.
+    """
+    entry_val = _greek_cell_to_db(orig_entry, entry_cell)
+    if entry_val is not None:
+        return entry_val
+    if orig_entry is None:
+        return _nan_to_none(current_cell)
+    return entry_val
+
+
 def _entry_float_eq(a: float | None, b: float | None) -> bool:
     if a is None and b is None:
         return True
@@ -1012,13 +1029,25 @@ def _journal_write_live_greeks_for_trade(trade: dict, positions: list[dict]) -> 
         iv_c = float(g["iv"]) if g.get("iv") is not None else None
     except (TypeError, ValueError):
         iv_c = None
+    iv_entry = trade.get("iv_at_entry")
+    delta_entry = trade.get("delta_at_entry")
+    theta_entry = trade.get("theta_at_entry")
+    vega_entry = trade.get("vega_at_entry")
+    if iv_entry is None and iv_c is not None:
+        iv_entry = iv_c
+    if delta_entry is None and dc is not None:
+        delta_entry = dc
+    if theta_entry is None and th_usd is not None:
+        theta_entry = th_usd
+    if vega_entry is None and ve_usd is not None:
+        vega_entry = ve_usd
     db.set_trade_portfolio_greeks(
         tid,
-        trade.get("iv_at_entry"),
-        trade.get("delta_at_entry"),
-        trade.get("theta_at_entry"),
+        iv_entry,
+        delta_entry,
+        theta_entry,
         dc,
-        vega_at_entry=trade.get("vega_at_entry"),
+        vega_at_entry=vega_entry,
         vega_current=ve_usd,
         iv_current=iv_c,
         theta_current=th_usd,
@@ -1086,7 +1115,7 @@ with st.expander("Synchronizácia s TWS / databázou (rovnako ako Dashboard)", e
                 type="secondary",
                 use_container_width=True,
                 key="pf_journal_sync_greeks",
-                help="Pre každú otvorenú nohu nájde zhodu v portfóliu a zapíše Δ, IV, Θ, Vega do DB (bez úpravy vstupných polí).",
+                help="Pre každú otvorenú nohu nájde zhodu v portfóliu a zapíše Δ, IV, Θ, Vega do DB; ak vstup chýba, doplní sa z aktuálnej hodnoty.",
             ):
                 with st.spinner("Sťahujem pozície s Grékmi (môže trvať)…"):
                     res = ibkr.fetch_positions(with_greeks=True, use_historical_last=False)
@@ -1196,6 +1225,7 @@ if not open_trades:
 else:
     st.caption(
         "**Návod:** Táto tabuľka je na ručný zápis. Doplň **Δ vstup / Δ aktuálna** a **Θ vstup ($/deň) / Θ aktuálna ($/deň)**, prípadne aj ďalšie hodnoty, a stlač **Uložiť journal**. "
+        "Ak je **vstup** ešte prázdny, ale vyplníš **aktuálnu** hodnotu, uloží sa aj ako vstup. "
         "Pod editorom sú **súčty za skupinu**; podrobnosti metrík sú v expanderi **Vysvetlivky k metrikám** (predvolene zbalený). "
         "Zápis sa uloží do DB a zostane aj na ďalší deň. "
         "**Skupiny:** každá skupina z denníka má **vlastnú hornú záložku** (napr. Kal.01) — klikni na názov a uprav len tú časť portfólia."
@@ -2205,12 +2235,28 @@ else:
                             db.update_trade(tid, group_id="" if not new_gid else new_gid)
                             nchg += 1
 
-                        new_iv = _greek_cell_to_db(orig.get("iv_at_entry"), row["IV vstup"])
-                        new_d = _greek_cell_to_db(orig.get("delta_at_entry"), row["Δ vstup"])
-                        new_th = _greek_cell_to_db(orig.get("theta_at_entry"), row["Θ vstup ($/deň)"])
+                        new_iv = _greek_entry_from_current_when_missing(
+                            orig.get("iv_at_entry"),
+                            row["IV vstup"],
+                            row["IV aktuálna"],
+                        )
+                        new_d = _greek_entry_from_current_when_missing(
+                            orig.get("delta_at_entry"),
+                            row["Δ vstup"],
+                            row["Δ aktuálna"],
+                        )
+                        new_th = _greek_entry_from_current_when_missing(
+                            orig.get("theta_at_entry"),
+                            row["Θ vstup ($/deň)"],
+                            row["Θ aktuálna ($/deň)"],
+                        )
                         new_dc = _greek_cell_to_db(orig.get("delta_current"), row["Δ aktuálna"])
                         new_tc = _greek_cell_to_db(orig.get("theta_current"), row["Θ aktuálna ($/deň)"])
-                        new_ve = _greek_cell_to_db(orig.get("vega_at_entry"), row["Vega vstup"])
+                        new_ve = _greek_entry_from_current_when_missing(
+                            orig.get("vega_at_entry"),
+                            row["Vega vstup"],
+                            row["Vega aktuálna"],
+                        )
                         new_vc = _greek_cell_to_db(orig.get("vega_current"), row["Vega aktuálna"])
                         new_ivc = _greek_cell_to_db(orig.get("iv_current"), row["IV aktuálna"])
 
