@@ -10,6 +10,7 @@ Streamlit aplikácia pre sledovanie a analýzu opčných obchodov s prepojením 
 - **Strategy Modeler** — Roll simulátor so sliderom pre strike, real-time PoP aktualizácia
 - **Hľadanie delty — diagonály** — skríning diagonálov z lokálnej DB reťazcov (gréky, filtre, triedenie). Manuál: [docs/hladanie-delty-diagonaly.md](docs/hladanie-delty-diagonaly.md)
 - **Journal — Gréky** — zápis Δ, Θ, Vega, IV, skupiny, net, história; prepojenie s TWS. Manuál: [docs/journal-greky.md](docs/journal-greky.md)
+- **Obchodné príkazy** — plán príkazu v DB, väzba na denník, voliteľné odoslanie do TWS, kontrola short nohy vs IB. Manuál (Markdown): [`docs/Obchodné príkazy/manual.md`](docs/Obchodné%20príkazy/manual.md)
 
 ## Inštalácia
 
@@ -47,3 +48,12 @@ streamlit run streamlit_app.py
 
 Uisti sa, že v TWS/Gateway máš povolené API pripojenie:
 `Edit → Global Configuration → API → Settings → Enable ActiveX and Socket Clients`
+
+## LIVE / PAPER databázy
+
+TradeJournal teraz používa oddelené súbory:
+
+- `data/journal_live.db` pre režim `LIVE`
+- `data/journal_paper.db` pre režim `PAPER`
+
+Pôvodný `data/journal.db` ostáva ako archív starších dát.

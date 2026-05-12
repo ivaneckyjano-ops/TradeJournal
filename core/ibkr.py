@@ -26,6 +26,66 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7496
 DEFAULT_CLIENT_ID = 10
 
+# Predvoľby pre UI (Dashboard): rovnaký TWS API socket pre TWS, IB Gateway aj IBKR Desktop —
+# port musí presne sedieť s Edit → Global Configuration → API → Socket port v danej aplikácii.
+# Ak bežia TWS a IBKR Desktop naraz, v každej nastav iný port a tu zvoľ zodpovedajúcu predvoľbu.
+IB_CONNECTION_PRESETS: tuple[tuple[str, int], ...] = (
+    ("TWS — live", 7496),
+    ("TWS — paper", 7497),
+    ("IBKR Desktop", 7498),
+    ("IB Gateway — live", 4001),
+    ("IB Gateway — paper", 4002),
+)
+
+
+def current_connection_scope() -> str:
+    """
+    Stabilný identifikátor aktívneho IB pripojenia.
+
+    Používame ho na oddelenie cache v ``st.session_state``, aby sa live a paper
+    údaje navzájom neprepisovali pri prepnutí portu / klienta.
+    """
+    host = str(st.session_state.get("ib_host") or DEFAULT_HOST).strip().lower()
+    try:
+        port = int(st.session_state.get("ib_port") or DEFAULT_PORT)
+    except (TypeError, ValueError):
+        port = DEFAULT_PORT
+    try:
+        client_id = int(st.session_state.get("ib_cid") or DEFAULT_CLIENT_ID)
+    except (TypeError, ValueError):
+        client_id = DEFAULT_CLIENT_ID
+    return f"{host}:{port}:cid{client_id}"
+
+
+def scoped_session_key(base_key: str) -> str:
+    """Vráti názov session_state kľúča pre aktuálny IB scope."""
+    return f"{base_key}__{current_connection_scope()}"
+
+
+def current_connection_label() -> str:
+    """Ľudsky čitateľný popis aktívneho IB pripojenia."""
+    host = str(st.session_state.get("ib_host") or DEFAULT_HOST).strip() or DEFAULT_HOST
+    try:
+        port = int(st.session_state.get("ib_port") or DEFAULT_PORT)
+    except (TypeError, ValueError):
+        port = DEFAULT_PORT
+    try:
+        client_id = int(st.session_state.get("ib_cid") or DEFAULT_CLIENT_ID)
+    except (TypeError, ValueError):
+        client_id = DEFAULT_CLIENT_ID
+    preset = next((lbl for lbl, prt in IB_CONNECTION_PRESETS if int(prt) == port), "Vlastné")
+    return f"{preset} · {host}:{port} · cid {client_id}"
+
+
+def get_scoped_session_value(base_key: str, default=None):
+    """Načíta hodnotu zo scope-kľúča pre aktuálne IB pripojenie."""
+    return st.session_state.get(scoped_session_key(base_key), default)
+
+
+def set_scoped_session_value(base_key: str, value) -> None:
+    """Zapíše hodnotu do scope-kľúča pre aktuálne IB pripojenie."""
+    st.session_state[scoped_session_key(base_key)] = value
+
 # ─── Background fetch job state (perzistentný medzi Streamlit rerunmi) ────────
 # Uložené na úrovni modulu – modul sa pri rerun NEreimportuje, stav zostáva.
 FETCH_JOB: dict = {
@@ -270,10 +330,19 @@ def connect(
 
     ok_tcp, tcp_err = _tcp_reachable(host, port, timeout=3.0)
     if not ok_tcp:
+        hint_7498 = ""
+        if int(port) == 7498:
+            hint_7498 = (
+                "Číslo 7498 je len odporúčaná predvoľba v TradeJournal — v IBKR Desktop (alebo TWS) "
+                "musíš v Global Configuration → API nastaviť rovnaký „Socket port“ a reštartovať klienta. "
+                "Ak tam API ešte nemáš zmenené, skús predvolené TWS: live 7496 alebo paper 7497. "
+            )
         return (
             False,
-            f"Na {host}:{port} sa nedá pripojiť (TCP). Spusti TWS alebo IB Gateway "
-            f"a skontroluj API port (TWS live 7496, paper 7497, Gateway 4001/4002). "
+            f"Na {host}:{port} sa nedá pripojiť (TCP). Spusti TWS, IB Gateway alebo IBKR Desktop "
+            f"a skontroluj, že v jeho API nastaveniach je rovnaký socket port ako tu. "
+            f"{hint_7498}"
+            f"Bežné porty: TWS live 7496, paper 7497, Gateway 4001/4002. "
             f"Detail: {tcp_err}",
         )
 
@@ -2075,21 +2144,56 @@ def fetch_fills() -> dict:
     """
     Načíta vykonané obchady (fills) z IBKR vrátane komisií.
 
-    Používa ``reqExecutions()`` — na rozdiel od ``ib.fills()`` vráti aj dáta po pripojení
-    (cache ``fills()`` často ostane prázdny, kým sa nevyžiadajú exekúcie zo servera).
+    Kombinuje ``reqExecutions()`` (dvakrát s krátkym ``ib.sleep`` medzi volaniami — pri prvom
+    pripojení často pomôže „druhý pokus“) so zlúčením ``ib.fills()`` z aktuálnej relácie.
     """
     ib = get_ib()
     if not ib or not ib.isConnected():
-        return {"fills": [], "error": "Nie je pripojenie na IBKR"}
+        return {
+            "fills": [],
+            "error": "Nie je pripojenie na IBKR",
+            "raw_fill_count": 0,
+            "non_option_fill_count": 0,
+        }
     _ib_ready()
     try:
+        from ib_insync import ExecutionFilter
+
+        seen_exec: set[str] = set()
         raw: list = []
+
+        def _add_fill_rows(rows):
+            for f in rows or []:
+                ex = getattr(f, "execution", None)
+                eid = str(getattr(ex, "execId", None) or "")
+                key = eid if eid else f"_id_{id(f)}"
+                if key in seen_exec:
+                    continue
+                seen_exec.add(key)
+                raw.append(f)
+
+        def _req_exec_once():
+            try:
+                _add_fill_rows(ib.reqExecutions(ExecutionFilter()))
+            except Exception:
+                try:
+                    _add_fill_rows(ib.reqExecutions())
+                except Exception:
+                    pass
+
+        _req_exec_once()
         try:
-            raw = list(ib.reqExecutions() or [])
+            ib.sleep(0.4)
         except Exception:
-            raw = []
-        if not raw:
-            raw = list(ib.fills() or [])
+            time.sleep(0.4)
+        _req_exec_once()
+        _add_fill_rows(list(ib.fills() or []))
+
+        non_opt = sum(
+            1
+            for f in raw
+            if getattr(getattr(f, "contract", None), "secType", None) != "OPT"
+        )
 
         commission_map: dict[str, float] = {}
         for f in raw:
@@ -2138,9 +2242,19 @@ def fetch_fills() -> dict:
                     "commission": comm,
                 }
             )
-        return {"fills": result, "error": None}
+        return {
+            "fills": result,
+            "error": None,
+            "raw_fill_count": len(raw),
+            "non_option_fill_count": non_opt,
+        }
     except Exception as e:
-        return {"fills": [], "error": str(e)}
+        return {
+            "fills": [],
+            "error": str(e),
+            "raw_fill_count": 0,
+            "non_option_fill_count": 0,
+        }
 
 
 def sync_fills_to_db(fills: list[dict], db_module) -> dict:
@@ -2243,6 +2357,55 @@ def sync_fills_to_db(fills: list[dict], db_module) -> dict:
     return {"added": added, "skipped": skipped, "closed": closed}
 
 
+def _resolve_order_contract(ib, contract):
+    """
+    Získa plný kontrakt s ``conId`` pre ``placeOrder``.
+
+    1) ``qualifyContracts`` (3 pokusy, dlhší timeout — paper TWS často mešká).
+    2) Ak stále nič, záložne ``reqContractDetails`` (niekedy prebehne, keď qualify visí).
+    """
+    old_to = getattr(ib, "RequestTimeout", 8)
+    last_timeout: BaseException | None = None
+    try:
+        ib.RequestTimeout = 75
+        for _attempt in range(3):
+            try:
+                qc = ib.qualifyContracts(contract)
+                if qc and getattr(qc[0], "conId", None):
+                    return qc[0], None
+            except (TimeoutError, asyncio.TimeoutError) as e:
+                last_timeout = e
+                try:
+                    ib.sleep(0.6)
+                except Exception:
+                    time.sleep(0.6)
+            except Exception as e:
+                return None, e
+
+        try:
+            ib.RequestTimeout = 60
+            dets = ib.reqContractDetails(contract)
+            if dets:
+                cand = dets[0].contract
+                if getattr(cand, "conId", None):
+                    return cand, None
+        except (TimeoutError, asyncio.TimeoutError) as e:
+            last_timeout = last_timeout or e
+        except Exception as e:
+            if last_timeout:
+                return None, last_timeout
+            return None, e
+
+        if last_timeout:
+            return None, last_timeout
+        return None, RuntimeError("IB nevrátil platný kontrakt (prázdny qualify aj contractDetails).")
+    finally:
+        try:
+            ib.RequestTimeout = old_to
+        except Exception:
+            pass
+
+
 def submit_trading_command_order(cmd: dict) -> dict:
     """
     Odošle jeden príkaz z uloženého záznamu (``trading_commands``) do TWS s ``transmit=True``.
@@ -2250,13 +2413,15 @@ def submit_trading_command_order(cmd: dict) -> dict:
     Očakáva polia: ``ticker``, ``action`` (buy/sell), ``order_kind``, ``quantity``,
     voliteľne ``limit_price``, ``stop_price``, ``close_sec_type`` (STK|OPT),
     pre OPT: ``close_expiry`` (YYYYMMDD), ``close_strike``, ``close_right`` (C|P).
+
+    ``order_kind``: ``market`` (trh), ``mtl`` (trhový limit v TWS, API ``MTL``), ``limit``, ``stop``.
     """
     ib = get_ib()
     if not ib or not ib.isConnected():
         return {"error": "Nie je pripojenie na IBKR.", "perm_id": None, "order_id": None}
 
     _ib_ready()
-    from ib_insync import LimitOrder, MarketOrder, Option as IBOption, StopOrder, Stock
+    from ib_insync import LimitOrder, MarketOrder, Option as IBOption, Order, StopOrder, Stock
 
     sym = (cmd.get("ticker") or "").strip().upper()
     if not sym:
@@ -2270,12 +2435,16 @@ def submit_trading_command_order(cmd: dict) -> dict:
     okind = (cmd.get("order_kind") or "").strip().lower()
     if okind == "bracket":
         return {
-            "error": "Typ „Bracket / combo“ zatiaľ nie je podporovaný pre priame odoslanie — zvoľ Limit, Trh alebo Stop.",
+            "error": "Typ „Bracket / combo“ zatiaľ nie je podporovaný pre priame odoslanie — zvoľ Trh, Trhový limit (MTL), Limit alebo Stop.",
             "perm_id": None,
             "order_id": None,
         }
-    if okind not in ("market", "limit", "stop"):
-        return {"error": "Vyber typ príkazu (Limit / Trh / Stop).", "perm_id": None, "order_id": None}
+    if okind not in ("market", "mtl", "limit", "stop"):
+        return {
+            "error": "Vyber typ príkazu (Trh / Trhový limit (MTL) / Limit / Stop).",
+            "perm_id": None,
+            "order_id": None,
+        }
 
     try:
         qty_f = float(cmd.get("quantity") or 0)
@@ -2308,13 +2477,35 @@ def submit_trading_command_order(cmd: dict) -> dict:
     except Exception as e:
         return {"error": f"Kontrakt: {type(e).__name__}: {e}", "perm_id": None, "order_id": None}
 
-    try:
-        qualified = ib.qualifyContracts(contract)
-        c = qualified[0] if qualified else contract
-        if not getattr(c, "conId", None):
-            return {"error": "Kontrakt sa nepodarilo kvalifikovať v IB.", "perm_id": None, "order_id": None}
-    except Exception as e:
-        return {"error": f"qualifyContracts: {type(e).__name__}: {e}", "perm_id": None, "order_id": None}
+    if sec == "STK":
+        # Pre jednoduché US akcie je SMART/USD dostatočný kontrakt pre TWS placeOrder.
+        # Povinné qualifyContracts tu zbytočne blokovalo skúšobné akciové príkazy.
+        c = contract
+    else:
+        try:
+            c, qerr = _resolve_order_contract(ib, contract)
+            if qerr is not None:
+                if isinstance(qerr, (TimeoutError, asyncio.TimeoutError)):
+                    detail = str(qerr).strip() or type(qerr).__name__
+                    return {
+                        "error": (
+                            "Kontrakt: časový limit (qualifyContracts / reqContractDetails). "
+                            "Skús znova o chvíľu; skontroluj sieť, nepreťažené TWS a platnosť kontraktu "
+                            "(expirácia YYYYMMDD, SMART, paper vs live). "
+                            f"Detail: {detail}"
+                        ),
+                        "perm_id": None,
+                        "order_id": None,
+                    }
+                return {
+                    "error": f"Kontrakt: {type(qerr).__name__}: {qerr}",
+                    "perm_id": None,
+                    "order_id": None,
+                }
+            if not c or not getattr(c, "conId", None):
+                return {"error": "Kontrakt sa nepodarilo rozlíšiť v IB (žiadny conId).", "perm_id": None, "order_id": None}
+        except Exception as e:
+            return {"error": f"Kontrakt: {type(e).__name__}: {e}", "perm_id": None, "order_id": None}
 
     try:
         lp = cmd.get("limit_price")
@@ -2326,13 +2517,21 @@ def submit_trading_command_order(cmd: dict) -> dict:
 
     if okind == "market":
         order = MarketOrder(ib_action, qty_f)
+    elif okind == "mtl":
+        if lf is None or lf <= 0:
+            return {
+                "error": "Pri trhovom limite (MTL) vyplň kladnú limitnú cenu (lmtPrice v TWS).",
+                "perm_id": None,
+                "order_id": None,
+            }
+        order = Order(action=ib_action, totalQuantity=qty_f, orderType="MTL", lmtPrice=lf)
     elif okind == "limit":
         if lf is None or lf <= 0:
             return {"error": "Pri limite vyplň kladnú cenu limitu.", "perm_id": None, "order_id": None}
         order = LimitOrder(ib_action, qty_f, lf)
     else:
         if sf is None or sf <= 0:
-            return {"error": "Pri stop príkaze vyplň kladnú stop cenu.", "perm_id": None, "order_id": None}
+            return {"error": "Pri stop príkaze vyplň kladnú spúšťaciu stop cenu.", "perm_id": None, "order_id": None}
         order = StopOrder(ib_action, qty_f, sf)
 
     order.transmit = True
@@ -2341,40 +2540,119 @@ def submit_trading_command_order(cmd: dict) -> dict:
         trade = ib.placeOrder(c, order)
         perm_out = None
         oid_out = None
+        status_out = ""
+        warning_out = ""
         for _ in range(80):
             ib.sleep(0.15)
             po = getattr(trade, "order", None)
             ps = getattr(trade, "orderStatus", None)
             if po is not None:
+                oid = getattr(po, "orderId", None)
+                if oid not in (None, 0):
+                    oid_out = str(int(oid))
                 pid = getattr(po, "permId", 0) or 0
                 if pid and int(pid) > 0:
                     perm_out = str(int(pid))
-                    oid_out = getattr(po, "orderId", None)
-                    if oid_out not in (None, 0):
-                        oid_out = str(int(oid_out))
-                    else:
-                        oid_out = None
                     break
             if ps is not None:
+                status_out = str(getattr(ps, "status", "") or status_out)
+                warning_out = (
+                    getattr(ps, "whyHeld", "")
+                    or getattr(ps, "warningText", "")
+                    or warning_out
+                )
+                oid = getattr(ps, "orderId", None)
+                if oid not in (None, 0):
+                    oid_out = str(int(oid))
                 pid = getattr(ps, "permId", 0) or 0
                 if pid and int(pid) > 0:
                     perm_out = str(int(pid))
-                    oid_out = getattr(ps, "orderId", None)
-                    if oid_out not in (None, 0):
-                        oid_out = str(int(oid_out))
                     break
         if not perm_out:
-            why = ""
-            if ps:
-                why = getattr(ps, "whyHeld", "") or getattr(ps, "warningText", "") or ""
+            bad_states = {"Cancelled", "ApiCancelled", "Inactive"}
+            if oid_out and status_out not in bad_states:
+                return {
+                    "error": None,
+                    "perm_id": None,
+                    "order_id": oid_out,
+                    "warning": (
+                        "TWS príkaz prijal, ale Perm ID ešte neprišlo. "
+                        "Skontroluj stav príkazu v TWS; v denníku ukladám Order ID."
+                        + (f" Stav: {status_out}." if status_out else "")
+                        + (f" Poznámka: {warning_out}" if warning_out else "")
+                    ),
+                }
             return {
-                "error": "IB nepotvrdil Perm ID včas." + (f" ({why})" if why else ""),
+                "error": "IB nepotvrdil prijatie príkazu včas."
+                + (f" Stav: {status_out}." if status_out else "")
+                + (f" Poznámka: {warning_out}" if warning_out else ""),
                 "perm_id": None,
-                "order_id": None,
+                "order_id": oid_out,
             }
         return {"error": None, "perm_id": perm_out, "order_id": oid_out}
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}", "perm_id": None, "order_id": None}
+
+
+def journal_short_opt_matches_ib_position(trade: dict, p: dict) -> bool:
+    """Či IB pozícia zodpovedá journal short opčnej nohe (OPT/FOP, Short)."""
+    from core.portfolio_data import normalize_expiry, _canon_option_type_for_key
+
+    if str(p.get("sec_type") or "").upper() not in ("OPT", "FOP"):
+        return False
+    if str(p.get("leg_type") or "").strip() != "Short":
+        return False
+    if str(trade.get("leg_type") or "").strip() != "Short":
+        return False
+    if str(trade.get("ticker") or "").strip().upper() != str(p.get("ticker") or "").strip().upper():
+        return False
+    try:
+        ts = float(trade.get("strike") or 0)
+        ps = float(p.get("strike") or 0)
+    except (TypeError, ValueError):
+        return False
+    if abs(ts - ps) > 1e-4:
+        return False
+
+    def _ex_norm(x: Any) -> str:
+        raw = str(x or "").strip().split()[0]
+        if not raw:
+            return ""
+        return normalize_expiry(raw).replace("-", "")[:8]
+
+    if _ex_norm(trade.get("expiry")) != _ex_norm(p.get("expiry")):
+        return False
+    tt = _canon_option_type_for_key(trade.get("option_type"))
+    pt = _canon_option_type_for_key(p.get("option_type"))
+    return tt == pt and tt in ("Call", "Put")
+
+
+def short_block_still_open_vs_ib(trade: dict, positions: list[dict]) -> dict:
+    """
+    ``blocked`` = True ak zhodná Short OPT pozícia je v snímku IB (typické blokovanie predaja long nohy).
+    """
+    matches = [p for p in positions if journal_short_opt_matches_ib_position(trade, p)]
+    qty = sum(float(p.get("contracts") or 0) for p in matches)
+    if qty > 1e-9:
+        return {
+            "blocked": True,
+            "visible_qty": qty,
+            "detail_sk": "Short kontrakt je v IB snímku stále otvorený — účet často nedovolí uzavrieť long nohu.",
+        }
+    return {
+        "blocked": False,
+        "visible_qty": 0.0,
+        "detail_sk": "Zhodná Short OPT pozícia v tomto snímku nie je (assignment / uzavretie / iný účet). Pred odoslaním long close over v TWS.",
+    }
+
+
+def check_assignment_watch_vs_ib(watch_trade: dict) -> dict:
+    """Načíta ``fetch_positions()`` a vyhodnotí, či sledovaná short noha ešte „drží“ blokovanie."""
+    res = fetch_positions()
+    if res.get("error"):
+        return {"error": res["error"], "blocked": None, "visible_qty": None, "detail_sk": ""}
+    inner = short_block_still_open_vs_ib(watch_trade, list(res.get("positions") or []))
+    return {"error": None, **inner}
 
 
 # ─── Expirácie ─────────────────────────────────────────────────────────────────

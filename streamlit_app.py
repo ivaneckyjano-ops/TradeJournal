@@ -6,6 +6,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import streamlit as st
 
+from core import database as db, ibkr
 from core.page_context import TWS_DASHBOARD_PAGE
 
 st.set_page_config(
@@ -14,6 +15,103 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+def _infer_ib_mode() -> str:
+    try:
+        port = int(st.session_state.get("ib_port") or 7496)
+    except (TypeError, ValueError):
+        port = 7496
+    return "PAPER" if port == 7497 else "LIVE"
+
+
+_IB_DEFAULT_CLIENT_IDS = {
+    "LIVE": 10,
+    "PAPER": 15,
+}
+
+
+def _apply_ib_mode() -> None:
+    mode = str(st.session_state.get("ib_mode") or "LIVE").strip().upper()
+    prev_mode = str(st.session_state.get("_ib_mode_prev") or "").strip().upper()
+    if mode != prev_mode and ibkr.get_ib() is not None:
+        try:
+            ibkr.disconnect()
+        except Exception:
+            pass
+    if mode == "PAPER":
+        st.session_state["ib_port"] = 7497
+        st.session_state["ib_cid"] = _IB_DEFAULT_CLIENT_IDS["PAPER"]
+        st.session_state["ib_conn_preset"] = "TWS — paper"
+    else:
+        st.session_state["ib_port"] = 7496
+        st.session_state["ib_cid"] = _IB_DEFAULT_CLIENT_IDS["LIVE"]
+        st.session_state["ib_conn_preset"] = "TWS — live"
+    st.session_state["_ib_mode_prev"] = mode
+
+
+_ib_mode = _infer_ib_mode()
+if st.session_state.get("ib_mode") not in ("LIVE", "PAPER"):
+    st.session_state["ib_mode"] = _ib_mode
+elif st.session_state.get("ib_port") in (7496, 7497):
+    st.session_state["ib_mode"] = _ib_mode
+
+if "ib_cid" not in st.session_state:
+    st.session_state["ib_cid"] = _IB_DEFAULT_CLIENT_IDS.get(st.session_state["ib_mode"], 10)
+
+if "_ib_mode_prev" not in st.session_state:
+    st.session_state["_ib_mode_prev"] = st.session_state["ib_mode"]
+
+_sidebar_bg = "#f3f8ff" if st.session_state["ib_mode"] == "LIVE" else "#fff8e6"
+st.markdown(
+    f"""
+    <style>
+    section[data-testid="stSidebar"] > div {{
+        background-color: {_sidebar_bg};
+        border-right: 1px solid rgba(100, 116, 139, 0.12);
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+def _render_ib_mode_badge() -> None:
+    mode = str(st.session_state.get("ib_mode") or "LIVE").strip().upper()
+    if mode == "PAPER":
+        bg = "#fff3c4"
+        fg = "#7a5b00"
+        label = "PAPER"
+        dot = "#eab308"
+    else:
+        bg = "#dbeafe"
+        fg = "#1d4ed8"
+        label = "LIVE"
+        dot = "#3b82f6"
+    st.markdown(
+        f"""
+        <div style="
+            display:inline-flex;
+            align-items:center;
+            gap:0.5rem;
+            padding:0.3rem 0.8rem;
+            border-radius:999px;
+            background:{bg};
+            border:1px solid rgba(15, 23, 42, 0.08);
+            box-shadow:0 1px 2px rgba(15, 23, 42, 0.04);
+            color:{fg};
+            font-weight:600;
+            font-size:0.85rem;
+            line-height:1;
+            margin:0.2rem 0 0.65rem 0;
+        ">
+            <span style="width:0.55rem;height:0.55rem;border-radius:50%;background:{dot};display:inline-block;"></span>
+            <span style="opacity:0.78;">IB režim</span>
+            <span>{label}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 # ─── Note Viewer Mode (Samostatné okno) ───────────────────────────────────────
 if "view_event" in st.query_params:
@@ -91,6 +189,8 @@ if "note_id" in st.query_params:
     
     st.stop()  # Ukonči vykonávanie, nezobrazuj zvyšok aplikácie
 
+_render_ib_mode_badge()
+
 # ─── Globálny auto-refresh (beží na VŠETKÝCH stránkach) ───────────────────────
 from streamlit_autorefresh import st_autorefresh
 
@@ -108,6 +208,16 @@ auto_on = st.session_state.get("auto_refresh_on", False)
 _tj_skip_global = st.session_state.get("tj_active_page") == TWS_DASHBOARD_PAGE
 
 with st.sidebar:
+    st.markdown("### LIVE / PAPER")
+    st.radio(
+        "Režim",
+        options=["LIVE", "PAPER"],
+        horizontal=True,
+        key="ib_mode",
+        on_change=_apply_ib_mode,
+        label_visibility="visible",
+    )
+    st.caption("Prepne `7496` / `7497` a farbu panela.")
     st.markdown("### ⟳ Auto-refresh")
     st.toggle(
         "Automatická synchronizácia",
@@ -139,6 +249,8 @@ with st.sidebar:
                 "Na **TWS Dashboard** je globálna synchronizácia vypnutá (stabilita prehliadača). "
                 "Obnov dáta tlačidlom na stránke."
             )
+    st.caption(f"Aktívne IB pripojenie: `{ibkr.current_connection_label()}`")
+    st.caption(f"Aktívna DB: `{os.path.basename(db.get_active_db_path())}`")
 
 # ─── Globálna auto-synchronizácia (funguje na každej stránke) ─────────────────
 if auto_on and not _tj_skip_global:
@@ -151,7 +263,7 @@ if auto_on and not _tj_skip_global:
         _res = ibkr.fetch_positions(use_historical_last=False)
         if not _res.get("error"):
             _fetched_positions = _res["positions"]
-            st.session_state["live_positions"] = _fetched_positions
+            ibkr.set_scoped_session_value("live_positions", _fetched_positions)
             _sync = ibkr.sync_positions_to_db(_fetched_positions, db)
             st.session_state["last_sync"] = datetime.now().strftime("%H:%M:%S")
             st.session_state["sync_count"] = st.session_state.get("sync_count", 0) + 1
@@ -161,19 +273,30 @@ if auto_on and not _tj_skip_global:
                 st.toast(f"Auto-sync: {_sync['updated']} pozícií aktualizovaných", icon="🔄")
         # Objednávky z cache (openTrades) – bez sieťového volania, bezpečné
         _live_orders = ibkr.get_ib().openTrades() if ibkr.get_ib() else []
-        st.session_state["live_orders"] = [
-            {"ticker": t.contract.symbol, "sec_type": t.contract.secType,
-             "action": t.order.action, "total_qty": t.order.totalQuantity,
-             "order_type": t.order.orderType, "status": t.orderStatus.status,
-             "limit_price": t.order.lmtPrice if t.order.orderType in ("LMT","STP LMT") else None,
-             "option_type": ("Call" if t.contract.right=="C" else "Put") if t.contract.secType=="OPT" else None,
-             "strike": float(t.contract.strike) if t.contract.secType=="OPT" else None,
-             "expiry": t.contract.lastTradeDateOrContractMonth if t.contract.secType=="OPT" else None,
-            }
-            for t in _live_orders
-            if t.orderStatus.status in ("PendingSubmit","PreSubmitted","Submitted")
-            and t.contract.secType in ("OPT","STK")
-        ]
+        ibkr.set_scoped_session_value(
+            "live_orders",
+            [
+                {
+                    "ticker": t.contract.symbol,
+                    "sec_type": t.contract.secType,
+                    "action": t.order.action,
+                    "total_qty": t.order.totalQuantity,
+                    "order_type": t.order.orderType,
+                    "status": t.orderStatus.status,
+                    "limit_price": t.order.lmtPrice if t.order.orderType in ("LMT", "STP LMT") else None,
+                    "option_type": ("Call" if t.contract.right == "C" else "Put")
+                    if t.contract.secType == "OPT"
+                    else None,
+                    "strike": float(t.contract.strike) if t.contract.secType == "OPT" else None,
+                    "expiry": t.contract.lastTradeDateOrContractMonth
+                    if t.contract.secType == "OPT"
+                    else None,
+                }
+                for t in _live_orders
+                if t.orderStatus.status in ("PendingSubmit", "PreSubmitted", "Submitted")
+                and t.contract.secType in ("OPT", "STK")
+            ],
+        )
 
 # ─── Navigácia ────────────────────────────────────────────────────────────────
 dashboard = st.Page("pages/dashboard.py",  title="Dashboard",         icon=":material/dashboard:",      default=True)
@@ -237,7 +360,7 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Chyba: {e}")
     st.caption(
-        "Zahrnuté je všetko mimo .gitignore — vrátane **journal.db** (obchody, kalendár, konzultácie, nápady)."
+        "Zahrnuté je všetko mimo .gitignore — vrátane aktuálnej DB pre režim LIVE/PAPER (obchody, kalendár, konzultácie, nápady)."
     )
 
     st.divider()

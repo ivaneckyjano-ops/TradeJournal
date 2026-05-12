@@ -139,10 +139,8 @@ with tab_manage:
     def get_live_data():
         pos = []
         ords = []
-        if "live_positions" in st.session_state:
-            pos = st.session_state["live_positions"]
-        if "live_orders" in st.session_state:
-            ords = st.session_state["live_orders"]
+        pos = ibkr.get_scoped_session_value("live_positions", [])
+        ords = ibkr.get_scoped_session_value("live_orders", [])
         return pos, ords
 
     ibkr_positions, ibkr_orders = get_live_data()
@@ -157,12 +155,12 @@ with tab_manage:
             res_ord = job["orders"]
             if res and not res.get("error"):
                 ibkr_positions = res.get("positions", [])
-                st.session_state["live_positions"] = ibkr_positions
+                ibkr.set_scoped_session_value("live_positions", ibkr_positions)
             elif res and res.get("error"):
                 st.error(f"Chyba pozície: {res['error']}")
             if res_ord and not res_ord.get("error"):
                 ibkr_orders = res_ord.get("orders", [])
-                st.session_state["live_orders"] = ibkr_orders
+                ibkr.set_scoped_session_value("live_orders", ibkr_orders)
             job["status"] = "idle"
             _n_g = sum(1 for p in ibkr_positions if p.get("sec_type") == "OPT" and p.get("theta") is not None)
             _t_o = sum(1 for p in ibkr_positions if p.get("sec_type") == "OPT")
@@ -217,7 +215,7 @@ with tab_manage:
                 ib_obj.RequestTimeout = 0   # obnov default (bez limitu)
             if not res_orders.get("error"):
                 ibkr_orders = res_orders.get("orders", [])
-                st.session_state["live_orders"] = ibkr_orders
+                ibkr.set_scoped_session_value("live_orders", ibkr_orders)
 
             # Greeks: background vlákno (čistý Black-Scholes výpočet)
             stop_evt = threading.Event()

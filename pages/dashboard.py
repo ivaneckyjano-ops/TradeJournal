@@ -10,11 +10,11 @@ set_tradejournal_page("dashboard")
 
 # Nastav správne defaulty pre IBKR pripojenie ak ešte nie sú nastavené
 if "ib_port" not in st.session_state:
-    st.session_state["ib_port"] = 7496
+    st.session_state["ib_port"] = 7497 if st.session_state.get("ib_mode") == "PAPER" else 7496
 if "ib_host" not in st.session_state:
     st.session_state["ib_host"] = "127.0.0.1"
 if "ib_cid" not in st.session_state:
-    st.session_state["ib_cid"] = 10
+    st.session_state["ib_cid"] = 15 if st.session_state.get("ib_mode") == "PAPER" else 10
 
 # Auto-refresh odkaz na session_state nastavené v streamlit_app.py
 auto_on = st.session_state.get("auto_refresh_on", False)
@@ -33,7 +33,33 @@ st.info(
 )
 
 # ─── IBKR Panel ───────────────────────────────────────────────────────────────
+_IB_PRESET_CUSTOM = "Vlastné (port ručne)"
+
+def _ib_dashboard_apply_preset_port() -> None:
+    sel = st.session_state.get("ib_conn_preset")
+    if not sel or sel == _IB_PRESET_CUSTOM:
+        return
+    for label, prt in ibkr.IB_CONNECTION_PRESETS:
+        if label == sel:
+            st.session_state["ib_port"] = int(prt)
+            return
+
+
 with st.expander("IBKR Pripojenie", expanded=not _ib_connected):
+    _preset_labels = [lbl for lbl, _ in ibkr.IB_CONNECTION_PRESETS]
+    _preset_options = _preset_labels + [_IB_PRESET_CUSTOM]
+    st.selectbox(
+        "Cieľ / predvoľba portu",
+        options=_preset_options,
+        key="ib_conn_preset",
+        on_change=_ib_dashboard_apply_preset_port,
+        help="TWS aj IBKR Desktop používajú rovnaké API — líši sa len číslo portu v nastaveniach klienta. "
+        "Pred prepnutím na inú aplikáciu klikni Odpojiť.",
+    )
+    st.caption(
+        "**Predvoľby:** LIVE = **7496 / CID 10**, PAPER = **7497 / CID 15**. "
+        "Ak používaš IBKR Desktop, môžeš si porty prispôsobiť, ale live a paper musia mať vždy iný port aj client id."
+    )
     col1, col2, col3 = st.columns([2, 1, 1])
     with col1:
         host = st.text_input("Host", value="127.0.0.1", key="ib_host")
@@ -68,6 +94,8 @@ if _ib_connected:
     st.success("IBKR: Pripojený")
 else:
     st.warning("IBKR: Nie je pripojenie. Použi panel vyššie na pripojenie.")
+
+st.caption(f"Aktívne IB pripojenie: `{ibkr.current_connection_label()}`")
 
 st.divider()
 
@@ -116,10 +144,21 @@ if fills_btn:
     if fills_res["error"]:
         st.error(fills_res["error"])
     elif not fills_res["fills"]:
-        st.warning(
-            "IBKR nevrátil žiadne opčné výplne. Skús znova po obchode v TWS, "
-            "alebo skontroluj účet / typ klienta (Paper vs Live). Pri prvom pripojení často pomôže druhý klik."
-        )
+        n_raw = int(fills_res.get("raw_fill_count") or 0)
+        n_non = int(fills_res.get("non_option_fill_count") or 0)
+        if n_raw > 0:
+            st.warning(
+                f"IBKR vrátil **{n_raw}** výplní, ale **žiadna nie je opcia (OPT)** — tento import "
+                "berie len opčné nohy. Akcie, hotovosť alebo **BAG combo** z TWS sa tu preskakujú. "
+                f"(Nepočítané ako OPT: **{n_non}**.)"
+            )
+        else:
+            st.warning(
+                "IBKR nevrátil žiadne výplne cez API (prázdny zoznam po `reqExecutions` + cache). "
+                "Skús **znova** po exekúcii v TWS / IBKR Desktop, skontroluj **Paper vs Live** port "
+                "a účet, v TWS **Global Configuration → API** či je povolené čítanie exekúcií, "
+                "a či v **Account** nie je iný účet ako v denníku. Pri prvom pripojení pomôže druhý klik."
+            )
     else:
         n_in = len(fills_res["fills"])
         sync_f = ibkr.sync_fills_to_db(fills_res["fills"], db)

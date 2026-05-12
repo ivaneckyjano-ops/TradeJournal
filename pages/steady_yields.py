@@ -942,7 +942,7 @@ with tab_sy_monitor:
             if _rmon.get("error"):
                 st.error(_rmon["error"])
             else:
-                st.session_state["live_positions"] = _rmon.get("positions") or []
+                ibkr.set_scoped_session_value("live_positions", _rmon.get("positions") or [])
                 st.session_state["sy_direct_option_quotes"] = _direct_quotes
                 _sy_clear_monitor_ib_metrics_cache()
                 st.success("Pozície v cache.")
@@ -963,7 +963,7 @@ with tab_sy_monitor:
     _mon_dr = float(st.session_state.get("sy_th_dr", DELTA_RED_MIN))
     _mon_rd = int(st.session_state.get("sy_th_rd", ROLL_DTE_TRIGGER))
 
-    live_mon = st.session_state.get("live_positions") or []
+    live_mon = ibkr.get_scoped_session_value("live_positions", []) or []
 
     by_gid: dict[str, list] = defaultdict(list)
     for tr in db.get_open_trades():
@@ -1309,7 +1309,7 @@ with tab_yield:
         m3.metric("Realiz. APR %", f"{summ['realized_apr_pct']:.1f}" if summ["realized_apr_pct"] is not None else "—")
         m4.metric("Δ očak. APR", f"{summ['apr_gap_pct']:+.1f}" if summ["apr_gap_pct"] is not None else "—")
 
-        _live_pf = st.session_state.get("live_positions") or []
+        _live_pf = ibkr.get_scoped_session_value("live_positions", []) or []
         _gt_sel = trades_for_group(trades, sel_g)
         _mtm_b = _sy_group_open_options_mtm_usd(_gt_sel, _live_pf)
         _long_m = _mtm_b.get("long_usd")
@@ -1421,10 +1421,10 @@ with tab_mon:
         if _rpos.get("error"):
             st.error(_rpos["error"])
         else:
-            st.session_state["live_positions"] = _rpos.get("positions") or []
+            ibkr.set_scoped_session_value("live_positions", _rpos.get("positions") or [])
             st.success("Pozície aktualizované.")
             st.rerun()
-    live = st.session_state.get("live_positions") or []
+    live = ibkr.get_scoped_session_value("live_positions", []) or []
     direct_quotes = st.session_state.get("sy_direct_option_quotes") or {}
 
     gid_m = st.selectbox(

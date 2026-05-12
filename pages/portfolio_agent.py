@@ -391,7 +391,7 @@ all_trades = db.get_open_trades()
 
 # Zdroj live dát: session_state (naplnený zo stránky Skupiny)
 # Fallback: FETCH_JOB["positions"] je dict {"positions": [...], "error": ...}
-_ss_positions = st.session_state.get("live_positions", [])
+_ss_positions = ibkr.get_scoped_session_value("live_positions", [])
 _job_raw      = ibkr.FETCH_JOB.get("positions")
 _job_positions = (
     _job_raw.get("positions", [])
@@ -437,7 +437,7 @@ if ibkr.is_connected():
                     return
                 _job["positions"] = res
                 if res and not res.get("error"):
-                    st.session_state["live_positions"] = res.get("positions", [])
+                    ibkr.set_scoped_session_value("live_positions", res.get("positions", []))
                 _job["status"] = "done"
             except Exception as exc:
                 _job["error"] = str(exc)
@@ -459,7 +459,7 @@ if ibkr.is_connected():
         res = _job["positions"]
         if res and not res.get("error"):
             pos_cache = res.get("positions", [])
-            st.session_state["live_positions"] = pos_cache
+            ibkr.set_scoped_session_value("live_positions", pos_cache)
         _job["status"] = "idle"
         st.rerun()
 

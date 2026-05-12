@@ -4,19 +4,56 @@ import sqlite3
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
-DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "journal.db")
+_DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
+LIVE_DB_PATH = os.path.join(_DATA_DIR, "journal_live.db")
+PAPER_DB_PATH = os.path.join(_DATA_DIR, "journal_paper.db")
+LEGACY_DB_PATH = os.path.join(_DATA_DIR, "journal.db")
+
+# Backward-compatible alias used by tests / temporary overrides.
+DB_PATH = LIVE_DB_PATH
 
 
-def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+def _session_ib_mode() -> Optional[str]:
+    try:
+        import streamlit as st
+    except Exception:
+        return None
+    mode = str(getattr(st, "session_state", {}).get("ib_mode") or "").strip().upper()
+    return mode if mode in ("LIVE", "PAPER") else None
+
+
+def get_active_db_path(mode: Optional[str] = None) -> str:
+    """
+    Vráti aktuálny SQLite súbor.
+
+    Poradie:
+    1. explicitný override cez `DB_PATH` (napr. testy),
+    2. DB podľa `ib_mode` v `st.session_state`,
+    3. default `DB_PATH`.
+    """
+    override = globals().get("DB_PATH", LIVE_DB_PATH)
+    if override not in (LIVE_DB_PATH, PAPER_DB_PATH, LEGACY_DB_PATH):
+        return str(override)
+
+    current_mode = (mode or _session_ib_mode() or "").strip().upper()
+    if current_mode == "PAPER":
+        return PAPER_DB_PATH
+    if current_mode == "LIVE":
+        return LIVE_DB_PATH
+    return str(override)
+
+
+def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path or get_active_db_path())
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
 def init_db() -> None:
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    with get_connection() as conn:
+    path = get_active_db_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with get_connection(path) as conn:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS trades (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -217,6 +254,9 @@ def _migrate_trading_commands(conn: sqlite3.Connection) -> None:
         "close_strike": "ALTER TABLE trading_commands ADD COLUMN close_strike REAL",
         "close_right": "ALTER TABLE trading_commands ADD COLUMN close_right TEXT",
         "linked_trade_id": "ALTER TABLE trading_commands ADD COLUMN linked_trade_id INTEGER",
+        "assignment_watch_trade_id": "ALTER TABLE trading_commands ADD COLUMN assignment_watch_trade_id INTEGER",
+        "assignment_check_at": "ALTER TABLE trading_commands ADD COLUMN assignment_check_at TEXT",
+        "assignment_check_summary": "ALTER TABLE trading_commands ADD COLUMN assignment_check_summary TEXT",
     }.items():
         if col not in existing:
             conn.execute(sql)
@@ -2213,6 +2253,39 @@ def _tc_linked_trade_id(raw: Any) -> Optional[int]:
     return i if i > 0 else None
 
 
+def _tc_assignment_watch_trade_id(raw: Any) -> Optional[int]:
+    tid = _tc_linked_trade_id(raw)
+    if tid is None:
+        return None
+    t = get_trade_by_id(tid)
+    if t is None:
+        raise ValueError(f"Obchod assignment_watch_trade_id={tid} neexistuje.")
+    if str(t.get("leg_type") or "").strip() != "Short":
+        raise ValueError(
+            "Sledovaná noha musí byť **Short** v denníku (tá blokuje uzavretie longu, kým je v účte otvorená)."
+        )
+    return tid
+
+
+def record_trading_command_assignment_check(cmd_id: int, summary: str) -> int:
+    """Zapíše čas a text poslednej kontroly short nohy voči IB."""
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    sum_clean = (summary or "").strip() or None
+    with get_connection() as conn:
+        cur = conn.execute(
+            """
+            UPDATE trading_commands SET
+                assignment_check_at = ?,
+                assignment_check_summary = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (now, sum_clean, now, int(cmd_id)),
+        )
+        conn.commit()
+        return int(cur.rowcount)
+
+
 def _normalize_tc_close_fields(
     *,
     close_sec_type: Optional[str],
@@ -2279,6 +2352,7 @@ def insert_trading_command(
     close_strike: Optional[float] = None,
     close_right: Optional[str] = None,
     linked_trade_id: Any = None,
+    assignment_watch_trade_id: Any = None,
 ) -> int:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     tit = (title or "").strip()
@@ -2305,6 +2379,7 @@ def insert_trading_command(
     if ltid is not None:
         if get_trade_by_id(ltid) is None:
             raise ValueError(f"Obchod linked_trade_id={ltid} neexistuje.")
+    awid = _tc_assignment_watch_trade_id(assignment_watch_trade_id)
     with get_connection() as conn:
         cur = conn.execute(
             """
@@ -2312,8 +2387,9 @@ def insert_trading_command(
             (created_at, updated_at, title, ticker, action, order_kind, quantity, limit_price, stop_price, body, status,
              plan_group, step_index, tws_perm_id, tws_order_id, tws_manual_note,
              cond_under_cmp, cond_under_price, cond_after_fill, cond_detail,
-             trigger_kind, close_sec_type, close_expiry, close_strike, close_right, linked_trade_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             trigger_kind, close_sec_type, close_expiry, close_strike, close_right, linked_trade_id,
+             assignment_watch_trade_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 now,
@@ -2342,6 +2418,7 @@ def insert_trading_command(
                 cstk,
                 csr,
                 ltid,
+                awid,
             ),
         )
         conn.commit()
@@ -2412,6 +2489,7 @@ def update_trading_command(
     close_strike: Optional[float] = None,
     close_right: Optional[str] = None,
     linked_trade_id: Any = None,
+    assignment_watch_trade_id: Any = None,
     _all_fields: bool = False,
 ) -> int:
     """
@@ -2457,6 +2535,8 @@ def update_trading_command(
         if lt_u is not None and get_trade_by_id(lt_u) is None:
             raise ValueError(f"Obchod linked_trade_id={lt_u} neexistuje.")
         m["linked_trade_id"] = lt_u
+        aw_u = _tc_assignment_watch_trade_id(assignment_watch_trade_id)
+        m["assignment_watch_trade_id"] = aw_u
     else:
         if title is not None:
             m["title"] = (title or "").strip() or m["title"]
@@ -2511,6 +2591,9 @@ def update_trading_command(
             if lt_u is not None and get_trade_by_id(lt_u) is None:
                 raise ValueError(f"Obchod linked_trade_id={lt_u} neexistuje.")
             m["linked_trade_id"] = lt_u
+        if assignment_watch_trade_id is not None:
+            aw_u = _tc_assignment_watch_trade_id(assignment_watch_trade_id)
+            m["assignment_watch_trade_id"] = aw_u
     with get_connection() as conn:
         conn.execute(
             """
@@ -2519,7 +2602,8 @@ def update_trading_command(
                 quantity = ?, limit_price = ?, stop_price = ?, body = ?, status = ?,
                 plan_group = ?, step_index = ?, tws_perm_id = ?, tws_order_id = ?, tws_manual_note = ?,
                 cond_under_cmp = ?, cond_under_price = ?, cond_after_fill = ?, cond_detail = ?,
-                trigger_kind = ?, close_sec_type = ?, close_expiry = ?, close_strike = ?, close_right = ?, linked_trade_id = ?
+                trigger_kind = ?, close_sec_type = ?, close_expiry = ?, close_strike = ?, close_right = ?, linked_trade_id = ?,
+                assignment_watch_trade_id = ?
             WHERE id = ?
             """,
             (
@@ -2548,6 +2632,7 @@ def update_trading_command(
                 m.get("close_strike"),
                 m.get("close_right"),
                 m.get("linked_trade_id"),
+                m.get("assignment_watch_trade_id"),
                 int(cmd_id),
             ),
         )

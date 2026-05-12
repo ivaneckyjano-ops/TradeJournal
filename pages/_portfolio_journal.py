@@ -695,14 +695,62 @@ def _journal_resolve_spot_for_pl(ticker: str, ib_positions: list[dict]) -> tuple
     return s, "Symboly" if s is not None else None
 
 
-def _journal_long_leg_ib_market_value_usd(trade: dict, ib_positions: list[dict]) -> float | None:
-    """Aktuálna trhová hodnota Long nohy z IB cache (USD za celú pozíciu), alebo None."""
+def _journal_ib_opt_last_per_share(p: dict) -> float | None:
+    """Aktuálna cena opcie $/akcia z IB (``market_price`` po enrichi — preferuje Last)."""
+    if p.get("sec_type") not in ("OPT", "FOP"):
+        return None
+    px = p.get("market_price")
+    if px is None:
+        return None
+    try:
+        v = float(px)
+    except (TypeError, ValueError):
+        return None
+    if v <= 0 or math.isnan(v):
+        return None
+    return v
+
+
+def _journal_long_option_entry_per_share(trade: dict, p: dict | None) -> float | None:
+    """Kúpna prémia $/akcia: journal ``entry_price``, inak ``avg_cost``/100 z IB (ako sync z TWS)."""
+    try:
+        ep = float(trade.get("entry_price") or 0)
+    except (TypeError, ValueError):
+        ep = 0.0
+    a = abs(ep)
+    if a > 1e-12:
+        return a
+    if not p:
+        return None
+    try:
+        ac = float(p.get("avg_cost") or 0)
+    except (TypeError, ValueError):
+        return None
+    if ac <= 0 or math.isnan(ac):
+        return None
+    return ac / 100.0
+
+
+def _journal_long_leg_ib_last_vs_entry_pl_usd(trade: dict, ib_positions: list[dict]) -> float | None:
+    """Long: (last cena opcie − kúpna $/akcia) × kontrakty × 100 — z IB + journal."""
     if str(trade.get("leg_type") or "").strip().capitalize() != "Long":
         return None
     p = find_ibkr_option_for_trade(trade, ib_positions)
     if not p:
         return None
-    return _journal_ib_opt_market_value_line(p)
+    last = _journal_ib_opt_last_per_share(p)
+    if last is None:
+        return None
+    entry = _journal_long_option_entry_per_share(trade, p)
+    if entry is None:
+        return None
+    try:
+        q = abs(float(trade.get("contracts") or 1))
+    except (TypeError, ValueError):
+        return None
+    if q <= 0:
+        return None
+    return (last - entry) * q * 100.0
 
 
 def _journal_long_leg_bs_mark_value_usd(trade: dict, spot_anchor: float, r: float = 0.045) -> float | None:
@@ -738,6 +786,25 @@ def _journal_long_leg_bs_mark_value_usd(trade: dict, spot_anchor: float, r: floa
     return float(px) * c_abs * 100.0
 
 
+def _journal_long_leg_bs_pl_vs_entry_usd(
+    trade: dict, spot_anchor: float, r: float = 0.045
+) -> float | None:
+    """Long bez IB: (BS teoret. cena $/akcia pri ``spot_anchor`` − kúpna z žurnálu) × ks × 100."""
+    tot = _journal_long_leg_bs_mark_value_usd(trade, float(spot_anchor), r=r)
+    if tot is None:
+        return None
+    entry = _journal_long_option_entry_per_share(trade, None)
+    if entry is None:
+        return None
+    try:
+        q = abs(float(trade.get("contracts") or 1))
+    except (TypeError, ValueError):
+        return None
+    if q <= 0:
+        return None
+    return tot - entry * q * 100.0
+
+
 def _journal_long_leg_assignment_column_usd(
     trade: dict,
     ib_positions: list[dict],
@@ -745,17 +812,17 @@ def _journal_long_leg_assignment_column_usd(
     r: float = 0.045,
 ) -> tuple[float | None, str]:
     """
-    Hodnota do stĺpca PL pre Long: IB trhová hodnota, inak BS teoretická hodnota pri ``spot_anchor``.
-    Vráti (USD, ``\"ib\"`` | ``\"bs\"`` | ``\"\"``).
+    PL pre Long: **(last − kúpna prémia $/akcia) × kontrakty × 100** (IB + žurnál),
+    inak rovnaký vzorec s BS cenou pri ``spot_anchor`` ak chýba IB.
     """
-    mv_ib = _journal_long_leg_ib_market_value_usd(trade, ib_positions)
-    if mv_ib is not None:
-        return float(mv_ib), "ib"
+    pl_ib = _journal_long_leg_ib_last_vs_entry_pl_usd(trade, ib_positions)
+    if pl_ib is not None:
+        return float(pl_ib), "ib"
     if spot_anchor is None:
         return None, ""
-    bs_mv = _journal_long_leg_bs_mark_value_usd(trade, float(spot_anchor), r=r)
-    if bs_mv is not None:
-        return float(bs_mv), "bs"
+    pl_bs = _journal_long_leg_bs_pl_vs_entry_usd(trade, float(spot_anchor), r=r)
+    if pl_bs is not None:
+        return float(pl_bs), "bs"
     return None, ""
 
 
@@ -969,7 +1036,7 @@ def _journal_refresh_group_from_tws(legs_edit: list[dict]) -> tuple[bool, str]:
     if res.get("error"):
         return False, str(res["error"])
     poss = list(res.get("positions") or [])
-    st.session_state["live_positions"] = poss
+    ibkr.set_scoped_session_value("live_positions", poss)
     st.session_state["last_sync"] = datetime.now().strftime("%H:%M:%S")
     n_ok = 0
     for tr in legs_edit:
@@ -1005,7 +1072,7 @@ with st.expander("Synchronizácia s TWS / databázou (rovnako ako Dashboard)", e
                     st.session_state["pf_journal_sync_msg"] = ("error", str(res["error"]))
                 else:
                     sync = ibkr.sync_positions_to_db(res["positions"], db, close_missing=True)
-                    st.session_state["live_positions"] = res["positions"]
+                    ibkr.set_scoped_session_value("live_positions", res["positions"])
                     st.session_state["last_sync"] = datetime.now().strftime("%H:%M:%S")
                     st.session_state["pf_journal_sync_msg"] = (
                         "ok",
@@ -1027,7 +1094,7 @@ with st.expander("Synchronizácia s TWS / databázou (rovnako ako Dashboard)", e
                     st.session_state["pf_journal_sync_msg"] = ("error", str(res["error"]))
                 else:
                     poss = res.get("positions", [])
-                    st.session_state["live_positions"] = poss
+                    ibkr.set_scoped_session_value("live_positions", poss)
                     n_ok = 0
                     nomatch: list[str] = []
                     for tr in db.get_open_trades():
@@ -1142,7 +1209,7 @@ else:
             st.error(_txt)
     with st.expander("Vysvetlivky k metrikám (súčty pod tabuľkou skupiny)", expanded=False):
         st.markdown(_JOURNAL_METRICS_HELP_MD)
-    _pf_live_pos: list[dict] = list(st.session_state.get("live_positions") or [])
+    _pf_live_pos: list[dict] = list(ibkr.get_scoped_session_value("live_positions", []) or [])
     _journal_tab_labels = [_journal_group_tab_label(g) for g in _sort_keys]
     _grp_tabs = st.tabs(_journal_tab_labels)
     for _ti, gname in enumerate(_sort_keys):
@@ -1901,7 +1968,7 @@ else:
                         )
 
                     with st.expander(
-                        "PL pri uplatnení",
+                        "PL pri assignment",
                         expanded=False,
                     ):
                         _tk_asn = str(legs_edit[0].get("ticker") or "").strip().upper() if legs_edit else ""
@@ -1937,8 +2004,8 @@ else:
                                     _sum_note += " Long: kombinácia IB a BS."
                             elif _has_any_long:
                                 _sum_note = (
-                                    " Long: dopln **Obnoviť údaje z TWS** alebo úplné údaje nohy "
-                                    "(expirácia, strike, IV), aby sa doplnil PL."
+                                    " Long: dopln **Obnoviť údaje z TWS**, **vstupnú cenu** v žurnáli "
+                                    "alebo údaje nohy (expirácia, strike, IV), aby sa doplnil PL."
                                 )
                             else:
                                 _sum_note = ""
@@ -1951,17 +2018,23 @@ else:
                                     """
 **Čo znamenajú čísla** (bez poplatkov, orientačne):
 
-- **Short — PL:** pre **Spot** v danom riadku tabuľky: na 1 akciu podkladu  
-  **|vstupná prémia| + strike − spot**, na celú nohu **× počet kontraktov × 100**.  
-  Ide o zjednodušený scenár uplatnenia dodania podkladu pri **strike**.
+- **Krátka — PL:** pre **Spot** v danom riadku: na 1 akciu podkladu  
+  **|vstupná prémia| + strike − spot**, na celú nohu **× kontrakty × 100**.  
+  Je to **jeden riadok** so zjednodušeným účinkom short opcie pri údere: v čísle je naraz aj **prémia** (čo ste za opciu dostali / zaplatili podľa znamienka v journali berieme cez abs) aj časť **(strike − spot)** na akciu — teda nie je to len „prémia × ks × 100“, ale **prémia + (K − S)** na akciu × 100 × ks.
 
-- **Long — PL:** najprv **aktuálna trhová hodnota z IB** (cena kontraktu × kontrakty × 100, longové znamienko ako v cache).  
-  Ak sa noha s TWS **nespáruje**, doplní sa **Black–Scholes**: teoretická cena opcie pri **referenčnom spote** (horný riadok rebríka = aktuálny referenčný spot podkladu), čas do expirácie z expirácie nohy, IV z žurnálu (**IV aktuálna / IV vstup**; ak nič — ako pri grafoch v časopise, často základ 30 %).  
-  Hodnota Long je **v celej tabuľke rovnaká** (nezávisí od stĺpca Spot); mení sa len **krátka** časť podľa scenára.
+- **Dlhá — PL:** **iba long opcia**, nie nákup akcie pri údere:  
+  **(aktuálna cena opcie $/akcia − kúpna prémia $/akcia) × kontrakty × 100**.  
+  Cena z IB (**Last** / mark / mid) alebo z BS, ak chýba zhoda s TWS. Kúpna prémia z **vstupnej ceny** v žurnáli, prípadne z **IB avg_cost/100**.
 
-- **Σ NET:** súčet PL všetkých nôh v danom riadku (**krátka** podľa daného Spot + **dlhá** ako vyššie).
+- **Prečo nie „−S×ks×100 + K×ks×100 + opcia…“ na dlhej nohe?**  
+  Súčet **−spot + strike** na akciu (× 100 × ks) je pri tomto zjednodušení **už obsiahnutý v riadku krátkej nohy** (v člene **+ K − S**). Keby sme ten istý **(K − S)×100×ks** pripočítali ešte raz na dlhej nohe, **Σ NET** by **podklad dvojnásobne** započítal.  
+  Rozklad, ktorý popisuješ (**podklad (K−S) + zostatok long opcie (mark − nákup)**), sedí s **Σ NET**, len je u nás rozdelený: **(K−S) a prémia shortu** sú v **krátkej** bunke, **(cena long opcie − nákup)** v **dlhej**.
 
-**Layout:** rovnaký ako tabuľka **P&L vs. spot** — pre každý scenár spot riadky nôh a **Σ NET**. Krátka noha: PL závisí od **Spot** v riadku. Dlhá noha: PL podľa IB alebo BS.
+- **Σ NET:** súčet PL v riadku (**krátka** + **dlhá**).
+
+**Layout:** ako tabuľka **P&L vs. spot** — scenár spot v stĺpci, riadky nôh, **Σ NET**. Dlhá noha: PL **nezávisí od Spot** v stĺpci (opcia sa oceňuje referenčne / IB), mení sa len krátka časť podľa **Spot** v riadku.
+
+*Poznámka:* pre **short put** je reálny cashflow pri údere iný než pre **short call**; tá istá jednoradová formula je len **orientačný model** pre obe nohy.
 """
                                 )
                                 st.markdown(
@@ -2102,7 +2175,7 @@ else:
                                 if "PL (USD)" in _adf_asn.columns:
                                     _cc_asn["PL (USD)"] = st.column_config.TextColumn(
                                         "PL (USD)",
-                                        help="Short: uplatnenie (|prémia| + K − spot)×ks×100. Long: aktuálna MV z IB. Σ NET = Short + Long.",
+                                        help="Krátka: |prémia|+K−spot na akciu ×ks×100 (zjednoduš. assignment). Dlhá: (last−kúpna)×ks×100. Σ NET = súčet.",
                                         width="small",
                                     )
                                 st.dataframe(
@@ -2116,7 +2189,7 @@ else:
                                 )
                         else:
                             st.caption(
-                                "**PL pri uplatnení:** dopln **spot** podkladu (IB / Symboly), aby sa dal zobraziť rebrík scenárov."
+                                "**PL pri assignment:** dopln **spot** podkladu (IB / Symboly), aby sa dal zobraziť rebrík scenárov."
                             )
 
                 if st.button("Uložiť journal (Gréky, IV, Vega, skupina)", key=f"pf_sv_{_gkey}", type="primary"):

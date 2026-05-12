@@ -100,3 +100,55 @@ def test_trading_commands_manual_tws_fields(monkeypatch, tmp_path: Path) -> None
     assert r4["close_expiry"] == "20260320"
     assert r4["close_strike"] == 400.0
     assert r4["close_right"] == "C"
+
+    tid_short = db.add_trade(
+        "QQQ",
+        "TEST",
+        "Short",
+        "Call",
+        400.0,
+        "2026-06-19",
+        1,
+        1.0,
+        "2026-05-01",
+    )
+    tid_long = db.add_trade(
+        "QQQ",
+        "TEST",
+        "Long",
+        "Call",
+        410.0,
+        "2026-06-19",
+        1,
+        2.0,
+        "2026-05-01",
+    )
+    i5 = db.insert_trading_command(
+        "Po assign — long close",
+        ticker="QQQ",
+        status="draft",
+        trigger_kind="short_leg_assignment",
+        assignment_watch_trade_id=tid_short,
+        linked_trade_id=tid_long,
+    )
+    r5 = db.get_trading_command(i5)
+    assert r5 is not None
+    assert r5["assignment_watch_trade_id"] == tid_short
+
+    n = db.record_trading_command_assignment_check(i5, "BLOK: short v účte.")
+    assert n == 1
+    r5b = db.get_trading_command(i5)
+    assert r5b is not None
+    assert r5b.get("assignment_check_summary") == "BLOK: short v účte."
+    assert r5b.get("assignment_check_at")
+
+    try:
+        db.insert_trading_command(
+            "Zlý watch",
+            ticker="QQQ",
+            assignment_watch_trade_id=tid_long,
+        )
+    except ValueError as e:
+        assert "Short" in str(e)
+    else:
+        raise AssertionError("očakávaná ValueError pre Long nohu ako watch")
