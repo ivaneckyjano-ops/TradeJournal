@@ -404,6 +404,43 @@ def journal_spot_levels_descending(high: float, low: float, step: float) -> list
     return dedup
 
 
+def journal_spot_levels_band(
+    center: float,
+    above_usd: float,
+    below_usd: float,
+    step: float,
+) -> list[float]:
+    """
+    Spotové úrovne od ``center + above_usd`` smerom nadol po ``max(1, center − below_usd)``, krok ``step``.
+
+    Oproti ``journal_spot_levels_descending(center, low, …)`` pridáva aj **úrovne nad** referenčným spotom.
+    Ak presný ``center`` nepadne na mriežku kroku, doplní sa do zoznamu.
+    """
+    c = float(center)
+    if c <= 0 or math.isnan(c):
+        return []
+    ab = max(0.0, float(above_usd))
+    be = max(0.0, float(below_usd))
+    hi = c + ab
+    lo = max(1.0, c - be)
+    if hi < lo:
+        hi, lo = lo, hi
+    st = max(0.01, float(step))
+    out = journal_spot_levels_descending(hi, lo, st)
+    eps = max(1e-6, st * 1e-4)
+    if not any(abs(x - c) < eps for x in out):
+        out = out + [round(c, 4)]
+    out.sort(reverse=True)
+    seen: set[float] = set()
+    dedup: list[float] = []
+    for v in out:
+        if v in seen:
+            continue
+        seen.add(v)
+        dedup.append(v)
+    return dedup
+
+
 def _pl_long_short_net_at_spot_today(legs: list[dict], S: float, r: float) -> tuple[float, float, float]:
     """Súčet modelového P&L „dnes“ (USD) pre long nohy, pre short nohy a čistý súčet."""
     long_tot = 0.0

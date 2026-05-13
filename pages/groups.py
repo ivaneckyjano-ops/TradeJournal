@@ -671,6 +671,7 @@ with tab_assign:
     st.subheader("Priradiť skupinu obchodom")
     st.caption(
         "**Návod:** Vyber existujúcu **skupinu**, v multiselect označ všetky nohy, ktoré majú mať rovnaké **Group ID**, a stlač **Priradiť**. "
+        "Zoznam obsahuje len **otvorené** nohy (stav Open) — uzavreté sa sem nedávajú. "
         "Rovnaké vieš aj v **Trade Log → Upraviť / Zoskupiť**."
     )
 
@@ -682,7 +683,7 @@ with tab_assign:
         sel_group = st.selectbox("Vyber skupinu", list(group_options.keys()), key="assign_group")
         st.caption("Pri priraďovaní nezabudni, že správny ticker si spravuj v **Symboly**. Tu sa len viaže už existujúca noha ku skupine.")
 
-        all_trades_assign = db.get_all_trades()
+        all_trades_assign = db.get_open_trades()
         trade_labels = {
             f"#{t['id']} | {t['ticker']} {t.get('leg_type','')} {t.get('option_type','')} "
             f"${t.get('strike',0):.0f} {t.get('expiry','')} "
@@ -690,21 +691,27 @@ with tab_assign:
             for t in all_trades_assign
         }
 
-        # Predvyber aktuálne priradené
+        # Predvyber aktuálne priradené (iba otvorené nohy sú v zozname)
         preselected = [
             lbl for lbl, tid in trade_labels.items()
             if next((t for t in all_trades_assign if t["id"] == tid), {}).get("group_id") == sel_group
         ]
 
-        selected = st.multiselect(
-            "Vyber nohy pre túto skupinu",
-            options=list(trade_labels.keys()),
-            default=preselected,
-            key="assign_trades_ms",
-        )
+        if not trade_labels:
+            st.info(
+                "V denníku nemáš žiadne **otvorené** nohy (stav Open) — nie je čo priradiť. "
+                "Skontroluj režim LIVE/PAPER a načítaj pozície z IB na Dashboarde."
+            )
+        else:
+            selected = st.multiselect(
+                "Vyber nohy pre túto skupinu",
+                options=list(trade_labels.keys()),
+                default=preselected,
+                key="assign_trades_ms",
+            )
 
-        if st.button("Priradiť", type="primary", key="assign_btn"):
-            ids = [trade_labels[lbl] for lbl in selected]
-            db.bulk_set_group_id(ids, sel_group)
-            st.success(f"Skupina **{sel_group}** priradená {len(ids)} nohám.")
-            st.rerun()
+            if st.button("Priradiť", type="primary", key="assign_btn"):
+                ids = [trade_labels[lbl] for lbl in selected]
+                db.bulk_set_group_id(ids, sel_group)
+                st.success(f"Skupina **{sel_group}** priradená {len(ids)} nohám.")
+                st.rerun()

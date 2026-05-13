@@ -27,6 +27,7 @@ from core.journal_pnl_curve import (
     journal_group_pl_ladder_tws_style_rows,
     journal_group_pl_stoploss_short_window,
     journal_group_pl_vs_spot,
+    journal_spot_levels_band,
     journal_spot_levels_descending,
 )
 from core.portfolio_data import (
@@ -682,6 +683,22 @@ def _journal_fmt_spot_cell_str(v: object) -> str:
         return f"{float(v):.2f}"
     except (TypeError, ValueError):
         return ""
+
+
+def _journal_fmt_dspot_cell_str(v: object) -> str:
+    """Rozdiel scenárového spotu oproti referenčnému (USD), so znamienkom."""
+    if v is None:
+        return ""
+    try:
+        fv = float(v)
+    except (TypeError, ValueError):
+        return ""
+    if math.isnan(fv):
+        return ""
+    if abs(fv) < 1e-6:
+        return "0.00"
+    sign = "+" if fv > 0 else ""
+    return f"{sign}{fv:.2f}"
 
 
 def _journal_fmt_pl_usd_cell_str(v: object) -> str:
@@ -2062,26 +2079,36 @@ else:
 
 - **Σ NET:** súčet PL v riadku (**krátka** + **dlhá**).
 
-**Layout:** ako tabuľka **P&L vs. spot** — scenár spot v stĺpci, riadky nôh, **Σ NET**. Dlhá noha: PL **nezávisí od Spot** v stĺpci (opcia sa oceňuje referenčne / IB), mení sa len krátka časť podľa **Spot** v riadku.
+**Layout:** ako tabuľka **P&L vs. spot** — scenár **Spot**, stĺpec **Δ spot** = o koľko USD je scenár nad/pod **referenčným spotom** (bázis z IB / Symboly), riadky nôh, **Σ NET**. Dlhá noha: PL **nezávisí od Spot** v stĺpci (opcia sa oceňuje referenčne / IB), mení sa len krátka časť podľa **Spot** v riadku.
 
 *Poznámka:* pre **short put** je reálny cashflow pri údere iný než pre **short call**; tá istá jednoradová formula je len **orientačný model** pre obe nohy.
 """
                                 )
                                 st.markdown(
-                                    f"**Referenčný spot** (horný v rebríku) = **{_hi_asn:.2f}** ({_src_asn_hi or '—'})."
+                                    f"**Referenčný spot** (bázis pre stĺpec Δ) = **{_hi_asn:.2f}** ({_src_asn_hi or '—'})."
                                     + _sum_note
                                 )
 
-                            _ac1, _ac2 = st.columns(2)
+                            _ac1, _ac2, _ac3 = st.columns(3)
                             with _ac1:
-                                _asn_lo = st.number_input(
-                                    "Spot až po (USD)",
-                                    min_value=1.0,
-                                    value=170.0,
+                                _asn_above = st.number_input(
+                                    "Nad spotom (USD)",
+                                    min_value=0.0,
+                                    value=25.0,
                                     step=1.0,
-                                    key=f"pf_asn_tbl_lo_{_gkey}",
+                                    help="Scenáre s podkladom vyšším ako referenčný spot o túto sumu (horná hranica rebríka).",
+                                    key=f"pf_asn_tbl_ab_{_gkey}",
                                 )
                             with _ac2:
+                                _asn_below = st.number_input(
+                                    "Pod spotom (USD)",
+                                    min_value=0.0,
+                                    value=50.0,
+                                    step=1.0,
+                                    help="Scenáre s podkladom nižším ako referenčný spot o túto sumu (dolná hranica rebríka).",
+                                    key=f"pf_asn_tbl_be_{_gkey}",
+                                )
+                            with _ac3:
                                 _asn_step = st.number_input(
                                     "Krok (USD)",
                                     min_value=0.05,
@@ -2090,12 +2117,21 @@ else:
                                     format="%.2f",
                                     key=f"pf_asn_tbl_st_{_gkey}",
                                 )
-                            _lv_asn = journal_spot_levels_descending(
-                                float(_hi_asn), float(_asn_lo), float(_asn_step)
+                            st.caption(
+                                f"Rebrík spotov: od **{_hi_asn + float(_asn_above):.2f}** nadol po **{max(1.0, _hi_asn - float(_asn_below)):.2f}** "
+                                f"(referencia **{_hi_asn:.2f}** uprostred rozsahu; krok **{_asn_step:g}** USD)."
+                            )
+                            _lv_asn = journal_spot_levels_band(
+                                float(_hi_asn),
+                                float(_asn_above),
+                                float(_asn_below),
+                                float(_asn_step),
                             )
                             _asn_tws_rows: list[dict] = []
+                            _ref_asn = float(_hi_asn)
                             for _sv in _lv_asn:
                                 _spot_r = round(float(_sv), 2)
+                                _dspot_r = round(_spot_r - _ref_asn, 2)
                                 _net_asn = 0
                                 for _leg in _legs_display_order_ui(legs_edit):
                                     _lt = str(_leg.get("leg_type") or "").strip().capitalize()
@@ -2118,6 +2154,7 @@ else:
                                         _asn_tws_rows.append(
                                             {
                                                 "spot": _spot_r,
+                                                "dspot_usd": _dspot_r,
                                                 "kontrakt": _lbl,
                                                 "noha": _lt or "—",
                                                 "ks": f"{_ks_signed:+d}",
@@ -2130,6 +2167,7 @@ else:
                                         _asn_tws_rows.append(
                                             {
                                                 "spot": _spot_r,
+                                                "dspot_usd": _dspot_r,
                                                 "kontrakt": _lbl,
                                                 "noha": _lt or "—",
                                                 "ks": f"{_ks_signed:+d}",
@@ -2148,6 +2186,7 @@ else:
                                     _asn_tws_rows.append(
                                         {
                                             "spot": _spot_r,
+                                            "dspot_usd": _dspot_r,
                                             "kontrakt": _lbl,
                                             "noha": _lt or "—",
                                             "ks": f"{_ks_signed:+d}",
@@ -2158,6 +2197,7 @@ else:
                                 _asn_tws_rows.append(
                                     {
                                         "spot": _spot_r,
+                                        "dspot_usd": _dspot_r,
                                         "kontrakt": "Σ NET",
                                         "noha": "",
                                         "ks": "",
@@ -2170,6 +2210,7 @@ else:
                                 _adf_asn = _adf_asn.rename(
                                     columns={
                                         "spot": "Spot",
+                                        "dspot_usd": "Δ spot (USD)",
                                         "kontrakt": "Kontrakt",
                                         "noha": "Noha",
                                         "ks": "Ks.",
@@ -2177,12 +2218,22 @@ else:
                                     }
                                 )
                                 _adf_asn["Spot"] = _adf_asn["Spot"].map(_journal_fmt_spot_cell_str)
+                                if "Δ spot (USD)" in _adf_asn.columns:
+                                    _adf_asn["Δ spot (USD)"] = _adf_asn["Δ spot (USD)"].map(
+                                        _journal_fmt_dspot_cell_str
+                                    )
                                 _adf_asn["PL (USD)"] = _adf_asn["PL (USD)"].map(_journal_fmt_pl_usd_cell_str)
                                 _cc_asn: dict = {}
                                 if "Spot" in _adf_asn.columns:
                                     _cc_asn["Spot"] = st.column_config.TextColumn(
                                         "Spot",
-                                        help="Scenár spotu (text = zarovnanie vľavo).",
+                                        help="Scenár ceny podkladu (USD).",
+                                        width="small",
+                                    )
+                                if "Δ spot (USD)" in _adf_asn.columns:
+                                    _cc_asn["Δ spot (USD)"] = st.column_config.TextColumn(
+                                        "Δ spot (USD)",
+                                        help="Scenárny spot mínus referenčný spot (IB / Symboly); + = vyššie podklad.",
                                         width="small",
                                     )
                                 if "Kontrakt" in _adf_asn.columns:

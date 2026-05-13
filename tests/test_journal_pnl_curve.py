@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import pytest
+
 from core.journal_pnl_curve import (
     _leg_pl_usd,
     journal_group_pl_ladder_tws_style_rows,
     journal_group_pl_rows_at_spots,
     journal_group_pl_stoploss_short_window,
     journal_group_pl_vs_spot,
+    journal_spot_levels_band,
     journal_spot_levels_descending,
 )
 
@@ -98,7 +101,19 @@ def test_journal_spot_levels_descending():
     assert all(lv[i] >= lv[i + 1] for i in range(len(lv) - 1))
 
 
-def test_journal_group_pl_rows_at_spots_matches_long_short():
+def test_journal_spot_levels_band_symmetric():
+    """Rebrík zahŕňa spot nad referenciou aj pod ňou; referencia ostáva v zozname."""
+    c = 100.0
+    lv = journal_spot_levels_band(c, above_usd=10.0, below_usd=10.0, step=2.5)
+    assert lv[0] == pytest.approx(110.0)
+    assert lv[-1] == pytest.approx(90.0)
+    assert any(abs(x - c) < 1e-6 for x in lv)
+    assert all(lv[i] >= lv[i + 1] for i in range(len(lv) - 1))
+
+
+def test_journal_spot_levels_band_off_grid_includes_center():
+    lv = journal_spot_levels_band(100.03, 5.0, 5.0, step=2.0)
+    assert any(abs(x - 100.03) < 0.01 for x in lv)
     legs = [
         {
             "ticker": "T",
