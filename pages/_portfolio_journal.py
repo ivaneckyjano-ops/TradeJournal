@@ -30,6 +30,7 @@ from core.journal_pnl_curve import (
     journal_spot_levels_band,
     journal_spot_levels_descending,
 )
+from core import delta_hedge_paper as dhp
 from core.portfolio_data import (
     calc_dte,
     find_ibkr_option_for_trade,
@@ -127,6 +128,84 @@ with st.expander("Návod na použitie", expanded=False):
             "Skopíruj z repozitára **docs/journal-greky.md** alebo ho obnov z gitu."
         )
 
+
+def _render_delta_hedge_panel() -> None:
+    """
+    Súčet Δ z otvorených nôh v aktívnej DB (LIVE aj PAPER), spot (Symboly + override),
+    odporúčaný obchod na podklade a deadband. Len výpočet — žiadne odosielanie príkazov.
+    """
+    with st.expander("Delta hedge — podklad prvého rádu", expanded=False):
+        st.caption(
+            "Výpočet z **otvorených nôh** v aktívnej DB a polí **Δ aktuálna** (inak Δ vstup). "
+            "Pred rozhodnutím obnov Δ z TWS (**Doplniť aktuálne Gréky z TWS → journal**). "
+            "**Neodosiela príkazy** — len orientačné čísla; obchod v TWS vždy ručne."
+        )
+        open_tr = [t for t in db.get_open_trades() if str(t.get("status") or "Open").lower() == "open"]
+        by_tk = dhp.net_delta_shares_by_ticker(open_tr)
+        if not by_tk:
+            st.info("Žiadne otvorené nohy — nie je čo hedžovať.")
+            return
+        c1, c2 = st.columns(2)
+        with c1:
+            target_d = st.number_input(
+                "Cieľová čistá Δ na ticker (akcie; opcie + podklad po hedži)",
+                value=5.0,
+                step=1.0,
+                format="%.2f",
+                key="dh_paper_target_shares",
+                help="Rovnaký cieľ pre každý podklad zvlášť; predvolene +5 akcií (mierne long delta po hedži).",
+            )
+        with c2:
+            deadband = st.number_input(
+                "Deadband (|hedge| pod týmto = neobchodovať)",
+                value=5.0,
+                min_value=0.0,
+                step=1.0,
+                format="%.1f",
+                key="dh_paper_deadband_shares",
+            )
+        st.markdown(
+            "**Spot podkladu (USD)** — prednosť **Symboly**; ak je spot 0, panel doplní "
+            "orientačné predvolené hodnoty **AMZN 262.84**, **UNH 375.46** (iba úvodné načítanie)."
+        )
+        tickers = list(by_tk.keys())
+        ncols = min(3, len(tickers))
+        cols = st.columns(ncols)
+        _paper_spot_fallback = {"AMZN": 262.84, "UNH": 375.46}
+        for i, tk in enumerate(tickers):
+            sym = db.get_symbol(tk)
+            base_spot = float(sym["spot"] or 0.0) if sym else 0.0
+            sk = f"dh_paper_spot_{tk}"
+            if sk not in st.session_state:
+                init_sp = base_spot if base_spot > 0 else float(_paper_spot_fallback.get(tk, 0.0))
+                st.session_state[sk] = float(init_sp)
+            with cols[i % ncols]:
+                st.number_input(f"{tk}", min_value=0.0, step=0.01, format="%.2f", key=sk)
+        rows: list[dict] = []
+        for tk in tickers:
+            net = float(by_tk[tk])
+            spot = float(st.session_state.get(f"dh_paper_spot_{tk}", 0.0) or 0.0)
+            dd = dhp.dollar_delta(net, spot) if spot > 0 else None
+            hedge = dhp.hedge_shares_for_target(net, float(target_d))
+            _, inside = dhp.apply_deadband(hedge, float(deadband))
+            rows.append(
+                {
+                    "Ticker": tk,
+                    "Čistá Δ opcie (akcie)": round(net, 2),
+                    "Spot": round(spot, 2) if spot else None,
+                    "$ Δ (opcie)": round(dd, 0) if dd is not None else None,
+                    "Hedge podklad (akcie)": round(hedge, 2),
+                    "V deadband": "Áno" if inside else "Nie",
+                    "Odporúčanie": dhp.hedge_action_label(hedge) if not inside else "Zatiaľ neobchodovať (deadband)",
+                }
+            )
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        if any(float(st.session_state.get(f"dh_paper_spot_{tk}", 0.0) or 0.0) <= 0 for tk in tickers):
+            st.warning("Pre ticker bez spotu dopln **Symboly** alebo spot vyššie — inak chýba **$Δ**.")
+
+
+st.divider()
+_render_delta_hedge_panel()
 st.divider()
 
 
