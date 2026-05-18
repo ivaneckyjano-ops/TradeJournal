@@ -6,6 +6,7 @@ from core.delta_hedge_paper import (
     hedge_shares_for_target,
     leg_delta_shares,
     net_delta_shares_by_ticker,
+    net_delta_shares_for_ticker,
 )
 
 
@@ -53,3 +54,11 @@ def test_apply_deadband():
 def test_hedge_action_label():
     assert "Nakúpiť" in hedge_action_label(10.0)
     assert "Predať" in hedge_action_label(-10.0)
+
+
+def test_net_delta_shares_for_ticker_synthetic():
+    legs = [
+        {"ticker": "MSFT", "leg_type": "Short", "contracts": 1, "delta_current": 0.317},
+        {"ticker": "MSFT", "leg_type": "Long", "contracts": 1, "delta_current": 0.475},
+    ]
+    assert abs(net_delta_shares_for_ticker(legs, "MSFT") - 15.8) < 0.01

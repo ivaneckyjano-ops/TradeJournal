@@ -39,6 +39,15 @@ from core.portfolio_data import (
     unrealized_by_journal_ids_for_ib_legs,
 )
 from core.page_context import set_tradejournal_page
+from core.spread_mentor import (
+    analyze_calendar_mentor,
+    analyze_diagonal_mentor,
+    compute_journal_group_greek_snapshot,
+    journal_greek_comparison_rows,
+    journal_greek_mentor_hints,
+    mentor_calendar_rows,
+    mentor_comparison_rows,
+)
 
 db.init_db()
 set_tradejournal_page("portfolio")
@@ -132,81 +141,289 @@ with st.expander("Návod na použitie", expanded=False):
 def _render_delta_hedge_panel() -> None:
     """
     Súčet Δ z otvorených nôh v aktívnej DB (LIVE aj PAPER), spot (Symboly + override),
-    odporúčaný obchod na podklade a deadband. Len výpočet — žiadne odosielanie príkazov.
+    odporúčaný obchod na podklade a deadband. Sekcia „Úvaha“ — manuálne nohy bez DB.
     """
+    def _cell_float(v) -> float | None:
+        """Parsovanie čísla z bunky editora (modul ešte nemusí mať ``_journal_float_for_sum`` — voláme skoro na začiatku súboru)."""
+        if v is None or v is pd.NA:
+            return None
+        try:
+            if pd.isna(v):
+                return None
+        except (TypeError, ValueError):
+            pass
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            return None
+        if isinstance(x, float) and math.isnan(x):
+            return None
+        return x
+
     with st.expander("Delta hedge — podklad prvého rádu", expanded=False):
         st.caption(
-            "Výpočet z **otvorených nôh** v aktívnej DB a polí **Δ aktuálna** (inak Δ vstup). "
-            "Pred rozhodnutím obnov Δ z TWS (**Doplniť aktuálne Gréky z TWS → journal**). "
-            "**Neodosiela príkazy** — len orientačné čísla; obchod v TWS vždy ručne."
+            "**Z DB:** otvorené nohy a **Δ aktuálna** (inak Δ vstup). **Úvaha:** skopíruj Δ z OptionTrader/TWS — "
+            "**nič sa neukladá** do denníka. **Neodosiela príkazy** — len orientačné čísla."
         )
         open_tr = [t for t in db.get_open_trades() if str(t.get("status") or "Open").lower() == "open"]
         by_tk = dhp.net_delta_shares_by_ticker(open_tr)
+
+        st.markdown("##### Z portfólia (otvorené nohy v DB)")
+        _dh_ib_ok = ibkr.is_connected()
+        if not _dh_ib_ok:
+            st.warning("**IBKR nie je pripojený** — na Dashboarde alebo v sidebari stlač **Pripojiť** (TWS musí bežať).")
+        else:
+            _dbc1, _dbc2 = st.columns(2)
+            with _dbc1:
+                if st.button(
+                    "Stiahnuť pozície z IBKR → DB",
+                    type="primary",
+                    use_container_width=True,
+                    key="dh_journal_sync_positions",
+                    help="Zosúladí otvorené nohy v denníku s portfóliom v TWS (rovnaké ako „Importovať pozície“ nižšie na stránke).",
+                ):
+                    with st.spinner("Načítavam portfólio z IBKR…"):
+                        _res_p = ibkr.fetch_positions(use_historical_last=False)
+                    if _res_p.get("error"):
+                        st.session_state["dh_ib_sync_msg"] = ("error", str(_res_p["error"]))
+                    else:
+                        _sync = ibkr.sync_positions_to_db(_res_p["positions"], db, close_missing=True)
+                        ibkr.set_scoped_session_value("live_positions", _res_p["positions"])
+                        st.session_state["last_sync"] = datetime.now().strftime("%H:%M:%S")
+                        st.session_state["dh_ib_sync_msg"] = (
+                            "ok",
+                            f"Pozície v DB: pridané **{_sync['added']}** · aktualizované **{_sync.get('updated', 0)}** · "
+                            f"uzavreté **{_sync.get('closed', 0)}**.",
+                        )
+                    st.rerun()
+            with _dbc2:
+                if st.button(
+                    "Doplniť Gréky z TWS → DB (všetky otvorené nohy)",
+                    type="secondary",
+                    use_container_width=True,
+                    key="dh_journal_sync_greeks_all",
+                    help="Načíta pozície s Grékmi a zapíše Δ, IV, Θ, Vega do DB pre každú otvorenú nohu so zhodou v TWS.",
+                ):
+                    with st.spinner("Sťahujem Gréky z TWS…"):
+                        _res_g = ibkr.fetch_positions(with_greeks=True, use_historical_last=False)
+                    if _res_g.get("error"):
+                        st.session_state["dh_ib_sync_msg"] = ("error", str(_res_g["error"]))
+                    else:
+                        _poss = list(_res_g.get("positions") or [])
+                        ibkr.set_scoped_session_value("live_positions", _poss)
+                        st.session_state["last_sync"] = datetime.now().strftime("%H:%M:%S")
+                        _n_ok = 0
+                        _nom: list[str] = []
+                        for _tr in db.get_open_trades():
+                            if str(_tr.get("status") or "Open").strip().lower() != "open":
+                                continue
+                            if _journal_write_live_greeks_for_trade(_tr, _poss):
+                                _n_ok += 1
+                            else:
+                                _tk = str(_tr.get("ticker") or "")
+                                _nom.append(f"{_tk} {_tr.get('strike')} {_tr.get('expiry')} {_tr.get('option_type')}")
+                        _ex = f" Bez zhody ({len(_nom)}): {', '.join(_nom[:6])}" if _nom else ""
+                        if len(_nom) > 6:
+                            _ex += "…"
+                        st.session_state["dh_ib_sync_msg"] = ("ok", f"Gréky v DB: **{_n_ok}** nôh.{_ex}")
+                    st.rerun()
+        _dh_sync_pop = st.session_state.pop("dh_ib_sync_msg", None)
+        if _dh_sync_pop:
+            _dk, _dt = _dh_sync_pop
+            if _dk == "error":
+                st.error(_dt)
+            else:
+                st.success(_dt)
+
         if not by_tk:
-            st.info("Žiadne otvorené nohy — nie je čo hedžovať.")
-            return
-        c1, c2 = st.columns(2)
-        with c1:
-            target_d = st.number_input(
-                "Cieľová čistá Δ na ticker (akcie; opcie + podklad po hedži)",
+            st.info(
+                "Žiadne otvorené nohy v DB — ak máš pozície v TWS, stlač **Stiahnuť pozície z IBKR → DB**, "
+                "potom **Doplniť Gréky z TWS → DB** (potrebné je IB pripojenie). Alebo použij **Úvaha bez pozície** nižšie."
+            )
+        else:
+            c1, c2 = st.columns(2)
+            with c1:
+                target_d = st.number_input(
+                    "Cieľová čistá Δ na ticker (akcie; opcie + podklad po hedži)",
+                    value=5.0,
+                    step=1.0,
+                    format="%.2f",
+                    key="dh_paper_target_shares",
+                    help="Rovnaký cieľ pre každý podklad zvlášť; predvolene +5 akcií (mierne long delta po hedži).",
+                )
+            with c2:
+                deadband = st.number_input(
+                    "Deadband (|hedge| pod týmto = neobchodovať)",
+                    value=5.0,
+                    min_value=0.0,
+                    step=1.0,
+                    format="%.1f",
+                    key="dh_paper_deadband_shares",
+                )
+            st.markdown(
+                "**Spot podkladu (USD)** — prednosť **Symboly**; ak je spot 0, panel doplní "
+                "orientačné predvolené hodnoty **AMZN 262.84**, **UNH 375.46** (iba úvodné načítanie)."
+            )
+            tickers = list(by_tk.keys())
+            ncols = min(3, len(tickers))
+            cols = st.columns(ncols)
+            _paper_spot_fallback = {"AMZN": 262.84, "UNH": 375.46}
+            for i, tk in enumerate(tickers):
+                sym = db.get_symbol(tk)
+                base_spot = float(sym["spot"] or 0.0) if sym else 0.0
+                sk = f"dh_paper_spot_{tk}"
+                if sk not in st.session_state:
+                    init_sp = base_spot if base_spot > 0 else float(_paper_spot_fallback.get(tk, 0.0))
+                    st.session_state[sk] = float(init_sp)
+                with cols[i % ncols]:
+                    st.number_input(f"{tk}", min_value=0.0, step=0.01, format="%.2f", key=sk)
+            rows: list[dict] = []
+            for tk in tickers:
+                net = float(by_tk[tk])
+                spot = float(st.session_state.get(f"dh_paper_spot_{tk}", 0.0) or 0.0)
+                dd = dhp.dollar_delta(net, spot) if spot > 0 else None
+                hedge = dhp.hedge_shares_for_target(net, float(target_d))
+                _, inside = dhp.apply_deadband(hedge, float(deadband))
+                rows.append(
+                    {
+                        "Ticker": tk,
+                        "Čistá Δ opcie (akcie)": round(net, 2),
+                        "Spot": round(spot, 2) if spot else None,
+                        "$ Δ (opcie)": round(dd, 0) if dd is not None else None,
+                        "Hedge podklad (akcie)": round(hedge, 2),
+                        "V deadband": "Áno" if inside else "Nie",
+                        "Odporúčanie": dhp.hedge_action_label(hedge) if not inside else "Zatiaľ neobchodovať (deadband)",
+                    }
+                )
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            if any(float(st.session_state.get(f"dh_paper_spot_{tk}", 0.0) or 0.0) <= 0 for tk in tickers):
+                st.warning("Pre ticker bez spotu dopln **Symboly** alebo spot vyššie — inak chýba **$Δ**.")
+
+        st.divider()
+        st.markdown("##### Úvaha bez pozície v DB (manuálne nohy)")
+        st.caption(
+            "Vyber **ticker zo Symboly** a do tabuľky **Long/Short**, **Δ na akciu** (0–1) a **kontrakty** ako v TWS. "
+            "Príklad: MSFT calendar — Short 0,317 / Long 0,475, po 1 kontrakte → čistá Δ **+15,8** akcií."
+        )
+        _sym_list = sorted({str(t).strip().upper() for t in db.get_symbol_tickers() if str(t).strip()})
+        _wt1, _wt2 = st.columns([1, 2])
+        with _wt1:
+            if _sym_list:
+                whatif_tk = str(
+                    st.selectbox(
+                        "Ticker podkladu (Symboly)",
+                        options=_sym_list,
+                        key="dh_whatif_symbol",
+                    )
+                    or ""
+                ).strip().upper()
+            else:
+                st.warning("V **Symboly** nie sú žiadne tickery — dopln ich v aplikácii alebo zadaj ticker ručne.")
+                whatif_tk = (
+                    st.text_input("Ticker podkladu (text)", value="", key="dh_whatif_ticker_fallback")
+                    .strip()
+                    .upper()
+                )
+        with _wt2:
+            if st.button("Predvolený príklad: MSFT calendar (430 C)", key="dh_whatif_reset_msft"):
+                if "dh_whatif_ed" in st.session_state:
+                    del st.session_state["dh_whatif_ed"]
+                if "MSFT" in _sym_list:
+                    st.session_state["dh_whatif_symbol"] = "MSFT"
+                st.rerun()
+        if not whatif_tk:
+            st.info("Vyber ticker zo **Symboly** (tabuľka v aplikácii), aby sa dal dopočítať spot a $Δ.")
+        _whatif_default = pd.DataFrame(
+            [
+                {"Noha": "Short", "Delta (na akciu)": 0.317, "Kontrakty": 1},
+                {"Noha": "Long", "Delta (na akciu)": 0.475, "Kontrakty": 1},
+            ]
+        )
+        _wdf = st.data_editor(
+            _whatif_default,
+            num_rows="dynamic",
+            column_config={
+                "Noha": st.column_config.SelectboxColumn("Noha", options=["Short", "Long"], required=True),
+                "Delta (na akciu)": st.column_config.NumberColumn(format="%.4f", min_value=-1.0, max_value=1.0, step=0.001),
+                "Kontrakty": st.column_config.NumberColumn(format="%d", min_value=1, step=1),
+            },
+            hide_index=True,
+            use_container_width=True,
+            key="dh_whatif_ed",
+        )
+        _wic1, _wic2, _wic3 = st.columns(3)
+        with _wic1:
+            w_target = st.number_input(
+                "Cieľová čistá Δ (akcie)",
                 value=5.0,
                 step=1.0,
                 format="%.2f",
-                key="dh_paper_target_shares",
-                help="Rovnaký cieľ pre každý podklad zvlášť; predvolene +5 akcií (mierne long delta po hedži).",
+                key="dh_whatif_target",
             )
-        with c2:
-            deadband = st.number_input(
-                "Deadband (|hedge| pod týmto = neobchodovať)",
+        with _wic2:
+            w_dead = st.number_input(
+                "Deadband (akcie)",
                 value=5.0,
                 min_value=0.0,
                 step=1.0,
                 format="%.1f",
-                key="dh_paper_deadband_shares",
+                key="dh_whatif_deadband",
             )
-        st.markdown(
-            "**Spot podkladu (USD)** — prednosť **Symboly**; ak je spot 0, panel doplní "
-            "orientačné predvolené hodnoty **AMZN 262.84**, **UNH 375.46** (iba úvodné načítanie)."
-        )
-        tickers = list(by_tk.keys())
-        ncols = min(3, len(tickers))
-        cols = st.columns(ncols)
-        _paper_spot_fallback = {"AMZN": 262.84, "UNH": 375.46}
-        for i, tk in enumerate(tickers):
-            sym = db.get_symbol(tk)
-            base_spot = float(sym["spot"] or 0.0) if sym else 0.0
-            sk = f"dh_paper_spot_{tk}"
-            if sk not in st.session_state:
-                init_sp = base_spot if base_spot > 0 else float(_paper_spot_fallback.get(tk, 0.0))
-                st.session_state[sk] = float(init_sp)
-            with cols[i % ncols]:
-                st.number_input(f"{tk}", min_value=0.0, step=0.01, format="%.2f", key=sk)
-        rows: list[dict] = []
-        for tk in tickers:
-            net = float(by_tk[tk])
-            spot = float(st.session_state.get(f"dh_paper_spot_{tk}", 0.0) or 0.0)
-            dd = dhp.dollar_delta(net, spot) if spot > 0 else None
-            hedge = dhp.hedge_shares_for_target(net, float(target_d))
-            _, inside = dhp.apply_deadband(hedge, float(deadband))
-            rows.append(
+        sym_w = db.get_symbol(whatif_tk) if whatif_tk else None
+        _w_sp0 = float(sym_w["spot"] or 0.0) if sym_w else 0.0
+        with _wic3:
+            _spot_lbl = f"Spot {whatif_tk} ($)" if whatif_tk else "Spot ($)"
+            w_spot = st.number_input(
+                _spot_lbl,
+                min_value=0.0,
+                value=float(_w_sp0 or 0.0),
+                step=0.01,
+                format="%.2f",
+                key="dh_whatif_spot",
+            )
+
+        _synth: list[dict] = []
+        for _, _wr in _wdf.iterrows():
+            _lt = str(_wr.get("Noha") or "").strip()
+            if _lt.lower() not in ("long", "short"):
+                continue
+            _d = _cell_float(_wr.get("Delta (na akciu)"))
+            if _d is None:
+                continue
+            try:
+                _kc = max(1, int(round(float(_wr.get("Kontrakty") or 1))))
+            except (TypeError, ValueError):
+                _kc = 1
+            _synth.append(
                 {
-                    "Ticker": tk,
-                    "Čistá Δ opcie (akcie)": round(net, 2),
-                    "Spot": round(spot, 2) if spot else None,
-                    "$ Δ (opcie)": round(dd, 0) if dd is not None else None,
-                    "Hedge podklad (akcie)": round(hedge, 2),
-                    "V deadband": "Áno" if inside else "Nie",
-                    "Odporúčanie": dhp.hedge_action_label(hedge) if not inside else "Zatiaľ neobchodovať (deadband)",
+                    "status": "Open",
+                    "ticker": whatif_tk,
+                    "leg_type": "Long" if _lt.lower() == "long" else "Short",
+                    "delta_current": float(_d),
+                    "contracts": _kc,
                 }
             )
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        if any(float(st.session_state.get(f"dh_paper_spot_{tk}", 0.0) or 0.0) <= 0 for tk in tickers):
-            st.warning("Pre ticker bez spotu dopln **Symboly** alebo spot vyššie — inak chýba **$Δ**.")
-
-
-st.divider()
-_render_delta_hedge_panel()
-st.divider()
+        _wnet = dhp.net_delta_shares_for_ticker(_synth, whatif_tk) if _synth else 0.0
+        _wdd = dhp.dollar_delta(_wnet, float(w_spot)) if w_spot and w_spot > 0 else None
+        _wh = dhp.hedge_shares_for_target(_wnet, float(w_target))
+        _w_in = dhp.apply_deadband(_wh, float(w_dead))[1]
+        _wrows = [
+            {
+                "Ticker": whatif_tk,
+                "Čistá Δ opcie (akcie)": round(_wnet, 2),
+                "Spot": round(float(w_spot), 2) if w_spot else None,
+                "$ Δ (opcie)": round(_wdd, 0) if _wdd is not None else None,
+                "Hedge podklad (akcie)": round(_wh, 2),
+                "V deadband": "Áno" if _w_in else "Nie",
+                "Odporúčanie": dhp.hedge_action_label(_wh) if not _w_in else "Zatiaľ neobchodovať (deadband)",
+            }
+        ]
+        if not _synth:
+            st.warning("Doplň aspoň jednu nohu s číselnou **Delta (na akciu)**.")
+        elif not whatif_tk:
+            st.warning("Vyber **ticker** zo Symboly.")
+        else:
+            st.dataframe(pd.DataFrame(_wrows), use_container_width=True, hide_index=True)
 
 
 def _dte(expiry_str: str) -> int | None:
@@ -1090,6 +1307,43 @@ def _journal_sign_mult_from_table_row(row) -> tuple[float, float]:
     return _journal_leg_sign_mult(t_like)
 
 
+def _journal_edited_to_mentor_legs(edited: pd.DataFrame) -> list[dict]:
+    """Riadky z ``data_editor`` → dict pre ``spread_mentor`` (DTE + čisté Gréky)."""
+    out: list[dict] = []
+    for _, row in edited.iterrows():
+        exp = row.get("Expirácia")
+        if exp is None or (isinstance(exp, float) and pd.isna(exp)):
+            exp_s = ""
+        else:
+            exp_s = str(exp).strip()
+        dc = _journal_float_for_sum(row.get("Δ aktuálna"))
+        de = _journal_float_for_sum(row.get("Δ vstup"))
+        thc = _journal_float_for_sum(row.get("Θ aktuálna ($/deň)"))
+        the = _journal_float_for_sum(row.get("Θ vstup ($/deň)"))
+        vc = _journal_float_for_sum(row.get("Vega aktuálna"))
+        ve = _journal_float_for_sum(row.get("Vega vstup"))
+        try:
+            k = int(row.get("Kontr.") or 1)
+        except (TypeError, ValueError):
+            k = 1
+        out.append(
+            {
+                "leg_type": str(row.get("Noha") or ""),
+                "expiry": exp_s,
+                "strike": float(row.get("Strike") or 0),
+                "option_type": str(row.get("Typ") or ""),
+                "contracts": k,
+                "delta_current": dc if dc is not None else de,
+                "delta_at_entry": de,
+                "theta_current": thc if thc is not None else the,
+                "theta_at_entry": the,
+                "vega_current": vc if vc is not None else ve,
+                "vega_at_entry": ve,
+            }
+        )
+    return out
+
+
 def _journal_leg_theta_vega_usd(trade: dict, greeks: dict) -> tuple[float | None, float | None]:
     """Θ a Vega v USD za celú nohu — rovnako ako pri výpočtoch v ``portfolio_data``."""
     sign, mult = _journal_leg_sign_mult(trade)
@@ -1307,6 +1561,10 @@ else:
 
 st.subheader("Otvorené pozície")
 
+st.divider()
+_render_delta_hedge_panel()
+st.divider()
+
 if not open_trades:
     st.warning(
         "V denníku nemáš žiadne otvorené nohy (*Open*), preto nie je čo dopĺňať. "
@@ -1501,6 +1759,69 @@ else:
                     if _tc is not None:
                         _sum_th_c += _tc
                         _n_th_c += 1
+
+                _ment_legs = _journal_edited_to_mentor_legs(edited)
+                _cal_m = analyze_calendar_mentor(_ment_legs)
+                _diag_m = analyze_diagonal_mentor(_ment_legs)
+                _greek_snap = compute_journal_group_greek_snapshot(_ment_legs)
+                _greek_kind = "calendar" if _cal_m is not None else "diagonal"
+                with st.expander(
+                    "Mentor — kalendár / diagonál (DTE + čisté Gréky)",
+                    expanded=False,
+                ):
+                    st.caption(
+                        "Rovnaké **DTE okná** ako vo Spread Builderi. **Čistá Δ** má orientačný prah (± podľa max. "
+                        "kontraktov v skupine); Θ a Vega sú **návodné**, nie tvrdý cieľ. "
+                        "Berie **aktuálnu tabuľku** (vrátane zmien pred uložením journalu)."
+                    )
+                    if _cal_m is None and _diag_m is None:
+                        st.info(
+                            "**Kalendár** potrebuje aspoň jeden Long a jeden Short s **rovnakým strike a typom opcie** "
+                            "a rôznou expiráciou. **Diagonál:** aspoň jednu Short a jednu Long nohu s expiráciou "
+                            "(typicky rôzne striky). Pri jednej nohe alebo chýbajúcich dátumoch mentor DTE nehodnotí."
+                        )
+                    if _cal_m is not None:
+                        st.markdown("##### Kalendárny spread (DTE)")
+                        st.dataframe(
+                            pd.DataFrame(mentor_calendar_rows(_cal_m)),
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={"Stav": st.column_config.TextColumn()},
+                        )
+                        st.markdown("**Kalendár — poznámky**")
+                        for _line in _cal_m.summary_lines:
+                            st.markdown(f"- {_line}")
+                    if _diag_m is not None:
+                        st.markdown("##### Diagonál / krížené expirácie (DTE)")
+                        st.dataframe(
+                            pd.DataFrame(mentor_comparison_rows(_diag_m)),
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={"Stav": st.column_config.TextColumn()},
+                        )
+                        st.markdown("**Diagonál — poznámky**")
+                        for _line in _diag_m.summary_lines:
+                            st.markdown(f"- {_line}")
+                    if _cal_m is not None and _diag_m is not None:
+                        st.caption(
+                            "Skupina vyhovuje **kalendárnemu páru** aj **diagonálnemu** výpočtu DTE — pri viacerých "
+                            "nohách môže byť štruktúra zložitejšia; Gréky ber ako orientáciu."
+                        )
+                    if _cal_m is not None or _diag_m is not None:
+                        st.markdown(
+                            f"##### Čisté Gréky vs. orientačné okno ({'kalendár' if _greek_kind == 'calendar' else 'diagonál'})"
+                        )
+                        st.dataframe(
+                            pd.DataFrame(journal_greek_comparison_rows(_greek_kind, _greek_snap)),
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={"Stav": st.column_config.TextColumn()},
+                        )
+                        _gh = journal_greek_mentor_hints(_greek_kind, _greek_snap)
+                        if _gh:
+                            st.markdown("**Gréky — upozornenia**")
+                            for _hint in _gh:
+                                st.markdown(f"- {_hint}")
 
                 with st.expander(
                     "Súčet čistej Δ a Θ (všetky nohy v skupine)",

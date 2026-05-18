@@ -18,6 +18,7 @@ Architektúra (na testovanie a doladenie)
 7. **Budúce rozšírenia** — napojenie na živý ``fetch_underlying`` / STK z IB,
    upozornenia pri prekročení prahu, zápis odporúčaného hedge do ``settings`` alebo
    samostatná tabuľka „hedge log“.
+8. **Úvaha bez DB** — manuálne nohy (Δ z OptionTrader/TWS); neukladá sa do ``trades``.
 
 Všetko je **orientačné** (opčná Δ nie je konštantná); neodosiela príkazy do TWS.
 """
@@ -59,6 +60,21 @@ def net_delta_shares_by_ticker(open_trades: list[dict[str, Any]]) -> dict[str, f
             continue
         out[tk] = out.get(tk, 0.0) + leg_delta_shares(t)
     return dict(sorted(out.items(), key=lambda kv: kv[0]))
+
+
+def net_delta_shares_for_ticker(legs: list[dict[str, Any]], ticker: str) -> float:
+    """
+    Súčet ``leg_delta_shares`` len pre nohy daného tickera (bez filtra ``status``).
+    Použitie: manuálne / hypotetické nohy v UI.
+    """
+    u = str(ticker or "").strip().upper()
+    if not u:
+        return 0.0
+    return sum(
+        leg_delta_shares(t)
+        for t in legs
+        if str(t.get("ticker") or "").strip().upper() == u
+    )
 
 
 def dollar_delta(net_shares: float, spot: float) -> float:

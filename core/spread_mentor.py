@@ -5,9 +5,10 @@ Orientačné rozsahy — nie investičná rada; používateľ si ich môže pris
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 
 # Konzervatívny „stred“ (odporúčané okná z tvojej tabuľky)
@@ -25,6 +26,11 @@ CAL_LONG_DTE_MIN = 50
 CAL_LONG_DTE_MAX = 150
 CAL_SPREAD_MONTHS_MIN = 0.5
 CAL_SPREAD_MONTHS_MAX = 2.5
+
+# Čistá Δ / Θ / Vega — orientačné „okná“ na porovnanie s journalom (na 1 kontrakt; škáluje sa × max kontraktov v skupine)
+# Delta: blízko neutrálu v akciách; diagonál mierne širšie než kalendár.
+GREEK_CAL_DELTA_ABS_PER_CONTRACT = 25.0
+GREEK_DIAG_DELTA_ABS_PER_CONTRACT = 32.0
 
 
 def _strike_grid_half_dollar(raw: object) -> float:
@@ -191,6 +197,14 @@ def analyze_calendar_mentor(legs: list[dict], today: Optional[date] = None) -> O
             continue
         r = str(leg.get("right") or "").strip().upper()[:1]
         if r not in ("C", "P"):
+            ot = str(leg.get("option_type") or "").strip().lower()
+            if ot == "call":
+                r = "C"
+            elif ot == "put":
+                r = "P"
+            else:
+                continue
+        if r not in ("C", "P"):
             continue
         strike = _strike_grid_half_dollar(leg.get("strike"))
         if strike <= 0:
@@ -331,3 +345,181 @@ def mentor_calendar_rows(res: CalendarMentorResult) -> list[dict[str, Any]]:
             "Stav": "OK" if res.spread_ok else "Mimo odporúčania",
         },
     ]
+
+
+# ─── Journal: čisté Gréky vs. orientačné okná (kalendár / diagonál) ───────────
+
+
+@dataclass
+class JournalGreekSnapshot:
+    """Súčty z polí denníka (aktuálne, inak vstupné) — rovnaká logika znamienok ako pri Σ čistá Δ."""
+
+    max_contracts: int
+    net_delta_shares: Optional[float]
+    delta_legs_used: int
+    delta_legs_total: int
+    net_theta_usd: Optional[float]
+    theta_legs_used: int
+    theta_legs_total: int
+    net_vega: Optional[float]
+    vega_legs_used: int
+    vega_legs_total: int
+
+
+def _journal_leg_sign_mult(trade: dict) -> tuple[float, float]:
+    mult = float(trade.get("contracts") or 1) * 100.0
+    sign = -1.0 if str(trade.get("leg_type") or "").strip() == "Short" else 1.0
+    return sign, mult
+
+
+def _journal_optional_float(trade: dict, *keys: str) -> Optional[float]:
+    for k in keys:
+        v = trade.get(k)
+        if v is None:
+            continue
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
+            continue
+        return x
+    return None
+
+
+def compute_journal_group_greek_snapshot(legs: list[dict]) -> JournalGreekSnapshot:
+    """
+    Z nôh v časopise (dict z DB): čistá Δ v ekvivalente akcií, súčet Θ ($/deň), súčet Vega.
+    Chýbajúce hodnoty na nohe sa preskočia; ak na žiadnej nohe nie je delta, ``net_delta_shares`` je None.
+    """
+    max_c = 1
+    for leg in legs:
+        try:
+            max_c = max(max_c, int(round(float(leg.get("contracts") or 1))))
+        except (TypeError, ValueError):
+            pass
+
+    d_sum = 0.0
+    d_n = 0
+    t_sum = 0.0
+    t_n = 0
+    v_sum = 0.0
+    v_n = 0
+    ntot = len(legs)
+
+    for leg in legs:
+        sgn, mlt = _journal_leg_sign_mult(leg)
+        d = _journal_optional_float(leg, "delta_current", "delta_at_entry")
+        if d is not None:
+            d_sum += float(d) * mlt * sgn
+            d_n += 1
+        th = _journal_optional_float(leg, "theta_current", "theta_at_entry")
+        if th is not None:
+            t_sum += float(th)
+            t_n += 1
+        vg = _journal_optional_float(leg, "vega_current", "vega_at_entry")
+        if vg is not None:
+            v_sum += float(vg)
+            v_n += 1
+
+    return JournalGreekSnapshot(
+        max_contracts=max_c,
+        net_delta_shares=d_sum if d_n else None,
+        delta_legs_used=d_n,
+        delta_legs_total=ntot,
+        net_theta_usd=t_sum if t_n else None,
+        theta_legs_used=t_n,
+        theta_legs_total=ntot,
+        net_vega=v_sum if v_n else None,
+        vega_legs_used=v_n,
+        vega_legs_total=ntot,
+    )
+
+
+def journal_greek_comparison_rows(
+    kind: Literal["calendar", "diagonal"],
+    snap: JournalGreekSnapshot,
+) -> list[dict[str, Any]]:
+    """
+    Tabuľka „Parameter / Konzervatívne okno / Tvoja skupina / Stav“ pre čisté Gréky.
+    Theta a Vega sú informatívne (bez tvrdého OK/Mimo okrem vegy pri kalendári).
+    """
+    per = GREEK_CAL_DELTA_ABS_PER_CONTRACT if kind == "calendar" else GREEK_DIAG_DELTA_ABS_PER_CONTRACT
+    band = float(per) * float(max(1, snap.max_contracts))
+    label = "Kalendár" if kind == "calendar" else "Diagonál"
+
+    def _delta_stav() -> str:
+        if snap.net_delta_shares is None:
+            return "— (chýba Δ na nohách)"
+        if snap.delta_legs_used < snap.delta_legs_total:
+            return "čiastočné (nie všetky nohy majú Δ)"
+        if abs(float(snap.net_delta_shares)) <= band:
+            return "OK (v okne)"
+        return "Mimo okna"
+
+    rows: list[dict[str, Any]] = [
+        {
+            "Parameter": f"Čistá Δ (akcie) · {label}",
+            "Konzervatívne okno": f"|Δ| ≤ {band:g} (±{per:g} × max. {snap.max_contracts} kontr.)",
+            "Tvoja skupina": f"{snap.net_delta_shares:+,.1f}" if snap.net_delta_shares is not None else "—",
+            "Stav": _delta_stav(),
+        },
+        {
+            "Parameter": "Čistá Θ ($/deň)",
+            "Konzervatívne okno": "Bez pevného prahu — závisí od debetu/kreditu a smeru",
+            "Tvoja skupina": f"${snap.net_theta_usd:+,.2f}" if snap.net_theta_usd is not None else "—",
+            "Stav": "—"
+            if snap.net_theta_usd is None
+            else ("info: doplň kontext" if snap.theta_legs_used < snap.theta_legs_total else "na kontrolu"),
+        },
+    ]
+
+    if kind == "calendar":
+        vega_note = "Klasický debetný kalendár často long vega (kladná čistá Vega)"
+        vega_stav = "—"
+        if snap.net_vega is not None:
+            if snap.net_vega > 0:
+                vega_stav = "typicky long vega"
+            elif snap.net_vega < 0:
+                vega_stav = "short vega / neto inverzne"
+            else:
+                vega_stav = "~0"
+        rows.append(
+            {
+                "Parameter": "Čistá Vega",
+                "Konzervatívne okno": vega_note,
+                "Tvoja skupina": f"{snap.net_vega:+,.1f}" if snap.net_vega is not None else "—",
+                "Stav": vega_stav if snap.net_vega is not None else "—",
+            }
+        )
+    else:
+        rows.append(
+            {
+                "Parameter": "Čistá Vega",
+                "Konzervatívne okno": "Diagonál: silne závisí od strikov a IV — bez univerzálneho prahu",
+                "Tvoja skupina": f"{snap.net_vega:+,.1f}" if snap.net_vega is not None else "—",
+                "Stav": "na kontrolu" if snap.net_vega is not None else "—",
+            }
+        )
+
+    return rows
+
+
+def journal_greek_mentor_hints(kind: Literal["calendar", "diagonal"], snap: JournalGreekSnapshot) -> list[str]:
+    """Krátke body pod tabuľku Grékov."""
+    out: list[str] = []
+    if snap.delta_legs_used < snap.delta_legs_total:
+        out.append(
+            f"Δ je súčet len z **{snap.delta_legs_used}** / **{snap.delta_legs_total}** nôh — doplň **Δ aktuálna** (alebo TWS sync)."
+        )
+    if snap.net_delta_shares is not None and snap.delta_legs_used == snap.delta_legs_total:
+        per = GREEK_CAL_DELTA_ABS_PER_CONTRACT if kind == "calendar" else GREEK_DIAG_DELTA_ABS_PER_CONTRACT
+        band = float(per) * float(max(1, snap.max_contracts))
+        if abs(float(snap.net_delta_shares)) > band:
+            out.append(
+                f"Čistá Δ **{snap.net_delta_shares:+.1f}** akcií je mimo orientačné okno **±{band:g}** — "
+                f"pri kalendári/diagonále často cieliš menšiu smerovú expozíciu alebo vedome prijímaš bias."
+            )
+    if kind == "calendar" and snap.net_vega is not None and snap.net_vega <= 0:
+        out.append("Kalendár s **nekladnou** čistou Vegou je menej typický — skontroluj znamienka nôh a zdroj dát.")
+    return out
