@@ -55,6 +55,8 @@ def _canon_option_type_for_key(opt_type: str | None) -> str:
     Bez normalizácie by ``str('P').capitalize()`` ostalo „P“ a kľúč sa s TWS nezhodoval.
     """
     s = str(opt_type or "").strip().lower()
+    if s in ("stk", "stock", "shares"):
+        return "STK"
     if s.startswith("c"):
         return "Call"
     if s.startswith("p"):
@@ -62,9 +64,16 @@ def _canon_option_type_for_key(opt_type: str | None) -> str:
     return str(opt_type or "").strip().capitalize() or ""
 
 
+def journal_contract_shares_multiplier(trade: dict) -> float:
+    """Opčný kontrakt × 100 akcií; čistá akcia (STK) v denníku = počet kusov × 1."""
+    ot = str(trade.get("option_type") or "").strip().upper()
+    return 1.0 if ot in ("STK", "STOCK") else 100.0
+
+
 def journal_position_key(ticker, strike, expiry, opt_type, leg_type) -> tuple:
-    """Kľúč pre zhodu denník ↔ TWS OPT (expirácia kompaktná YYYYMMDD)."""
-    raw_exp = str(expiry or "").strip().split()[0]
+    """Kľúč pre zhodu denník ↔ TWS (OPT alebo STK; expirácia kompaktná YYYYMMDD)."""
+    _exp_toks = str(expiry or "").strip().split()
+    raw_exp = _exp_toks[0] if _exp_toks else ""
     exp_c = normalize_expiry(raw_exp).replace("-", "")
     return (
         str(ticker).upper(),
@@ -115,7 +124,10 @@ def calc_dte(expiry_str: Optional[str]) -> Optional[int]:
     if not expiry_str:
         return None
     try:
-        raw = str(expiry_str).strip().split()[0]
+        _toks = str(expiry_str).strip().split()
+        raw = _toks[0] if _toks else ""
+        if not raw:
+            return None
         s = normalize_expiry(raw)
         return (datetime.strptime(s, "%Y-%m-%d").date() - date.today()).days
     except ValueError:
@@ -152,6 +164,13 @@ def greek_for_trade(
     strike = float(trade.get("strike", 0))
     expiry = normalize_expiry(trade.get("expiry", ""))
     opt    = trade.get("option_type", "")
+    opt_s = str(opt or "").strip().upper()
+    if opt_s in ("STK", "STOCK"):
+        unit = {"delta": 1.0, "theta": 0.0, "gamma": 0.0, "vega": 0.0, "iv": None}
+        for p in positions_cache:
+            if ibkr_stock_position_matches_trade(p, trade):
+                return unit, "live"
+        return unit, "bs"
 
     for p in positions_cache:
         if p.get("sec_type") != "OPT":
@@ -215,7 +234,7 @@ def build_group_data(
         for leg in legs:
             greeks, src = greek_for_trade(leg, pos_cache, manual_spots, manual_ivs)
             dte_val = calc_dte(leg.get("expiry"))
-            mult    = float(leg.get("contracts", 1) or 1) * 100
+            mult    = float(leg.get("contracts", 1) or 1) * journal_contract_shares_multiplier(leg)
             sign    = -1 if leg.get("leg_type") == "Short" else 1
 
             theta = (greeks.get("theta", 0) or 0)
@@ -313,6 +332,27 @@ def journal_group_id(trade: dict) -> str:
     return (trade.get("group_id") or "").strip() or "— (bez skupiny)"
 
 
+def ibkr_stock_position_matches_trade(p: dict, trade: dict) -> bool:
+    """Či IBKR STK riadok zodpovedá otvorenej nohe typu akcia v denníku."""
+    if p.get("sec_type") != "STK":
+        return False
+    ot = str(trade.get("option_type") or "").strip().upper()
+    if ot not in ("STK", "STOCK"):
+        return False
+    if str(p.get("ticker", "")).upper() != str(trade.get("ticker", "")).upper():
+        return False
+    return p.get("leg_type") == trade.get("leg_type")
+
+
+def ibkr_position_matches_journal_leg(p: dict, trade: dict) -> bool:
+    """IBKR riadok (OPT alebo STK) ↔ otvorená noha v denníku."""
+    if p.get("sec_type") == "OPT":
+        return ibkr_option_position_matches_trade(p, trade)
+    if p.get("sec_type") == "STK":
+        return ibkr_stock_position_matches_trade(p, trade)
+    return False
+
+
 def ibkr_option_position_matches_trade(p: dict, trade: dict) -> bool:
     """Či IBKR OPT riadok zodpovedá otvorenej nohe z denníka."""
     if p.get("sec_type") != "OPT":
@@ -339,22 +379,25 @@ def match_greeks(trade: dict, ibkr_positions: list) -> dict:
     if not ibkr_positions:
         return {}
     for p in ibkr_positions:
-        if ibkr_option_position_matches_trade(p, trade):
-            return {
-                "delta": p.get("delta"),
-                "gamma": p.get("gamma"),
-                "theta": p.get("theta"),
-                "vega":  p.get("vega"),
-            }
+        if not ibkr_position_matches_journal_leg(p, trade):
+            continue
+        if p.get("sec_type") == "STK":
+            return {"delta": 1.0, "gamma": 0.0, "theta": 0.0, "vega": 0.0}
+        return {
+            "delta": p.get("delta"),
+            "gamma": p.get("gamma"),
+            "theta": p.get("theta"),
+            "vega":  p.get("vega"),
+        }
     return {}
 
 
 def find_ibkr_option_for_trade(trade: dict, ib_positions: list) -> Optional[dict]:
-    """Prvá IBKR OPT pozícia zodpovedajúca otvorenej nohe z denníka."""
+    """Prvá IBKR pozícia (OPT alebo STK) zodpovedajúca otvorenej nohe z denníka."""
     if not ib_positions:
         return None
     for p in ib_positions:
-        if ibkr_option_position_matches_trade(p, trade):
+        if ibkr_position_matches_journal_leg(p, trade):
             return p
     return None
 
@@ -375,7 +418,7 @@ def unrealized_by_journal_ids_for_ib_legs(
         if tid is None:
             continue
         for p in ib_positions_for_group:
-            if ibkr_option_position_matches_trade(p, t):
+            if ibkr_position_matches_journal_leg(p, t):
                 out[int(tid)] = float(p.get("unrealized_pnl") or 0)
                 break
     return out
@@ -387,7 +430,7 @@ def group_ibkr_positions_for_dashboard(
 ) -> tuple[list[tuple[str, list[dict]]], list[dict]]:
     """
     Zoradí IB pozície podľa ``group_id`` z otvorených nôh v denníku.
-    Každý IB OPT riadok max. jednej nohe; STK bez opčného páru ide do syntetickej skupiny ``— STK · TICKER``.
+    Každý IB OPT/STK riadok max. jednej nohe; STK bez zhody s denníkom ide do ``— STK · TICKER (IB)``.
     Nevyužité riadky (napr. OPT mimo denníka) vráti v ``unmatched``.
     """
     from collections import defaultdict
@@ -402,7 +445,7 @@ def group_ibkr_positions_for_dashboard(
         for i, p in enumerate(ib_positions):
             if used[i]:
                 continue
-            if ibkr_option_position_matches_trade(p, t):
+            if ibkr_position_matches_journal_leg(p, t):
                 grouped[gid].append(p)
                 used[i] = True
                 break

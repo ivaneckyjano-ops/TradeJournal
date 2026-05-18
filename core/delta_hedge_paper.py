@@ -5,7 +5,8 @@ Architektúra (na testovanie a doladenie)
 ----------------------------------------
 1. **Zdroj Δ** — otvorené nohy z aktívnej DB (`trades.status='Open'`). Na nohe sa
    berie ``delta_current``, ak chýba ``delta_at_entry`` (rovnako ako súčty v časopise).
-2. **Agregácia** — na ticker: súčet ``sign(leg) * δ_per_share * contracts * 100``,
+2. **Agregácia** — na ticker: súčet ``sign(leg) * δ_per_share * contracts * 100`` pre opcie,
+   pre **STK** v denníku ``sign * počet kusov`` (Δ/akcia = 1),
    kde short noha má ``-1`` (zhoda s ``portfolio_data.build_group_data``).
 3. **Spot** — prednosť tabuľka **Symboly** (`symbols.spot`); v UI možnosť ručného
    override pre paper experiment. Bez spotu nie je **$Δ**.
@@ -33,8 +34,16 @@ def _leg_sign(leg_type: Optional[str]) -> int:
 
 def leg_delta_shares(trade: dict[str, Any]) -> float:
     """
-    Príspevok jednej nohy do Δ v jednotkách „ekvivalent akcií“ (1 kontrakt = 100 ks).
+    Príspevok jednej nohy do Δ v jednotkách „ekvivalent akcií“
+    (opcia: 1 kontrakt = 100 ks; akcia STK: 1 ks = 1 ks).
     """
+    ot = str(trade.get("option_type") or "").strip().upper()
+    if ot in ("STK", "STOCK"):
+        try:
+            c = float(trade.get("contracts") or 1)
+        except (TypeError, ValueError):
+            c = 1.0
+        return _leg_sign(trade.get("leg_type")) * c
     d = trade.get("delta_current")
     if d is None:
         d = trade.get("delta_at_entry")

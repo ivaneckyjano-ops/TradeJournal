@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any, Literal, Optional
 
+from core.portfolio_data import journal_contract_shares_multiplier
+
 
 # Konzervatívny „stred“ (odporúčané okná z tvojej tabuľky)
 SHORT_DTE_MIN = 30
@@ -367,7 +369,7 @@ class JournalGreekSnapshot:
 
 
 def _journal_leg_sign_mult(trade: dict) -> tuple[float, float]:
-    mult = float(trade.get("contracts") or 1) * 100.0
+    mult = float(trade.get("contracts") or 1) * journal_contract_shares_multiplier(trade)
     sign = -1.0 if str(trade.get("leg_type") or "").strip() == "Short" else 1.0
     return sign, mult
 

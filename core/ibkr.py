@@ -1741,6 +1741,12 @@ def fetch_positions(
                     "strike":      None,
                     "expiry":      c.lastTradeDateOrContractMonth,
                 })
+            elif c.secType == "STK":
+                base.update({
+                    "option_type": "STK",
+                    "strike":      0.0,
+                    "expiry":      "",
+                })
             else:
                 base.update({"option_type": None, "strike": None, "expiry": None})
 
@@ -2055,11 +2061,11 @@ def sync_positions_to_db(positions: list[dict], db_module, *, close_missing: boo
     `close_missing=False` necháva chýbajúce riadky otvorené.
     """
     existing_open = db_module.get_open_trades()
-    ibkr_opts = [p for p in positions if p["sec_type"] == "OPT"]
+    ibkr_legs = [p for p in positions if p.get("sec_type") in ("OPT", "STK")]
 
     # Mapa IBKR pozícií podľa kľúča
     ibkr_map: dict[str, dict] = {}
-    for pos in ibkr_opts:
+    for pos in ibkr_legs:
         k = _pos_key(pos["ticker"], pos["strike"], pos["expiry"],
                      pos["leg_type"], pos["option_type"])
         ibkr_map[k] = pos
@@ -2085,8 +2091,15 @@ def sync_positions_to_db(positions: list[dict], db_module, *, close_missing: boo
             if abs(ib_c - db_c) > 1e-6:
                 # Opčné kontrakty sú vždy celé čísla v DB (INTEGER)
                 changes["contracts"] = int(round(ib_c))
-            # Aktualizuj priemerné náklady (entry price)
-            new_ep = round(pos["avg_cost"] / 100, 4) if pos.get("avg_cost") else None
+            # Aktualizuj priemerné náklady (entry price): opcie $/akcia z prémie, akcie $/ks z avg_cost
+            if str(pos.get("sec_type") or "") == "STK":
+                try:
+                    ac = float(pos.get("avg_cost") or 0)
+                except (TypeError, ValueError):
+                    ac = 0.0
+                new_ep = round(ac, 4) if ac else None
+            else:
+                new_ep = round(pos["avg_cost"] / 100, 4) if pos.get("avg_cost") else None
             old_ep = t.get("entry_price") or 0.0
             if new_ep is not None and abs(new_ep - old_ep) > 0.01:
                 changes["entry_price"] = new_ep
@@ -2097,17 +2110,26 @@ def sync_positions_to_db(positions: list[dict], db_module, *, close_missing: boo
                 skipped += 1
         else:
             # Nová pozícia — pridaj do DB
+            if str(pos.get("sec_type") or "") == "STK":
+                try:
+                    ac = float(pos.get("avg_cost") or 0)
+                except (TypeError, ValueError):
+                    ac = 0.0
+                ep = round(ac, 4) if ac else 0.0
+            else:
+                ep = round(pos["avg_cost"] / 100, 4) if pos.get("avg_cost") else 0.0
             db_module.add_trade(
                 ticker=pos["ticker"],
                 strategy="Import IBKR",
                 leg_type=pos["leg_type"],
                 option_type=pos["option_type"],
-                strike=pos["strike"],
-                expiry=pos["expiry"],
+                strike=float(pos.get("strike") or 0),
+                expiry=str(pos.get("expiry") or ""),
                 contracts=int(round(float(pos["contracts"]))),
-                entry_price=round(pos["avg_cost"] / 100, 4) if pos.get("avg_cost") else 0.0,
+                entry_price=ep,
                 entry_date=datetime.today().strftime("%Y-%m-%d"),
                 group_id=None, iv_at_entry=None, pop_at_entry=None,
+                delta_at_entry=1.0 if str(pos.get("sec_type") or "") == "STK" else None,
             )
             added += 1
 

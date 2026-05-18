@@ -36,6 +36,7 @@ from core.portfolio_data import (
     find_ibkr_option_for_trade,
     greek_for_trade,
     ib_opt_greeks_scaled_for_journal,
+    journal_contract_shares_multiplier,
     unrealized_by_journal_ids_for_ib_legs,
 )
 from core.page_context import set_tradejournal_page
@@ -842,8 +843,8 @@ def _skupina_cell_norm(v) -> str:
 
 
 def _journal_leg_sign_mult(trade: dict) -> tuple[float, float]:
-    """Znamienko nohy (Long +1, Short −1) a násobiteľ kontrakt × 100."""
-    mult = float(trade.get("contracts") or 1) * 100.0
+    """Znamienko nohy (Long +1, Short −1) a násobiteľ (×100 opcia, ×1 STK)."""
+    mult = float(trade.get("contracts") or 1) * journal_contract_shares_multiplier(trade)
     sign = -1.0 if str(trade.get("leg_type") or "").strip() == "Short" else 1.0
     return sign, mult
 
@@ -1302,8 +1303,12 @@ def _journal_group_ib_market_value_and_cost_basis(
 
 
 def _journal_sign_mult_from_table_row(row) -> tuple[float, float]:
-    """Kontrakty a znamienko z riadku časopisnej tabuľky (stĺpce Kontr., Noha)."""
-    t_like = {"contracts": row.get("Kontr."), "leg_type": row.get("Noha")}
+    """Kontrakty a znamienko z riadku časopisnej tabuľky (stĺpce Kontr., Noha, Typ)."""
+    t_like = {
+        "contracts": row.get("Kontr."),
+        "leg_type": row.get("Noha"),
+        "option_type": row.get("Typ"),
+    }
     return _journal_leg_sign_mult(t_like)
 
 

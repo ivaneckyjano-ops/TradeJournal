@@ -53,8 +53,8 @@ def _apply_ib_mode() -> None:
 _ib_mode = _infer_ib_mode()
 if st.session_state.get("ib_mode") not in ("LIVE", "PAPER"):
     st.session_state["ib_mode"] = _ib_mode
-elif st.session_state.get("ib_port") in (7496, 7497):
-    st.session_state["ib_mode"] = _ib_mode
+# ib_mode určuje DB (journal_*); neprepisovať ho z portu pri každom rerune — používateľ
+# môže mať LIVE v sidebari a iný port (Gateway, vlastné), inak by navigácia prepínala PAPER/LIVE.
 
 if "ib_cid" not in st.session_state:
     st.session_state["ib_cid"] = _IB_DEFAULT_CLIENT_IDS.get(st.session_state["ib_mode"], 10)

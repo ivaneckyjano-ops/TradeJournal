@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
@@ -61,7 +62,7 @@ def init_db() -> None:
                 ticker       TEXT NOT NULL,
                 strategy     TEXT,
                 leg_type     TEXT CHECK(leg_type IN ('Long','Short')),
-                option_type  TEXT CHECK(option_type IN ('Call','Put')),
+                option_type  TEXT CHECK(option_type IN ('Call','Put','STK')),
                 strike       REAL,
                 expiry       TEXT,
                 contracts    INTEGER DEFAULT 1,
@@ -125,6 +126,8 @@ def init_db() -> None:
     # Migrácia: pridaj nové stĺpce do existujúcich DB
     _migrate_symbols(get_connection())
     _migrate_trades(get_connection())
+    with get_connection() as _conn_stk:
+        _migrate_trades_option_type_allow_stk(_conn_stk)
     _migrate_group_apr_snapshots(get_connection())
     _migrate_spread_builder(get_connection())
     _migrate_portfolio_greek_history(get_connection())
@@ -185,6 +188,101 @@ def _migrate_trades(conn: sqlite3.Connection) -> None:
             conn.execute(sql)
     conn.commit()
     conn.close()
+
+
+_STK_OPT_CHECK = re.compile(
+    r"option_type\s+TEXT\s+CHECK\s*\(\s*option_type\s+IN\s*\(\s*'Call'\s*,\s*'Put'\s*\)\s*\)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _trades_create_sql_relaxed_option_type(conn: sqlite3.Connection, source_table: str) -> str:
+    """CREATE TABLE trades … bez CHECK na ``option_type`` (hodnota STK)."""
+    cols = conn.execute(f'PRAGMA table_info("{source_table}")').fetchall()
+    parts: list[str] = []
+    for _cid, name, typ, notnull, dflt, pk in cols:
+        if name == "option_type":
+            parts.append('  "option_type" TEXT')
+            continue
+        coltype = typ or "TEXT"
+        if name == "id" and int(pk or 0) == 1:
+            parts.append('  "id" INTEGER PRIMARY KEY AUTOINCREMENT')
+            continue
+        seg = [f'  "{name}" {coltype}']
+        if dflt is not None:
+            seg.append(f"DEFAULT {dflt}")
+        if int(notnull or 0) == 1 and int(pk or 0) == 0:
+            seg.append("NOT NULL")
+        parts.append(" ".join(seg))
+    return "CREATE TABLE trades (\n" + ",\n".join(parts) + "\n)"
+
+
+def _tables_with_foreign_key_to(conn: sqlite3.Connection, parent: str) -> list[str]:
+    out: list[str] = []
+    for (tname,) in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    ):
+        for fk in conn.execute(f'PRAGMA foreign_key_list("{tname}")'):
+            if str(fk[2]) == parent:
+                out.append(str(tname))
+                break
+    return out
+
+
+def _rebuild_table_fix_fk_parent(
+    conn: sqlite3.Connection,
+    table: str,
+    old_parent: str,
+    new_parent: str,
+) -> None:
+    """Prekopíruje tabuľku s rovnakým menom a opraveným REFERENCES na rodiča."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone()
+    if not row or not row[0]:
+        return
+    ddl = row[0]
+    if old_parent not in ddl:
+        return
+    fixed = ddl.replace(f'REFERENCES "{old_parent}"', f'REFERENCES "{new_parent}"').replace(
+        f"REFERENCES {old_parent}(", f"REFERENCES {new_parent}("
+    )
+    cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{table}")').fetchall()]
+    colq = ", ".join(f'"{c}"' for c in cols)
+    tmp = f"{table}_mig_fk_tmp"
+    conn.execute(f'ALTER TABLE "{table}" RENAME TO "{tmp}"')
+    conn.execute(fixed)
+    conn.execute(f'INSERT INTO "{table}" ({colq}) SELECT {colq} FROM "{tmp}"')
+    conn.execute(f'DROP TABLE "{tmp}"')
+
+
+def _migrate_trades_option_type_allow_stk(conn: sqlite3.Connection) -> None:
+    """
+    Existujúce DB mali CHECK len Call/Put — rozšíri uloženie o akcie (STK).
+    Prekopíruje ``trades`` a tabuľky s FK na ``trades`` (notes, events, trade_greek_snapshots).
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='trades'"
+    ).fetchone()
+    if not row or not row[0]:
+        return
+    if not _STK_OPT_CHECK.search(row[0]):
+        return
+    old_tbl = "trades_mig_old"
+    fk_prev = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute(f'ALTER TABLE trades RENAME TO "{old_tbl}"')
+        conn.execute(_trades_create_sql_relaxed_option_type(conn, old_tbl))
+        cols = [r[1] for r in conn.execute(f'PRAGMA table_info("{old_tbl}")').fetchall()]
+        colq = ", ".join(f'"{c}"' for c in cols)
+        conn.execute(f"INSERT INTO trades ({colq}) SELECT {colq} FROM \"{old_tbl}\"")
+        for child in _tables_with_foreign_key_to(conn, old_tbl):
+            _rebuild_table_fix_fk_parent(conn, child, old_tbl, "trades")
+        conn.execute(f'DROP TABLE "{old_tbl}"')
+    finally:
+        conn.execute(f"PRAGMA foreign_keys={int(fk_prev)}")
 
 
 def _migrate_trade_journal_greeks(conn: sqlite3.Connection) -> None:
@@ -1004,7 +1102,8 @@ def compute_pnl(trade: dict) -> Optional[float]:
         return None
     contracts = trade.get("contracts", 1) or 1
     commission = trade.get("commission") or 0.0
-    multiplier = 100
+    ot = str(trade.get("option_type") or "").strip().upper()
+    multiplier = 1 if ot in ("STK", "STOCK") else 100
     if xp is not None:
         raw = (xp - ep) * contracts * multiplier
         gross = raw if trade.get("leg_type") == "Long" else -raw

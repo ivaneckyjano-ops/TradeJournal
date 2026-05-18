@@ -126,3 +126,35 @@ def test_sync_positions_updates_existing_open_trade(monkeypatch, tmp_path):
     assert row["delta_current"] == -0.41
     assert row["theta_current"] == 0.33
     assert row["vega_current"] == 1.02
+
+
+def test_sync_positions_adds_stock_stk(monkeypatch, tmp_path):
+    import core.ibkr as ibkr
+
+    db = _prepare_temp_db(monkeypatch, tmp_path)
+
+    positions = [
+        {
+            "sec_type": "STK",
+            "ticker": "GLW",
+            "contracts": 42,
+            "leg_type": "Long",
+            "option_type": "STK",
+            "strike": 0.0,
+            "expiry": "",
+            "avg_cost": 55.25,
+        }
+    ]
+
+    result = ibkr.sync_positions_to_db(positions, db, close_missing=True)
+
+    assert result["added"] == 1
+    assert result["closed"] == 0
+    open_trades = db.get_open_trades()
+    assert len(open_trades) == 1
+    row = open_trades[0]
+    assert row["ticker"] == "GLW"
+    assert row["option_type"] == "STK"
+    assert row["contracts"] == 42
+    assert abs(float(row["entry_price"]) - 55.25) < 1e-6
+    assert float(row.get("delta_at_entry") or 0) == 1.0
