@@ -50,6 +50,12 @@ from core.spread_mentor import (
     mentor_comparison_rows,
 )
 
+_journal_mode = str(st.session_state.get("ib_mode") or "").strip().upper()
+if _journal_mode == "PAPER":
+    db.DB_PATH = db.PAPER_DB_PATH
+else:
+    db.DB_PATH = db.LIVE_DB_PATH
+
 db.init_db()
 set_tradejournal_page("portfolio")
 
@@ -900,7 +906,7 @@ def _render_add_stk_leg_journal_panel(open_tr_legs: list[dict]) -> None:
 
 
 def _journal_group_tab_label(gname: str, *, max_len: int = 28) -> str:
-    """Názov skupiny pre záložku ``st.tabs`` (krátke mená sa vo UI lmú lepšie)."""
+    """Krátky názov skupiny v prepínači časopisu (dlhé mená sa skracujú kvôli prehľadnosti)."""
     if gname == PF_GROUP_NONE:
         return "Bez skupiny"
     s = (gname or "").strip() or "?"
@@ -1672,7 +1678,7 @@ else:
         "Pod editorom sú **súčty za skupinu**; podrobnosti metrík sú v expanderi **Vysvetlivky k metrikám** (predvolene zbalený). "
         "Zápis sa uloží do DB a zostane aj na ďalší deň. "
         "**Skupiny:** na presun viacerých nôh naraz použi expander **Rýchle priradenie skupiny** nižšie. "
-        "Inak zmeň stĺpec **Skupina** v tabuľke a v tej istej záložke stlač **Uložiť journal** — záložky sú len pre prehľad (filtrované nohy podľa aktuálnej skupiny)."
+        "Inak zmeň stĺpec **Skupina** v tabuľke a v tej istej skupine stlač **Uložiť journal** — vyber skupinu v prepínači **Skupina** vyššie."
     )
     _fb = st.session_state.pop("pf_journal_tws_refresh_msg", None)
     if _fb:
@@ -1687,9 +1693,10 @@ else:
     with st.expander("Rýchle priradenie skupiny — viac nôh naraz", expanded=False):
         st.markdown(
             "**Problém:** stĺpec *Skupina* je v širokej tabuľke ďaleko od kontraktu a pri presune nohy medzi skupinami "
-            "musíš potom hľadať správnu hornú záložku.\n\n"
+            "musíš potom hľadať správny prepínač **Skupina** vyššie.\n\n"
             "**Tu:** vyber **cieľovú skupinu**, označ **nohy** (multiselect), **Priradiť** — uloží sa len `group_id` v DB "
-            "(Gréky/IV sa nemenia). Potom **obnov stránku** alebo prepni záložku, ak nohy „preskočili“ medzi skupinami."
+            "(Gréky/IV sa nemenia). Ako **vyradiť zo skupiny**: vyber cieľ **„bez skupiny“** a **Priradiť**, alebo použij expander **Vyradiť nohy zo skupiny** pod nadpisom aktuálnej skupiny. "
+            "Po presune môžeš **obnoviť stránku** alebo prepnúť **Skupina** vyššie, ak nohy „preskočili“ medzi skupinami."
         )
         _bo1, _bo2 = st.columns([1, 1])
         with _bo1:
@@ -1752,996 +1759,1017 @@ else:
                 st.warning("Vyber aspoň jednu nohu v zozname vyššie.")
 
     _pf_live_pos: list[dict] = list(ibkr.get_scoped_session_value("live_positions", []) or [])
-    _journal_tab_labels = [_journal_group_tab_label(g) for g in _sort_keys]
-    _grp_tabs = st.tabs(_journal_tab_labels)
-    for _ti, gname in enumerate(_sort_keys):
-        with _grp_tabs[_ti]:
-            legs = by_group[gname]
-            meta = groups_meta.get(gname) if gname != PF_GROUP_NONE else None
-            _gkey = hashlib.sha256(gname.encode("utf-8")).hexdigest()[:16]
-            legs_edit = sorted(legs, key=lambda x: (str(x.get("ticker") or ""), int(x.get("id") or 0)))
-            if not legs_edit:
-                continue
+    _GR_SEL_KEY = "pf_journal_selected_group"
+    if _GR_SEL_KEY not in st.session_state or st.session_state[_GR_SEL_KEY] not in _sort_keys:
+        st.session_state[_GR_SEL_KEY] = _sort_keys[0]
+    st.selectbox(
+        "Skupina",
+        options=_sort_keys,
+        format_func=_journal_group_tab_label,
+        key=_GR_SEL_KEY,
+        help="Vyber skupinu na úpravu časopisu. Výber ostane aj po **Obnoviť údaje z TWS** alebo uložení.",
+        label_visibility="visible",
+    )
+    gname = str(st.session_state[_GR_SEL_KEY])
 
-            with st.container():
-                _gh1, _gh2 = st.columns([4, 1])
-                with _gh1:
-                    st.markdown(f"#### {gname}")
-                with _gh2:
-                    if st.button(
-                        "Obnoviť údaje z TWS",
-                        key=f"pf_twsg_{_gkey}",
-                        help="Načíta portfólio s Grékmi, obnoví cache pre metriky a zapíše Δ/Θ/IV/Vega do DB pre nohy tejto skupiny.",
-                        use_container_width=True,
-                    ):
-                        with st.spinner("Sťahujem z TWS…"):
-                            _ok_t, _msg_t = _journal_refresh_group_from_tws(legs_edit)
-                        st.session_state["pf_journal_tws_refresh_msg"] = (
-                            ("ok", _msg_t) if _ok_t else ("err", _msg_t)
-                        )
-                        st.rerun()
-                if meta:
-                    _tk = meta.get("ticker") or ""
-                    _st = meta.get("strategy") or ""
-                    if _tk or _st:
-                        st.caption(f"Skupina v DB: **{_tk}** · {_st}")
-                rows = []
-                orig_by_id: dict[int, dict] = {}
-                for t in legs_edit:
-                    tid = int(t["id"])
-                    orig_by_id[tid] = t
-                    exp = t.get("expiry") or ""
-                    dte_v = _dte(str(exp))
-                    iv_e = t.get("iv_at_entry")
-                    iv_c = t.get("iv_current")
-                    dlt_e = t.get("delta_at_entry")
-                    th_e = t.get("theta_at_entry")
-                    th_c = t.get("theta_current")
-                    dlt_c = t.get("delta_current")
-                    v_e = t.get("vega_at_entry")
-                    v_c = t.get("vega_current")
-                    gid_disp = (t.get("group_id") or "").strip() or PF_GROUP_NONE
-                    if gid_disp not in _grp_opts:
-                        gid_disp = PF_GROUP_NONE
-                    r = {
-                        "ID": tid,
-                        "Skupina": gid_disp,
-                        "Stratégia": t.get("strategy") or "",
-                        "Ticker": t.get("ticker") or "",
-                        "Noha": t.get("leg_type") or "",
-                        "Typ": t.get("option_type") or "",
-                        "Strike": float(t.get("strike") or 0),
-                        "Expirácia": exp,
-                        "DTE": int(dte_v) if dte_v is not None else None,
-                        "Kontr.": int(t.get("contracts") or 1),
-                        "Entry $": float(t.get("entry_price") or 0),
-                        "Entry dátum": t.get("entry_date") or "",
-                        "Δ vstup": pd.NA if dlt_e is None else float(dlt_e),
-                        "Δ aktuálna": pd.NA if dlt_c is None else float(dlt_c),
-                        "Θ vstup ($/deň)": pd.NA if th_e is None else float(th_e),
-                        "Θ aktuálna ($/deň)": pd.NA if th_c is None else float(th_c),
-                        "Vega vstup": pd.NA if v_e is None else float(v_e),
-                        "Vega aktuálna": pd.NA if v_c is None else float(v_c),
-                        "IV vstup": pd.NA if iv_e is None else float(iv_e),
-                        "IV aktuálna": pd.NA if iv_c is None else float(iv_c),
-                    }
-                    rows.append(r)
-                df = pd.DataFrame(rows)
-                if "Skupina" in df.columns:
-                    _sk_cells = [_skupina_cell_norm(x) for x in df["Skupina"].tolist()]
-                    df["Skupina"] = _sk_cells
-                    _grp_opts_editor = list(dict.fromkeys([*_grp_opts, *_sk_cells]))
-                else:
-                    _grp_opts_editor = list(_grp_opts)
-                _float_cols = [
-                    "Δ vstup",
-                    "Δ aktuálna",
-                    "Θ vstup ($/deň)",
-                    "Θ aktuálna ($/deň)",
-                    "Vega vstup",
-                    "Vega aktuálna",
-                    "IV vstup",
-                    "IV aktuálna",
-                ]
-                for _c in _float_cols:
-                    if _c in df.columns:
-                        df[_c] = df[_c].astype("Float64")
-                st.caption(
-                    "**IV** ako zlomok (0,35 = 35 %). **Θ** = USD/deň za celú nohu. **Vega** = za pozíciu (× kontrakty × 100, znamienko podľa nohy). "
-                    "**Súčet za skupinu** = sčítanie všetkých nôh v tabuľke vyššie (čistá Δ ako ekvivalent akcií, Θ ako súčet $/deň). "
-                    "Po **Uložiť journal** sa z aktuálnych hodnôt uloží aj **bod do histórie** snímok Grékov v DB."
-                )
-                _disabled = [
-                    "ID",
-                    "Stratégia",
-                    "Ticker",
-                    "Noha",
-                    "Typ",
-                    "Strike",
-                    "Expirácia",
-                    "DTE",
-                    "Kontr.",
-                    "Entry $",
-                    "Entry dátum",
-                ]
-                _col_cfg = {
-                    "Skupina": st.column_config.SelectboxColumn(
-                        "Skupina",
-                        options=_grp_opts_editor,
-                        required=False,
-                        help="Presun nohy do inej skupiny: zmeň hodnotu a v tejto záložke stlač **Uložiť journal** nižšie. "
-                        "Na viac nôh naraz použi expander **Rýchle priradenie skupiny** nad záložkami.",
-                    ),
-                    "Strike": st.column_config.NumberColumn(format="$%.2f"),
-                    "Entry $": st.column_config.NumberColumn(format="$%.2f"),
-                    "DTE": st.column_config.NumberColumn(format="%d dní"),
-                    "Δ vstup": st.column_config.NumberColumn(format="%.4f", step=0.0001),
-                    "Δ aktuálna": st.column_config.NumberColumn(format="%.4f", step=0.0001),
-                    "Θ vstup ($/deň)": st.column_config.NumberColumn(format="$%.3f", step=0.001),
-                    "Θ aktuálna ($/deň)": st.column_config.NumberColumn(
-                        format="$%.3f", step=0.001, help="Aktuálna theta pozície ($/deň)."
-                    ),
-                    "Vega vstup": st.column_config.NumberColumn(format="%.2f", step=0.01),
-                    "Vega aktuálna": st.column_config.NumberColumn(format="%.2f", step=0.01),
-                    "IV vstup": st.column_config.NumberColumn(format="%.4f", step=0.0001),
-                    "IV aktuálna": st.column_config.NumberColumn(format="%.4f", step=0.0001),
-                }
-                edited = st.data_editor(
-                    df,
+    legs = by_group[gname]
+    meta = groups_meta.get(gname) if gname != PF_GROUP_NONE else None
+    _gkey = hashlib.sha256(gname.encode("utf-8")).hexdigest()[:16]
+    legs_edit = sorted(legs, key=lambda x: (str(x.get("ticker") or ""), int(x.get("id") or 0)))
+    if not legs_edit:
+        st.caption(
+            "Táto skupina nemá pri aktívnom filtri žiadne otvorené nohy (stav Open alebo filter **Symboly**)."
+        )
+    else:
+        with st.container():
+            _gh1, _gh2 = st.columns([4, 1])
+            with _gh1:
+                st.markdown(f"#### {gname}")
+            with _gh2:
+                if st.button(
+                    "Obnoviť údaje z TWS",
+                    key=f"pf_twsg_{_gkey}",
+                    help="Načíta portfólio s Grékmi, obnoví cache pre metriky a zapíše Δ/Θ/IV/Vega do DB pre nohy tejto skupiny.",
                     use_container_width=True,
-                    hide_index=True,
-                    disabled=_disabled,
-                    column_config=_col_cfg,
-                    key=f"pf_ed_{_gkey}",
-                )
-                _sum_cd_e = _sum_cd_c = 0.0
-                _n_cd_e = _n_cd_c = 0
-                _sum_th_e = _sum_th_c = 0.0
-                _n_th_e = _n_th_c = 0
-                for _, row in edited.iterrows():
-                    _sgn, _mlt = _journal_sign_mult_from_table_row(row)
-                    _cde = _journal_clean_delta_share_equiv(row.get("Δ vstup"), _sgn, _mlt)
-                    _cdc = _journal_clean_delta_share_equiv(row.get("Δ aktuálna"), _sgn, _mlt)
-                    _fe = _journal_float_for_sum(_cde)
-                    _fc = _journal_float_for_sum(_cdc)
-                    if _fe is not None:
-                        _sum_cd_e += _fe
-                        _n_cd_e += 1
-                    if _fc is not None:
-                        _sum_cd_c += _fc
-                        _n_cd_c += 1
-                    _te = _journal_float_for_sum(row.get("Θ vstup ($/deň)"))
-                    _tc = _journal_float_for_sum(row.get("Θ aktuálna ($/deň)"))
-                    if _te is not None:
-                        _sum_th_e += _te
-                        _n_th_e += 1
-                    if _tc is not None:
-                        _sum_th_c += _tc
-                        _n_th_c += 1
-
-                _ment_legs = _journal_edited_to_mentor_legs(edited)
-                _cal_m = analyze_calendar_mentor(_ment_legs)
-                _diag_m = analyze_diagonal_mentor(_ment_legs)
-                _greek_snap = compute_journal_group_greek_snapshot(_ment_legs)
-                _greek_kind = "calendar" if _cal_m is not None else "diagonal"
-                with st.expander(
-                    "Mentor — kalendár / diagonál (DTE + čisté Gréky)",
-                    expanded=False,
                 ):
+                    with st.spinner("Sťahujem z TWS…"):
+                        _ok_t, _msg_t = _journal_refresh_group_from_tws(legs_edit)
+                    st.session_state["pf_journal_tws_refresh_msg"] = (
+                        ("ok", _msg_t) if _ok_t else ("err", _msg_t)
+                    )
+                    st.rerun()
+            if meta:
+                _tk = meta.get("ticker") or ""
+                _st = meta.get("strategy") or ""
+                if _tk or _st:
+                    st.caption(f"Skupina v DB: **{_tk}** · {_st}")
+            if gname != PF_GROUP_NONE:
+                with st.expander("Vyradiť nohy zo skupiny", expanded=False):
                     st.caption(
-                        "Rovnaké **DTE okná** ako vo Spread Builderi. **Čistá Δ** má orientačný prah (± podľa max. "
-                        "kontraktov v skupine); Θ a Vega sú **návodné**, nie tvrdý cieľ. "
-                        "Berie **aktuálnu tabuľku** (vrátane zmien pred uložením journalu)."
+                        "Vyber nohy v tejto skupine a stlač tlačidlo — **Group ID** sa vymaže (noha skončí v „bez skupiny“). "
+                        "Údaje Grékov / IV v DB sa nemenia."
                     )
-                    if _cal_m is None and _diag_m is None:
-                        st.info(
-                            "**Kalendár** potrebuje aspoň jeden Long a jeden Short s **rovnakým strike a typom opcie** "
-                            "a rôznou expiráciou. **Diagonál:** aspoň jednu Short a jednu Long nohu s expiráciou "
-                            "(typicky rôzne striky). Pri jednej nohe alebo chýbajúcich dátumoch mentor DTE nehodnotí."
+                    _rm_j_map: dict[str, int] = {}
+                    _rm_j_labels: list[str] = []
+                    for t in legs_edit:
+                        tid = int(t["id"])
+                        _gcur = (t.get("group_id") or "").strip() or "—"
+                        _lbl_j = (
+                            f"[{tid}] {t.get('ticker') or ''} · {t.get('leg_type') or ''} {t.get('option_type') or ''} "
+                            f"K{t.get('strike') or ''} {t.get('expiry') or ''} ×{int(t.get('contracts') or 1)} "
+                            f"— teraz: {_gcur}"
                         )
-                    if _cal_m is not None:
-                        st.markdown("##### Kalendárny spread (DTE)")
-                        st.dataframe(
-                            pd.DataFrame(mentor_calendar_rows(_cal_m)),
-                            use_container_width=True,
-                            hide_index=True,
-                            column_config={"Stav": st.column_config.TextColumn()},
-                        )
-                        st.markdown("**Kalendár — poznámky**")
-                        for _line in _cal_m.summary_lines:
-                            st.markdown(f"- {_line}")
-                    if _diag_m is not None:
-                        st.markdown("##### Diagonál / krížené expirácie (DTE)")
-                        st.dataframe(
-                            pd.DataFrame(mentor_comparison_rows(_diag_m)),
-                            use_container_width=True,
-                            hide_index=True,
-                            column_config={"Stav": st.column_config.TextColumn()},
-                        )
-                        st.markdown("**Diagonál — poznámky**")
-                        for _line in _diag_m.summary_lines:
-                            st.markdown(f"- {_line}")
-                    if _cal_m is not None and _diag_m is not None:
-                        st.caption(
-                            "Skupina vyhovuje **kalendárnemu páru** aj **diagonálnemu** výpočtu DTE — pri viacerých "
-                            "nohách môže byť štruktúra zložitejšia; Gréky ber ako orientáciu."
-                        )
-                    if _cal_m is not None or _diag_m is not None:
-                        st.markdown(
-                            f"##### Čisté Gréky vs. orientačné okno ({'kalendár' if _greek_kind == 'calendar' else 'diagonál'})"
-                        )
-                        st.dataframe(
-                            pd.DataFrame(journal_greek_comparison_rows(_greek_kind, _greek_snap)),
-                            use_container_width=True,
-                            hide_index=True,
-                            column_config={"Stav": st.column_config.TextColumn()},
-                        )
-                        _gh = journal_greek_mentor_hints(_greek_kind, _greek_snap)
-                        if _gh:
-                            st.markdown("**Gréky — upozornenia**")
-                            for _hint in _gh:
-                                st.markdown(f"- {_hint}")
-
-                with st.expander(
-                    "Súčet čistej Δ a Θ (všetky nohy v skupine)",
-                    expanded=False,
-                ):
-                    _m_cd_e = f"{_sum_cd_e:+,.1f}" if _n_cd_e else "—"
-                    _m_cd_c = f"{_sum_cd_c:+,.1f}" if _n_cd_c else "—"
-                    _m_th_e = f"${_sum_th_e:+,.2f}/deň" if _n_th_e else "—"
-                    _m_th_c = f"${_sum_th_c:+,.2f}/deň" if _n_th_c else "—"
-                    _mc1, _mc2, _mc3, _mc4 = st.columns(4)
-                    _mc1.metric(
-                        "Σ čistá Δ vstup",
-                        _m_cd_e,
-                        help="Súčet Δ vstup v ekvivalente akcií — expander Vysvetlivky k metrikám.",
+                        _rm_j_labels.append(_lbl_j)
+                        _rm_j_map[_lbl_j] = tid
+                    st.multiselect(
+                        "Nohy na vyradenie",
+                        options=_rm_j_labels,
+                        key=f"pf_journal_rm_pick_{_gkey}",
                     )
-                    _mc2.metric(
-                        "Σ čistá Δ aktuálna",
-                        _m_cd_c,
-                        help="Súčet Δ aktuálna v ekvivalente akcií — expander Vysvetlivky k metrikám.",
-                    )
-                    _mc3.metric(
-                        "Σ čistá Θ vstup",
-                        _m_th_e,
-                        help="Súčet Θ vstup ($/deň) — expander Vysvetlivky k metrikám.",
-                    )
-                    _mc4.metric(
-                        "Σ čistá Θ aktuálna",
-                        _m_th_c,
-                        help="Súčet Θ aktuálna ($/deň) — expander Vysvetlivky k metrikám.",
-                    )
-
-                _dd_ib, _n_dd_ib = _journal_group_delta_dollars_ib(
-                    edited, orig_by_id, _pf_live_pos
+                    if st.button(
+                        "Vyradiť vybrané zo skupiny",
+                        key=f"pf_journal_rm_btn_{_gkey}",
+                        type="secondary",
+                    ):
+                        _pj_rm = list(st.session_state.get(f"pf_journal_rm_pick_{_gkey}") or [])
+                        _n_rm_j = 0
+                        for _lab_j in _pj_rm:
+                            _tid_j = _rm_j_map.get(str(_lab_j))
+                            if _tid_j is None:
+                                continue
+                            db.update_trade(int(_tid_j), group_id="")
+                            _n_rm_j += 1
+                        if _n_rm_j:
+                            st.success(f"Vyradených nôh: **{_n_rm_j}** (bez skupiny).")
+                            st.session_state[f"pf_journal_rm_pick_{_gkey}"] = []
+                            st.rerun()
+                        else:
+                            st.warning("Vyber aspoň jednu nohu v zozname vyššie.")
+            rows = []
+            orig_by_id: dict[int, dict] = {}
+            for t in legs_edit:
+                tid = int(t["id"])
+                orig_by_id[tid] = t
+                exp = t.get("expiry") or ""
+                dte_v = _dte(str(exp))
+                iv_e = t.get("iv_at_entry")
+                iv_c = t.get("iv_current")
+                dlt_e = t.get("delta_at_entry")
+                th_e = t.get("theta_at_entry")
+                th_c = t.get("theta_current")
+                dlt_c = t.get("delta_current")
+                v_e = t.get("vega_at_entry")
+                v_c = t.get("vega_current")
+                gid_disp = (t.get("group_id") or "").strip() or PF_GROUP_NONE
+                if gid_disp not in _grp_opts:
+                    gid_disp = PF_GROUP_NONE
+                r = {
+                    "ID": tid,
+                    "Skupina": gid_disp,
+                    "Stratégia": t.get("strategy") or "",
+                    "Ticker": t.get("ticker") or "",
+                    "Noha": t.get("leg_type") or "",
+                    "Typ": t.get("option_type") or "",
+                    "Strike": float(t.get("strike") or 0),
+                    "Expirácia": exp,
+                    "DTE": int(dte_v) if dte_v is not None else None,
+                    "Kontr.": int(t.get("contracts") or 1),
+                    "Entry $": float(t.get("entry_price") or 0),
+                    "Entry dátum": t.get("entry_date") or "",
+                    "Δ vstup": pd.NA if dlt_e is None else float(dlt_e),
+                    "Δ aktuálna": pd.NA if dlt_c is None else float(dlt_c),
+                    "Θ vstup ($/deň)": pd.NA if th_e is None else float(th_e),
+                    "Θ aktuálna ($/deň)": pd.NA if th_c is None else float(th_c),
+                    "Vega vstup": pd.NA if v_e is None else float(v_e),
+                    "Vega aktuálna": pd.NA if v_c is None else float(v_c),
+                    "IV vstup": pd.NA if iv_e is None else float(iv_e),
+                    "IV aktuálna": pd.NA if iv_c is None else float(iv_c),
+                }
+                rows.append(r)
+            df = pd.DataFrame(rows)
+            if "Skupina" in df.columns:
+                _sk_cells = [_skupina_cell_norm(x) for x in df["Skupina"].tolist()]
+                df["Skupina"] = _sk_cells
+                _grp_opts_editor = list(dict.fromkeys([*_grp_opts, *_sk_cells]))
+            else:
+                _grp_opts_editor = list(_grp_opts)
+            _float_cols = [
+                "Δ vstup",
+                "Δ aktuálna",
+                "Θ vstup ($/deň)",
+                "Θ aktuálna ($/deň)",
+                "Vega vstup",
+                "Vega aktuálna",
+                "IV vstup",
+                "IV aktuálna",
+            ]
+            for _c in _float_cols:
+                if _c in df.columns:
+                    df[_c] = df[_c].astype("Float64")
+            st.caption(
+                "**IV** ako zlomok (0,35 = 35 %). **Θ** = USD/deň za celú nohu. **Vega** = za pozíciu (× kontrakty × 100, znamienko podľa nohy). "
+                "**Súčet za skupinu** = sčítanie všetkých nôh v tabuľke vyššie (čistá Δ ako ekvivalent akcií, Θ ako súčet $/deň). "
+                "Po **Uložiť journal** sa z aktuálnych hodnôt uloží aj **bod do histórie** snímok Grékov v DB."
+            )
+            _disabled = [
+                "ID",
+                "Stratégia",
+                "Ticker",
+                "Noha",
+                "Typ",
+                "Strike",
+                "Expirácia",
+                "DTE",
+                "Kontr.",
+                "Entry $",
+                "Entry dátum",
+            ]
+            _col_cfg = {
+                "Skupina": st.column_config.SelectboxColumn(
+                    "Skupina",
+                    options=_grp_opts_editor,
+                    required=False,
+                    help="Presun nohy do inej skupiny: zmeň hodnotu a pri aktuálnom výbere skupiny stlač **Uložiť journal** nižšie. "
+                        "Na viac nôh naraz použi expander **Rýchle priradenie skupiny** nad prepínačom **Skupina**.",
+                ),
+                "Strike": st.column_config.NumberColumn(format="$%.2f"),
+                "Entry $": st.column_config.NumberColumn(format="$%.2f"),
+                "DTE": st.column_config.NumberColumn(format="%d dní"),
+                "Δ vstup": st.column_config.NumberColumn(format="%.4f", step=0.0001),
+                "Δ aktuálna": st.column_config.NumberColumn(format="%.4f", step=0.0001),
+                "Θ vstup ($/deň)": st.column_config.NumberColumn(format="$%.3f", step=0.001),
+                "Θ aktuálna ($/deň)": st.column_config.NumberColumn(
+                    format="$%.3f", step=0.001, help="Aktuálna theta pozície ($/deň)."
+                ),
+                "Vega vstup": st.column_config.NumberColumn(format="%.2f", step=0.01),
+                "Vega aktuálna": st.column_config.NumberColumn(format="%.2f", step=0.01),
+                "IV vstup": st.column_config.NumberColumn(format="%.4f", step=0.0001),
+                "IV aktuálna": st.column_config.NumberColumn(format="%.4f", step=0.0001),
+            }
+            edited = st.data_editor(
+                df,
+                use_container_width=True,
+                hide_index=True,
+                disabled=_disabled,
+                column_config=_col_cfg,
+                key=f"pf_ed_{_gkey}",
+            )
+            _sum_cd_e = _sum_cd_c = 0.0
+            _n_cd_e = _n_cd_c = 0
+            _sum_th_e = _sum_th_c = 0.0
+            _n_th_e = _n_th_c = 0
+            for _, row in edited.iterrows():
+                _sgn, _mlt = _journal_sign_mult_from_table_row(row)
+                _cde = _journal_clean_delta_share_equiv(row.get("Δ vstup"), _sgn, _mlt)
+                _cdc = _journal_clean_delta_share_equiv(row.get("Δ aktuálna"), _sgn, _mlt)
+                _fe = _journal_float_for_sum(_cde)
+                _fc = _journal_float_for_sum(_cdc)
+                if _fe is not None:
+                    _sum_cd_e += _fe
+                    _n_cd_e += 1
+                if _fc is not None:
+                    _sum_cd_c += _fc
+                    _n_cd_c += 1
+                _te = _journal_float_for_sum(row.get("Θ vstup ($/deň)"))
+                _tc = _journal_float_for_sum(row.get("Θ aktuálna ($/deň)"))
+                if _te is not None:
+                    _sum_th_e += _te
+                    _n_th_e += 1
+                if _tc is not None:
+                    _sum_th_c += _tc
+                    _n_th_c += 1
+    
+            _ment_legs = _journal_edited_to_mentor_legs(edited)
+            _cal_m = analyze_calendar_mentor(_ment_legs)
+            _diag_m = analyze_diagonal_mentor(_ment_legs)
+            _greek_snap = compute_journal_group_greek_snapshot(_ment_legs)
+            _greek_kind = "calendar" if _cal_m is not None else "diagonal"
+            with st.expander(
+                "Mentor — kalendár / diagonál (DTE + čisté Gréky)",
+                expanded=False,
+            ):
+                st.caption(
+                    "Rovnaké **DTE okná** ako vo Spread Builderi. **Čistá Δ** má orientačný prah (± podľa max. "
+                    "kontraktov v skupine); Θ a Vega sú **návodné**, nie tvrdý cieľ. "
+                    "Berie **aktuálnu tabuľku** (vrátane zmien pred uložením journalu)."
                 )
-                _dd_sym, _n_dd_sym = _journal_group_delta_dollars_usd(edited)
-                _len_ed = len(edited)
-                if _len_ed > 0 and _n_dd_ib == _len_ed:
-                    _dd_sum, _n_dd, _dd_src = _dd_ib, _n_dd_ib, "ib"
-                elif _len_ed > 0 and _n_dd_sym == _len_ed:
-                    _dd_sum, _n_dd, _dd_src = _dd_sym, _n_dd_sym, "journal"
-                elif _n_dd_ib > 0:
-                    _dd_sum, _n_dd, _dd_src = _dd_ib, _n_dd_ib, "ib_partial"
-                elif _n_dd_sym > 0:
-                    _dd_sum, _n_dd, _dd_src = _dd_sym, _n_dd_sym, "journal_partial"
+                if _cal_m is None and _diag_m is None:
+                    st.info(
+                        "**Kalendár** potrebuje aspoň jeden Long a jeden Short s **rovnakým strike a typom opcie** "
+                        "a rôznou expiráciou. **Diagonál:** aspoň jednu Short a jednu Long nohu s expiráciou "
+                        "(typicky rôzne striky). Pri jednej nohe alebo chýbajúcich dátumoch mentor DTE nehodnotí."
+                    )
+                if _cal_m is not None:
+                    st.markdown("##### Kalendárny spread (DTE)")
+                    st.dataframe(
+                        pd.DataFrame(mentor_calendar_rows(_cal_m)),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={"Stav": st.column_config.TextColumn()},
+                    )
+                    st.markdown("**Kalendár — poznámky**")
+                    for _line in _cal_m.summary_lines:
+                        st.markdown(f"- {_line}")
+                if _diag_m is not None:
+                    st.markdown("##### Diagonál / krížené expirácie (DTE)")
+                    st.dataframe(
+                        pd.DataFrame(mentor_comparison_rows(_diag_m)),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={"Stav": st.column_config.TextColumn()},
+                    )
+                    st.markdown("**Diagonál — poznámky**")
+                    for _line in _diag_m.summary_lines:
+                        st.markdown(f"- {_line}")
+                if _cal_m is not None and _diag_m is not None:
+                    st.caption(
+                        "Skupina vyhovuje **kalendárnemu páru** aj **diagonálnemu** výpočtu DTE — pri viacerých "
+                        "nohách môže byť štruktúra zložitejšia; Gréky ber ako orientáciu."
+                    )
+                if _cal_m is not None or _diag_m is not None:
+                    st.markdown(
+                        f"##### Čisté Gréky vs. orientačné okno ({'kalendár' if _greek_kind == 'calendar' else 'diagonál'})"
+                    )
+                    st.dataframe(
+                        pd.DataFrame(journal_greek_comparison_rows(_greek_kind, _greek_snap)),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={"Stav": st.column_config.TextColumn()},
+                    )
+                    _gh = journal_greek_mentor_hints(_greek_kind, _greek_snap)
+                    if _gh:
+                        st.markdown("**Gréky — upozornenia**")
+                        for _hint in _gh:
+                            st.markdown(f"- {_hint}")
+    
+            with st.expander(
+                "Súčet čistej Δ a Θ (všetky nohy v skupine)",
+                expanded=False,
+            ):
+                _m_cd_e = f"{_sum_cd_e:+,.1f}" if _n_cd_e else "—"
+                _m_cd_c = f"{_sum_cd_c:+,.1f}" if _n_cd_c else "—"
+                _m_th_e = f"${_sum_th_e:+,.2f}/deň" if _n_th_e else "—"
+                _m_th_c = f"${_sum_th_c:+,.2f}/deň" if _n_th_c else "—"
+                _mc1, _mc2, _mc3, _mc4 = st.columns(4)
+                _mc1.metric(
+                    "Σ čistá Δ vstup",
+                    _m_cd_e,
+                    help="Súčet Δ vstup v ekvivalente akcií — expander Vysvetlivky k metrikám.",
+                )
+                _mc2.metric(
+                    "Σ čistá Δ aktuálna",
+                    _m_cd_c,
+                    help="Súčet Δ aktuálna v ekvivalente akcií — expander Vysvetlivky k metrikám.",
+                )
+                _mc3.metric(
+                    "Σ čistá Θ vstup",
+                    _m_th_e,
+                    help="Súčet Θ vstup ($/deň) — expander Vysvetlivky k metrikám.",
+                )
+                _mc4.metric(
+                    "Σ čistá Θ aktuálna",
+                    _m_th_c,
+                    help="Súčet Θ aktuálna ($/deň) — expander Vysvetlivky k metrikám.",
+                )
+    
+            _dd_ib, _n_dd_ib = _journal_group_delta_dollars_ib(
+                edited, orig_by_id, _pf_live_pos
+            )
+            _dd_sym, _n_dd_sym = _journal_group_delta_dollars_usd(edited)
+            _len_ed = len(edited)
+            if _len_ed > 0 and _n_dd_ib == _len_ed:
+                _dd_sum, _n_dd, _dd_src = _dd_ib, _n_dd_ib, "ib"
+            elif _len_ed > 0 and _n_dd_sym == _len_ed:
+                _dd_sum, _n_dd, _dd_src = _dd_sym, _n_dd_sym, "journal"
+            elif _n_dd_ib > 0:
+                _dd_sum, _n_dd, _dd_src = _dd_ib, _n_dd_ib, "ib_partial"
+            elif _n_dd_sym > 0:
+                _dd_sum, _n_dd, _dd_src = _dd_sym, _n_dd_sym, "journal_partial"
+            else:
+                _dd_sum, _n_dd, _dd_src = 0.0, 0, "none"
+            _mv_sum, _cb_sum, _n_ib = _journal_group_ib_market_value_and_cost_basis(
+                edited, orig_by_id, _pf_live_pos
+            )
+            with st.expander(
+                "Delta doláre · Trhová hodnota · Nákladová základňa · TH − náklad (skupina)",
+                expanded=False,
+            ):
+                _m_dd = f"${_dd_sum:+,.0f}" if _n_dd else "—"
+                _m_mv = f"${_mv_sum:+,.2f}" if _n_ib else "—"
+                _m_cb = f"${_cb_sum:+,.2f}" if _n_ib else "—"
+                _m_th_cb = f"${(_mv_sum - _cb_sum):+,.2f}" if _n_ib else "—"
+                _ib1, _ib2, _ib3, _ib4 = st.columns(4)
+                _ib1.metric(
+                    "Delta doláre (Σ)",
+                    _m_dd,
+                    help="Expozícia v USD — detail v expanderi Vysvetlivky k metrikám.",
+                )
+                _ib2.metric(
+                    "Trhová hodnota (Σ)",
+                    _m_mv,
+                    help="Súčet MV z IB (cena kontraktu alebo API) — expander.",
+                )
+                _ib3.metric(
+                    "Nákladová základňa (Σ)",
+                    _m_cb,
+                    help="Súčet nákladovej bázy so znamienkom (net spread) — expander.",
+                )
+                _ib4.metric(
+                    "TH − náklad (Σ)",
+                    _m_th_cb,
+                    help="Trhová hodnota mínus nákladová základňa (súčty z IB) — nezrealizovaný P&L skupiny; expander.",
+                )
+                if not _pf_live_pos:
+                    st.caption(
+                        "**IB:** v session nie sú pozície — import z IB alebo **Obnoviť údaje z TWS** pri skupine."
+                    )
+                elif _pf_live_pos and _n_ib < len(edited):
+                    st.caption(f"**IB zhoda:** {_n_ib} / {len(edited)} nôh v skupine.")
+                elif _dd_src in ("none", "ib_partial", "journal_partial") and _len_ed > 0:
+                    st.caption(
+                        "**Delta doláre:** niektoré nohy chýbajú v výpočte — pozri expander *Vysvetlivky k metrikám* alebo obnov TWS."
+                    )
+    
+            with st.expander("Graf P&L vs. cena podkladu (BS model, orientačný)", expanded=False):
+                _tk_pl = str(legs_edit[0].get("ticker") or "").strip().upper() if legs_edit else ""
+                _s0pl, _pl_marker_src = _journal_resolve_spot_for_pl(_tk_pl, _pf_live_pos)
+                _plcurve = journal_group_pl_vs_spot(
+                    legs_edit, spot_center=_s0pl, marker_source=_pl_marker_src
+                )
+                if _plcurve is None:
+                    st.caption(
+                        "Graf sa nevykreslí, ak skupina má **viac tickerov podkladu**, chýbajú **expirácie**, "
+                        "alebo dáta na výpočet nie sú dostačujúce."
+                    )
                 else:
-                    _dd_sum, _n_dd, _dd_src = 0.0, 0, "none"
-                _mv_sum, _cb_sum, _n_ib = _journal_group_ib_market_value_and_cost_basis(
-                    edited, orig_by_id, _pf_live_pos
-                )
-                with st.expander(
-                    "Delta doláre · Trhová hodnota · Nákladová základňa · TH − náklad (skupina)",
-                    expanded=False,
-                ):
-                    _m_dd = f"${_dd_sum:+,.0f}" if _n_dd else "—"
-                    _m_mv = f"${_mv_sum:+,.2f}" if _n_ib else "—"
-                    _m_cb = f"${_cb_sum:+,.2f}" if _n_ib else "—"
-                    _m_th_cb = f"${(_mv_sum - _cb_sum):+,.2f}" if _n_ib else "—"
-                    _ib1, _ib2, _ib3, _ib4 = st.columns(4)
-                    _ib1.metric(
-                        "Delta doláre (Σ)",
-                        _m_dd,
-                        help="Expozícia v USD — detail v expanderi Vysvetlivky k metrikám.",
-                    )
-                    _ib2.metric(
-                        "Trhová hodnota (Σ)",
-                        _m_mv,
-                        help="Súčet MV z IB (cena kontraktu alebo API) — expander.",
-                    )
-                    _ib3.metric(
-                        "Nákladová základňa (Σ)",
-                        _m_cb,
-                        help="Súčet nákladovej bázy so znamienkom (net spread) — expander.",
-                    )
-                    _ib4.metric(
-                        "TH − náklad (Σ)",
-                        _m_th_cb,
-                        help="Trhová hodnota mínus nákladová základňa (súčty z IB) — nezrealizovaný P&L skupiny; expander.",
-                    )
-                    if not _pf_live_pos:
-                        st.caption(
-                            "**IB:** v session nie sú pozície — import z IB alebo **Obnoviť údaje z TWS** pri skupine."
+                    _hlab = _plcurve["horizon_date"].strftime("%d.%m.%Y")
+                    fig_pnl = go.Figure()
+                    fig_pnl.add_trace(
+                        go.Scatter(
+                            x=_plcurve["spots"],
+                            y=_plcurve["pl_now"],
+                            mode="lines",
+                            name="P&L (model, dnes)",
+                            line=dict(width=2, color="#e8e8e8"),
                         )
-                    elif _pf_live_pos and _n_ib < len(edited):
-                        st.caption(f"**IB zhoda:** {_n_ib} / {len(edited)} nôh v skupine.")
-                    elif _dd_src in ("none", "ib_partial", "journal_partial") and _len_ed > 0:
-                        st.caption(
-                            "**Delta doláre:** niektoré nohy chýbajú v výpočte — pozri expander *Vysvetlivky k metrikám* alebo obnov TWS."
-                        )
-
-                with st.expander("Graf P&L vs. cena podkladu (BS model, orientačný)", expanded=False):
-                    _tk_pl = str(legs_edit[0].get("ticker") or "").strip().upper() if legs_edit else ""
-                    _s0pl, _pl_marker_src = _journal_resolve_spot_for_pl(_tk_pl, _pf_live_pos)
-                    _plcurve = journal_group_pl_vs_spot(
-                        legs_edit, spot_center=_s0pl, marker_source=_pl_marker_src
                     )
-                    if _plcurve is None:
-                        st.caption(
-                            "Graf sa nevykreslí, ak skupina má **viac tickerov podkladu**, chýbajú **expirácie**, "
-                            "alebo dáta na výpočet nie sú dostačujúce."
+                    fig_pnl.add_trace(
+                        go.Scatter(
+                            x=_plcurve["spots"],
+                            y=_plcurve["pl_horizon"],
+                            mode="lines",
+                            name=f"P&L pri exp. {_hlab}",
+                            line=dict(width=2, color="#a8a8a8", dash="dash"),
                         )
-                    else:
-                        _hlab = _plcurve["horizon_date"].strftime("%d.%m.%Y")
-                        fig_pnl = go.Figure()
+                    )
+                    _fwd_palette = ("#64b5f6", "#9575cd", "#ff8a65", "#4dd0e1", "#aed581")
+                    _fwd_dashes = ("dash", "dot", "longdash", "dashdot", "dot")
+                    _fwd_days_list = list(_plcurve.get("forward_days") or [])
+                    _pl_fwd_by = _plcurve.get("pl_fwd_by_day") or {}
+                    for _fi, _kd in enumerate(_fwd_days_list):
+                        _ys_f = _pl_fwd_by.get(int(_kd))
+                        if not _ys_f:
+                            continue
+                        _c = _fwd_palette[_fi % len(_fwd_palette)]
+                        _d = _fwd_dashes[_fi % len(_fwd_dashes)]
                         fig_pnl.add_trace(
                             go.Scatter(
                                 x=_plcurve["spots"],
-                                y=_plcurve["pl_now"],
+                                y=_ys_f,
                                 mode="lines",
-                                name="P&L (model, dnes)",
-                                line=dict(width=2, color="#e8e8e8"),
+                                name=f"P&L o +{_kd} dní (model)",
+                                line=dict(width=1.35, color=_c, dash=_d),
+                                opacity=0.92,
+                            )
+                        )
+                    _ms = _plcurve.get("marker_spot")
+                    _msrc = _plcurve.get("marker_source") or "spot"
+                    _ym1 = _plcurve.get("pl_now_at_marker")
+                    _ym2 = _plcurve.get("pl_horizon_at_marker")
+                    if _ms is not None and _ym1 is not None and _ym2 is not None:
+                        fig_pnl.add_vline(
+                            x=_ms,
+                            line_width=3,
+                            line_color="#26c6da",
+                            opacity=0.95,
+                            annotation_text=f"Aktuálny spot: {_ms:.2f}",
+                            annotation_position="top",
+                            annotation_font_size=12,
+                            annotation_font_color="#26c6da",
+                        )
+                        fig_pnl.add_trace(
+                            go.Scatter(
+                                x=[_ms],
+                                y=[_ym1],
+                                mode="markers",
+                                name="Spot → P&L (dnes)",
+                                marker=dict(size=16, color="#26c6da", symbol="diamond", line=dict(width=2, color="#ffffff")),
+                                hovertemplate=f"<b>Spot ({_msrc})</b> {_ms:.2f}<br><b>P&L dnes</b>: %{{y:.0f}} USD<extra></extra>",
                             )
                         )
                         fig_pnl.add_trace(
                             go.Scatter(
-                                x=_plcurve["spots"],
-                                y=_plcurve["pl_horizon"],
-                                mode="lines",
-                                name=f"P&L pri exp. {_hlab}",
-                                line=dict(width=2, color="#a8a8a8", dash="dash"),
+                                x=[_ms],
+                                y=[_ym2],
+                                mode="markers",
+                                name="Spot → P&L (pri exp.)",
+                                marker=dict(size=14, color="#ffb74d", symbol="diamond", line=dict(width=2, color="#ffffff")),
+                                hovertemplate=f"<b>Spot ({_msrc})</b> {_ms:.2f}<br><b>P&L pri exp.</b>: %{{y:.0f}} USD<extra></extra>",
                             )
                         )
-                        _fwd_palette = ("#64b5f6", "#9575cd", "#ff8a65", "#4dd0e1", "#aed581")
-                        _fwd_dashes = ("dash", "dot", "longdash", "dashdot", "dot")
-                        _fwd_days_list = list(_plcurve.get("forward_days") or [])
-                        _pl_fwd_by = _plcurve.get("pl_fwd_by_day") or {}
+                        _pl_fwd_at = _plcurve.get("pl_fwd_at_marker") or {}
                         for _fi, _kd in enumerate(_fwd_days_list):
-                            _ys_f = _pl_fwd_by.get(int(_kd))
-                            if not _ys_f:
+                            _yf = _pl_fwd_at.get(int(_kd))
+                            if _yf is None:
                                 continue
                             _c = _fwd_palette[_fi % len(_fwd_palette)]
-                            _d = _fwd_dashes[_fi % len(_fwd_dashes)]
-                            fig_pnl.add_trace(
-                                go.Scatter(
-                                    x=_plcurve["spots"],
-                                    y=_ys_f,
-                                    mode="lines",
-                                    name=f"P&L o +{_kd} dní (model)",
-                                    line=dict(width=1.35, color=_c, dash=_d),
-                                    opacity=0.92,
-                                )
-                            )
-                        _ms = _plcurve.get("marker_spot")
-                        _msrc = _plcurve.get("marker_source") or "spot"
-                        _ym1 = _plcurve.get("pl_now_at_marker")
-                        _ym2 = _plcurve.get("pl_horizon_at_marker")
-                        if _ms is not None and _ym1 is not None and _ym2 is not None:
-                            fig_pnl.add_vline(
-                                x=_ms,
-                                line_width=3,
-                                line_color="#26c6da",
-                                opacity=0.95,
-                                annotation_text=f"Aktuálny spot: {_ms:.2f}",
-                                annotation_position="top",
-                                annotation_font_size=12,
-                                annotation_font_color="#26c6da",
-                            )
                             fig_pnl.add_trace(
                                 go.Scatter(
                                     x=[_ms],
-                                    y=[_ym1],
+                                    y=[_yf],
                                     mode="markers",
-                                    name="Spot → P&L (dnes)",
-                                    marker=dict(size=16, color="#26c6da", symbol="diamond", line=dict(width=2, color="#ffffff")),
-                                    hovertemplate=f"<b>Spot ({_msrc})</b> {_ms:.2f}<br><b>P&L dnes</b>: %{{y:.0f}} USD<extra></extra>",
+                                    marker=dict(size=8, color=_c, symbol="circle", line=dict(width=1, color="#ffffff")),
+                                    showlegend=False,
+                                    hovertemplate=(
+                                        f"<b>Spot ({_msrc})</b> {_ms:.2f}<br>"
+                                        f"<b>P&L o +{_kd} dní</b>: %{{y:.0f}} USD<extra></extra>"
+                                    ),
                                 )
                             )
-                            fig_pnl.add_trace(
-                                go.Scatter(
-                                    x=[_ms],
-                                    y=[_ym2],
-                                    mode="markers",
-                                    name="Spot → P&L (pri exp.)",
-                                    marker=dict(size=14, color="#ffb74d", symbol="diamond", line=dict(width=2, color="#ffffff")),
-                                    hovertemplate=f"<b>Spot ({_msrc})</b> {_ms:.2f}<br><b>P&L pri exp.</b>: %{{y:.0f}} USD<extra></extra>",
-                                )
-                            )
-                            _pl_fwd_at = _plcurve.get("pl_fwd_at_marker") or {}
-                            for _fi, _kd in enumerate(_fwd_days_list):
-                                _yf = _pl_fwd_at.get(int(_kd))
-                                if _yf is None:
-                                    continue
-                                _c = _fwd_palette[_fi % len(_fwd_palette)]
-                                fig_pnl.add_trace(
-                                    go.Scatter(
-                                        x=[_ms],
-                                        y=[_yf],
-                                        mode="markers",
-                                        marker=dict(size=8, color=_c, symbol="circle", line=dict(width=1, color="#ffffff")),
-                                        showlegend=False,
-                                        hovertemplate=(
-                                            f"<b>Spot ({_msrc})</b> {_ms:.2f}<br>"
-                                            f"<b>P&L o +{_kd} dní</b>: %{{y:.0f}} USD<extra></extra>"
-                                        ),
-                                    )
-                                )
-                        fig_pnl.update_layout(
-                            template="plotly_dark",
-                            xaxis_title="Cena podkladu",
-                            yaxis_title="P&L (USD)",
-                            hovermode="x unified",
-                            margin=dict(l=48, r=24, t=40, b=48),
-                            legend=dict(
-                                yanchor="top",
-                                y=0.99,
-                                xanchor="left",
-                                x=0.01,
-                                bgcolor="rgba(0,0,0,0)",
-                            ),
-                            height=420,
-                        )
-                        st.plotly_chart(fig_pnl, use_container_width=True, key=f"pf_pnl_{_gkey}")
-                        st.caption(_plcurve["note"])
-                        if _plcurve.get("forward_days"):
-                            st.caption(
-                                "**Čiary +2 / +3 / +5 dní:** P&L vs. spot po ubehnutí týchto kalendárnych dňoch (kratší čas do expirácie, rovnaká IV z journalu). "
-                                "Pri **rozdielnej Δ** medzi nohami kompenzácia pri pohybe podkladu v čase **nie je rovnaká** — krivky sa od „dnes“ **rozbiehajú**."
-                            )
-                        if _plcurve.get("marker_spot") is None:
-                            st.caption(
-                                "**Tip:** Na čiaru spotu treba **pripojené IB** (automaticky sa skúsi aktuálny podklad), prípadne **STK** v portfóliu alebo **spot** v **Symboly**."
-                            )
-
-                with st.expander(
-                    "Stop-loss: P&L vs. podklad (rozsah z prémie short nohy)", expanded=False
-                ):
-                    _tk_sl = str(legs_edit[0].get("ticker") or "").strip().upper() if legs_edit else ""
-                    _s0sl, _src_sl = _journal_resolve_spot_for_pl(_tk_sl, _pf_live_pos)
-                    _pl_stop = journal_group_pl_stoploss_short_window(
-                        legs_edit, spot_center=_s0sl, marker_source=_src_sl
+                    fig_pnl.update_layout(
+                        template="plotly_dark",
+                        xaxis_title="Cena podkladu",
+                        yaxis_title="P&L (USD)",
+                        hovermode="x unified",
+                        margin=dict(l=48, r=24, t=40, b=48),
+                        legend=dict(
+                            yanchor="top",
+                            y=0.99,
+                            xanchor="left",
+                            x=0.01,
+                            bgcolor="rgba(0,0,0,0)",
+                        ),
+                        height=420,
                     )
-                    if _pl_stop is None:
+                    st.plotly_chart(fig_pnl, use_container_width=True, key=f"pf_pnl_{_gkey}")
+                    st.caption(_plcurve["note"])
+                    if _plcurve.get("forward_days"):
                         st.caption(
-                            "Tento graf vyžaduje **aspoň jednu short nohu** so strike a expiráciou a **jeden ticker** podkladu."
+                            "**Čiary +2 / +3 / +5 dní:** P&L vs. spot po ubehnutí týchto kalendárnych dňoch (kratší čas do expirácie, rovnaká IV z journalu). "
+                            "Pri **rozdielnej Δ** medzi nohami kompenzácia pri pohybe podkladu v čase **nie je rovnaká** — krivky sa od „dnes“ **rozbiehajú**."
                         )
-                    else:
-                        _xxs = _pl_stop["x_spot_minus_short"]
-                        _kss = float(_pl_stop["k_short"])
-                        _s_under = _pl_stop["spots"]
-                        _cd_sl = [[float(s), float(xrk)] for s, xrk in zip(_s_under, _xxs)]
-                        fig_sl = go.Figure()
+                    if _plcurve.get("marker_spot") is None:
+                        st.caption(
+                            "**Tip:** Na čiaru spotu treba **pripojené IB** (automaticky sa skúsi aktuálny podklad), prípadne **STK** v portfóliu alebo **spot** v **Symboly**."
+                        )
+    
+            with st.expander(
+                "Stop-loss: P&L vs. podklad (rozsah z prémie short nohy)", expanded=False
+            ):
+                _tk_sl = str(legs_edit[0].get("ticker") or "").strip().upper() if legs_edit else ""
+                _s0sl, _src_sl = _journal_resolve_spot_for_pl(_tk_sl, _pf_live_pos)
+                _pl_stop = journal_group_pl_stoploss_short_window(
+                    legs_edit, spot_center=_s0sl, marker_source=_src_sl
+                )
+                if _pl_stop is None:
+                    st.caption(
+                        "Tento graf vyžaduje **aspoň jednu short nohu** so strike a expiráciou a **jeden ticker** podkladu."
+                    )
+                else:
+                    _xxs = _pl_stop["x_spot_minus_short"]
+                    _kss = float(_pl_stop["k_short"])
+                    _s_under = _pl_stop["spots"]
+                    _cd_sl = [[float(s), float(xrk)] for s, xrk in zip(_s_under, _xxs)]
+                    fig_sl = go.Figure()
+                    fig_sl.add_trace(
+                        go.Scatter(
+                            x=_s_under,
+                            y=_pl_stop["pl_now"],
+                            mode="lines",
+                            name="P&L (dnes)",
+                            line=dict(width=2.2, color="#eceff1"),
+                            customdata=_cd_sl,
+                            hovertemplate="Spot=%{customdata[0]:.2f}<br>spot−K=%{customdata[1]:.2f}<br>P&L=%{y:.0f} USD<extra></extra>",
+                        )
+                    )
+                    _pf_sl = ("#64b5f6", "#9575cd", "#ff8a65", "#4dd0e1", "#aed581")
+                    _pd_sl = ("dash", "dot", "longdash", "dashdot", "dot")
+                    for _si, _kd in enumerate(_pl_stop.get("forward_days") or []):
+                        _yfs = (_pl_stop.get("pl_fwd_by_day") or {}).get(int(_kd))
+                        if not _yfs:
+                            continue
                         fig_sl.add_trace(
                             go.Scatter(
                                 x=_s_under,
-                                y=_pl_stop["pl_now"],
+                                y=_yfs,
                                 mode="lines",
-                                name="P&L (dnes)",
-                                line=dict(width=2.2, color="#eceff1"),
+                                name=f"P&L o +{_kd} dní",
+                                line=dict(
+                                    width=1.35,
+                                    color=_pf_sl[_si % len(_pf_sl)],
+                                    dash=_pd_sl[_si % len(_pd_sl)],
+                                ),
+                                opacity=0.9,
                                 customdata=_cd_sl,
                                 hovertemplate="Spot=%{customdata[0]:.2f}<br>spot−K=%{customdata[1]:.2f}<br>P&L=%{y:.0f} USD<extra></extra>",
                             )
                         )
-                        _pf_sl = ("#64b5f6", "#9575cd", "#ff8a65", "#4dd0e1", "#aed581")
-                        _pd_sl = ("dash", "dot", "longdash", "dashdot", "dot")
+                    _mspot = _pl_stop.get("marker_spot")
+                    _y0m = _pl_stop.get("pl_now_at_marker")
+                    if _mspot is not None and _y0m is not None:
+                        fig_sl.add_vline(
+                            x=_mspot,
+                            line_width=3,
+                            line_color="#26c6da",
+                            opacity=0.95,
+                            annotation_text=f"Aktuálny spot: {_mspot:.2f}",
+                            annotation_position="top",
+                            annotation_font_size=11,
+                            annotation_font_color="#26c6da",
+                        )
+                        fig_sl.add_trace(
+                            go.Scatter(
+                                x=[_mspot],
+                                y=[_y0m],
+                                mode="markers",
+                                name="Teraz",
+                                marker=dict(
+                                    size=15,
+                                    color="#26c6da",
+                                    symbol="diamond",
+                                    line=dict(width=2, color="#ffffff"),
+                                ),
+                                hovertemplate=(
+                                    f"<b>Spot</b> {_mspot:.2f}<br><b>spot−K</b> {_mspot - _kss:+.2f}<br>"
+                                    "<b>P&L dnes</b> %{y:.0f} USD<extra></extra>"
+                                ),
+                            )
+                        )
+                        _fat_sl = _pl_stop.get("pl_fwd_at_marker") or {}
                         for _si, _kd in enumerate(_pl_stop.get("forward_days") or []):
-                            _yfs = (_pl_stop.get("pl_fwd_by_day") or {}).get(int(_kd))
-                            if not _yfs:
+                            _yf = _fat_sl.get(int(_kd))
+                            if _yf is None:
                                 continue
-                            fig_sl.add_trace(
-                                go.Scatter(
-                                    x=_s_under,
-                                    y=_yfs,
-                                    mode="lines",
-                                    name=f"P&L o +{_kd} dní",
-                                    line=dict(
-                                        width=1.35,
-                                        color=_pf_sl[_si % len(_pf_sl)],
-                                        dash=_pd_sl[_si % len(_pd_sl)],
-                                    ),
-                                    opacity=0.9,
-                                    customdata=_cd_sl,
-                                    hovertemplate="Spot=%{customdata[0]:.2f}<br>spot−K=%{customdata[1]:.2f}<br>P&L=%{y:.0f} USD<extra></extra>",
-                                )
-                            )
-                        _mspot = _pl_stop.get("marker_spot")
-                        _y0m = _pl_stop.get("pl_now_at_marker")
-                        if _mspot is not None and _y0m is not None:
-                            fig_sl.add_vline(
-                                x=_mspot,
-                                line_width=3,
-                                line_color="#26c6da",
-                                opacity=0.95,
-                                annotation_text=f"Aktuálny spot: {_mspot:.2f}",
-                                annotation_position="top",
-                                annotation_font_size=11,
-                                annotation_font_color="#26c6da",
-                            )
+                            _c = _pf_sl[_si % len(_pf_sl)]
                             fig_sl.add_trace(
                                 go.Scatter(
                                     x=[_mspot],
-                                    y=[_y0m],
+                                    y=[_yf],
                                     mode="markers",
-                                    name="Teraz",
-                                    marker=dict(
-                                        size=15,
-                                        color="#26c6da",
-                                        symbol="diamond",
-                                        line=dict(width=2, color="#ffffff"),
-                                    ),
-                                    hovertemplate=(
-                                        f"<b>Spot</b> {_mspot:.2f}<br><b>spot−K</b> {_mspot - _kss:+.2f}<br>"
-                                        "<b>P&L dnes</b> %{y:.0f} USD<extra></extra>"
-                                    ),
+                                    marker=dict(size=7, color=_c, symbol="circle", line=dict(width=1, color="#ffffff")),
+                                    showlegend=False,
+                                    hovertemplate=f"+{_kd} dní pri tom istom S: %{{y:.0f}} USD<extra></extra>",
                                 )
                             )
-                            _fat_sl = _pl_stop.get("pl_fwd_at_marker") or {}
-                            for _si, _kd in enumerate(_pl_stop.get("forward_days") or []):
-                                _yf = _fat_sl.get(int(_kd))
-                                if _yf is None:
-                                    continue
-                                _c = _pf_sl[_si % len(_pf_sl)]
-                                fig_sl.add_trace(
-                                    go.Scatter(
-                                        x=[_mspot],
-                                        y=[_yf],
-                                        mode="markers",
-                                        marker=dict(size=7, color=_c, symbol="circle", line=dict(width=1, color="#ffffff")),
-                                        showlegend=False,
-                                        hovertemplate=f"+{_kd} dní pri tom istom S: %{{y:.0f}} USD<extra></extra>",
-                                    )
-                                )
-                        fig_sl.add_vline(
-                            x=_kss,
-                            line_width=1,
-                            line_color="#888888",
-                            opacity=0.55,
-                            line_dash="dot",
-                        )
-                        fig_sl.update_layout(
-                            template="plotly_dark",
-                            xaxis_title="Cena podkladu (USD) — rozsah z vstupnej prémie short nohy okolo K",
-                            yaxis_title="P&L (USD)",
-                            hovermode="x unified",
-                            margin=dict(l=48, r=24, t=44, b=56),
-                            legend=dict(
-                                yanchor="top",
-                                y=0.99,
-                                xanchor="left",
-                                x=0.01,
-                                bgcolor="rgba(0,0,0,0)",
-                            ),
-                            height=400,
-                        )
-                        st.plotly_chart(fig_sl, use_container_width=True, key=f"pf_pnl_sl_{_gkey}")
-                        st.caption(_pl_stop["note"])
-                        st.caption(
-                            f"**K (short):** {_kss:g}. **Sivá bodkovaná** = strike shortu. "
-                            "Rozsah osi X podľa **vstupnej prémie** short nohy v journali; bez prémie širší základný interval."
-                        )
-                        _hi_tbl = _pl_stop.get("marker_spot") or _s0sl
-                        if _hi_tbl is not None and float(_hi_tbl) > 0:
-                            st.markdown("##### Tabuľka P&L vs. spot (štýl TWS, model BS)")
-                            _tc1, _tc2 = st.columns(2)
-                            with _tc1:
-                                _tbl_lo = st.number_input(
-                                    "Spot až po (USD)",
-                                    min_value=1.0,
-                                    value=170.0,
-                                    step=1.0,
-                                    key=f"pf_sl_tbl_lo_{_gkey}",
-                                )
-                            with _tc2:
-                                _tbl_step = st.number_input(
-                                    "Krok (USD)",
-                                    min_value=0.05,
-                                    value=0.5,
-                                    step=0.05,
-                                    format="%.2f",
-                                    key=f"pf_sl_tbl_st_{_gkey}",
-                                )
-                            _lv = journal_spot_levels_descending(float(_hi_tbl), float(_tbl_lo), float(_tbl_step))
-
-                            # ── Tabuľka P&L: IB-anchored delta aprox. ──────────────────────────────
-                            # Pre každú nohu:
-                            #   P&L(S) = unrealized_pnl_IB  +  delta_IB × (S − S_now) × contracts × 100
-                            # kde S_now = aktuálny spot (z IB / Symboly).
-                            # Výhoda: presné číslo pri aktuálnom spote (zhoduje sa s TWS),
-                            # správny smer (delta z IB) pre ostatné scenáre.
-                            # Fallback na BS model ak IB greky/unrealized nie sú dostupné.
-
-                            _s_now = float(_s0sl) if _s0sl is not None and float(_s0sl or 0) > 0 else None
-                            _tws_rows: list[dict] = []
-                            _used_ib = False
-                            for _sv in _lv:
-                                _spot_r = round(float(_sv), 2)
-                                _leg_rows = []
-                                _net_pl = 0
-                                for _leg in (_legs_display_order_ui(legs_edit) if True else legs_edit):
-                                    _lt = str(_leg.get("leg_type") or "").strip().capitalize()
-                                    _ks = abs(int(round(float(_leg.get("contracts") or 1))))
-                                    _ks_signed = _ks if _lt == "Long" else -_ks
-                                    _lbl = _journal_leg_instrument_label_ui(_leg)
-
-                                    _ib_opt = find_ibkr_option_for_trade(_leg, _pf_live_pos)
-                                    _pl_leg: int | None = None
-                                    if _ib_opt is not None and _s_now is not None:
-                                        try:
-                                            _unrl = float(_ib_opt.get("unrealized_pnl") or 0.0)
-                                            _delta_ps = float(_ib_opt.get("delta") or 0.0)
-                                            _sgn_pos = 1.0 if _lt == "Long" else -1.0
-                                            _dS = float(_sv) - _s_now
-                                            _pl_leg = int(round(_unrl + _sgn_pos * _delta_ps * _dS * _ks * 100.0))
-                                            _used_ib = True
-                                        except Exception:
-                                            _pl_leg = None
-
-                                    if _pl_leg is None:
-                                        # fallback: BS model (pôvodná logika)
-                                        _pl_bs = _single_leg_pl_now_usd(_leg, float(_sv), 0.045)
-                                        _pl_leg = int(round(float(_pl_bs))) if _pl_bs is not None else 0
-
-                                    _net_pl += _pl_leg
-                                    _leg_rows.append({
-                                        "spot": _spot_r,
-                                        "kontrakt": _lbl,
-                                        "noha": _lt or "—",
-                                        "ks": f"{_ks_signed:+d}",
-                                        "pl_usd": _pl_leg,
-                                        "_typ": "noha",
-                                    })
-                                _tws_rows.extend(_leg_rows)
-                                _tws_rows.append({
-                                    "spot": _spot_r,
-                                    "kontrakt": "Σ NET",
-                                    "noha": "",
-                                    "ks": "",
-                                    "pl_usd": _net_pl,
-                                    "_typ": "net",
-                                })
-
-                            if _tws_rows:
-                                _tdf = pd.DataFrame(_tws_rows).drop(columns=["_typ"], errors="ignore")
-                                _tdf = _tdf.rename(
-                                    columns={
-                                        "spot": "Spot",
-                                        "kontrakt": "Kontrakt",
-                                        "noha": "Noha",
-                                        "ks": "Ks.",
-                                        "pl_usd": "P&L (USD)",
-                                    }
-                                )
-                                _tdf["Spot"] = _tdf["Spot"].map(_journal_fmt_spot_cell_str)
-                                _tdf["P&L (USD)"] = _tdf["P&L (USD)"].map(_journal_fmt_pl_usd_cell_str)
-                                _cc_tws: dict = {}
-                                if "Spot" in _tdf.columns:
-                                    _cc_tws["Spot"] = st.column_config.TextColumn(
-                                        "Spot",
-                                        help="Scenár ceny podkladu (text = zarovnanie vľavo).",
-                                        width="small",
-                                    )
-                                if "Kontrakt" in _tdf.columns:
-                                    _cc_tws["Kontrakt"] = st.column_config.TextColumn(
-                                        "Kontrakt",
-                                        help="Opčný kontrakt (z denníka).",
-                                        width="large",
-                                    )
-                                if "Noha" in _tdf.columns:
-                                    _cc_tws["Noha"] = st.column_config.TextColumn(
-                                        "Noha",
-                                        help="Long alebo Short.",
-                                        width="small",
-                                    )
-                                if "Ks." in _tdf.columns:
-                                    _cc_tws["Ks."] = st.column_config.TextColumn(
-                                        "Ks.",
-                                        help="Počet kontraktov so znamienkom (+ long, − short).",
-                                        width="small",
-                                    )
-                                if "P&L (USD)" in _tdf.columns:
-                                    _pl_help = (
-                                        "P&L v USD: pri aktuálnom spote z IB (TWS); ostatné spoty = delta aproximácia. "
-                                        "Riadok Σ NET = súčet nôh."
-                                    )
-                                    _cc_tws["P&L (USD)"] = st.column_config.TextColumn(
-                                        "P&L (USD)",
-                                        help=_pl_help + " Hodnoty ako text kvôli čitateľnému zarovnaniu.",
-                                        width="small",
-                                    )
-                                st.dataframe(
-                                    _tdf,
-                                    use_container_width=True,
-                                    hide_index=True,
-                                    column_config=_cc_tws,
-                                )
-                                _src_note = "IB delta aprox. (baseline = live unrealized P&L z TWS)" if _used_ib else "BS model (IB data nie sú dostupné – klikni Obnoviť údaje z TWS)"
-                                st.caption(
-                                    f"**Layout ako v TWS:** Spot | Kontrakt | Noha | Ks. | P&L. "
-                                    f"P&L pri aktuálnom spote = presné IB číslo; ostatné spoty = lineárna delta aprox. "
-                                    f"**Zdroj:** {_src_note}."
-                                )
-                        else:
-                            st.caption("**Tabuľka:** dopln **spot** (IB / Symboly), aby bolo od čoho počítať krok nadol.")
-
-                _watch_rows: list[dict] = []
-                for _, row in edited.iterrows():
-                    lt = str(row.get("Noha") or "")
-                    de = _nan_to_none(row["Δ vstup"])
-                    dc = _nan_to_none(row["Δ aktuálna"])
-                    ratio = _short_delta_abs_ratio(lt, de, dc)
-                    spot_w = spot_a = None
-                    if lt != "Short":
-                        p_str, st_lbl = "—", "—"
-                    elif ratio is None:
-                        p_str, st_lbl = "—", "doplň Δ vstup + Δ aktuálnu"
-                    elif ratio >= _SHORT_DELTA_ALERT_RATIO:
-                        p_str, st_lbl = f"{ratio:.2f}×", "⛔ |Δ| ≥ 2× oproti vstupu"
-                    elif ratio >= _SHORT_DELTA_WARN_RATIO:
-                        p_str, st_lbl = f"{ratio:.2f}×", "⚠ blíži sa k 2×"
-                    else:
-                        p_str, st_lbl = f"{ratio:.2f}×", "OK"
-
-                    # Orientačný podklad pri |Δ| = ratio × |Δ vstup| (BS; IV z journalu / Symboly)
-                    iv_bs, iv_src = None, ""
-                    strike_v = float(row.get("Strike") or 0)
-                    exp_s = str(row.get("Expirácia") or "")
-                    dte_sig = _dte_signed(exp_s)
-                    rc = _option_right_from_typ(row.get("Typ"))
-                    tk_up = str(row.get("Ticker") or "").strip().upper()
-                    spot_hint = ""
-                    if lt == "Short":
-                        iv_bs, iv_src = _resolve_iv_bs_for_spot_row(row, tk_up)
-                        spot_hint = _spot_missing_reason_short(
-                            iv_bs=iv_bs,
-                            strike_v=strike_v,
-                            dte_signed=dte_sig,
-                            rc=rc,
-                            entry_delta_ok=de is not None,
-                        )
-
-                    if lt == "Short" and de is not None:
-                        if (
-                            iv_bs is not None
-                            and strike_v > 0
-                            and dte_sig is not None
-                            and dte_sig >= 0
-                            and rc
-                        ):
-                            ae = abs(float(de))
-                            tw = _target_abs_delta_for_ratio(ae, _SHORT_DELTA_WARN_RATIO)
-                            ta = _target_abs_delta_for_ratio(ae, _SHORT_DELTA_ALERT_RATIO)
-                            if tw is not None:
-                                spot_w = spot_for_abs_delta_bs(
-                                    strike_v, int(dte_sig), float(iv_bs), rc, tw
-                                )
-                            if ta is not None:
-                                spot_a = spot_for_abs_delta_bs(
-                                    strike_v, int(dte_sig), float(iv_bs), rc, ta
-                                )
-                            if spot_w is not None or spot_a is not None:
-                                spot_hint = ""
-                            if spot_w is None and spot_a is None and spot_hint == "":
-                                spot_hint = (
-                                    "Numericky sa nepodarilo dopočítať spot (extrémne IV alebo údaje)."
-                                )
-
-                    _watch_rows.append(
-                        {
-                            "ID": int(row["ID"]),
-                            "Ticker": row.get("Ticker") or "",
-                            "Noha": lt,
-                            "|Δ aktuál| / |Δ vstup|": p_str,
-                            "Stav": st_lbl,
-                            "IV v BS": _fmt_iv_bs_line(iv_bs, iv_src),
-                            f"Podklad @ {_SHORT_DELTA_WARN_RATIO:g}× (BS)": _fmt_underlying_spot(spot_w),
-                            f"Podklad @ {_SHORT_DELTA_ALERT_RATIO:g}× (BS)": _fmt_underlying_spot(spot_a),
-                            "Pre spot": spot_hint if lt == "Short" else "",
-                        }
+                    fig_sl.add_vline(
+                        x=_kss,
+                        line_width=1,
+                        line_color="#888888",
+                        opacity=0.55,
+                        line_dash="dot",
                     )
-                if any(str(r.get("Noha")) == "Short" for r in _watch_rows):
-                    with st.expander(
-                        "Sledovanie delty (shortové nohy)",
-                        expanded=False,
-                    ):
-                        st.info(
-                            "**Podklad @ …×** sa dopočíta z buniek v tabuľke vyššie pri každom obnovení stránky "
-                            "(po úprave bunky Streamlit znova spustí výpočet; **Uložiť journal** len uloží hodnoty do DB). "
-                            "Potrebné: **Δ vstup**, **IV aktuálna** alebo **IV vstup** — môžeš zadať ako **0,767** alebo ako percentá z brokera (**76,7**). "
-                            "Ak je IV v journalu prázdne, použije sa **IV %** zo záložky **Symboly** (rovnaký ticker)."
-                        )
-                        st.caption(
-                            f"Pomer |Δ aktuálna| ÷ |Δ vstup|. Varovanie od **{_SHORT_DELTA_WARN_RATIO}×**, "
-                            f"silné od **{_SHORT_DELTA_ALERT_RATIO}×**. "
-                            f"Stĺpce **Podklad @ …×** = orientačná cena podkladu (Black–Scholes), pri ktorej by **|delta opcie|** "
-                            f"bola **≈ {_SHORT_DELTA_WARN_RATIO:g}× / {_SHORT_DELTA_ALERT_RATIO:g}×** oproti **|Δ vstup|**. "
-                            "**IV v BS** = akú IV model použil (percentá zo vstupu sa normalizujú na zlomok). "
-                            "Bez dividend, **r = 4,5 %**. Pri rollovaní len ako vodítko."
-                        )
-                        st.dataframe(
-                            pd.DataFrame(_watch_rows),
-                            use_container_width=True,
-                            hide_index=True,
-                        )
-
-                    with st.expander(
-                        "PL pri assignment",
-                        expanded=False,
-                    ):
-                        _tk_asn = str(legs_edit[0].get("ticker") or "").strip().upper() if legs_edit else ""
-                        _hi_asn, _src_asn_hi = _journal_resolve_spot_for_pl(_tk_asn, _pf_live_pos)
-                        if _hi_asn is not None and float(_hi_asn) > 0:
-                            _long_pl_by_tid: dict[int, float] = {}
-                            _long_src_by_tid: dict[int, str] = {}
-                            for _lg in legs_edit:
-                                if str(_lg.get("leg_type") or "").strip().capitalize() != "Long":
-                                    continue
-                                _lid = _lg.get("id")
-                                if _lid is None:
-                                    continue
-                                _val, _src = _journal_long_leg_assignment_column_usd(
-                                    _lg, _pf_live_pos, float(_hi_asn)
-                                )
-                                if _val is not None:
-                                    _long_pl_by_tid[int(_lid)] = float(_val)
-                                    _long_src_by_tid[int(_lid)] = _src
-                            _long_sum = sum(_long_pl_by_tid.values())
-                            _has_any_long = any(
-                                str(lg.get("leg_type") or "").strip().capitalize() == "Long"
-                                for lg in legs_edit
+                    fig_sl.update_layout(
+                        template="plotly_dark",
+                        xaxis_title="Cena podkladu (USD) — rozsah z vstupnej prémie short nohy okolo K",
+                        yaxis_title="P&L (USD)",
+                        hovermode="x unified",
+                        margin=dict(l=48, r=24, t=44, b=56),
+                        legend=dict(
+                            yanchor="top",
+                            y=0.99,
+                            xanchor="left",
+                            x=0.01,
+                            bgcolor="rgba(0,0,0,0)",
+                        ),
+                        height=400,
+                    )
+                    st.plotly_chart(fig_sl, use_container_width=True, key=f"pf_pnl_sl_{_gkey}")
+                    st.caption(_pl_stop["note"])
+                    st.caption(
+                        f"**K (short):** {_kss:g}. **Sivá bodkovaná** = strike shortu. "
+                        "Rozsah osi X podľa **vstupnej prémie** short nohy v journali; bez prémie širší základný interval."
+                    )
+                    _hi_tbl = _pl_stop.get("marker_spot") or _s0sl
+                    if _hi_tbl is not None and float(_hi_tbl) > 0:
+                        st.markdown("##### Tabuľka P&L vs. spot (štýl TWS, model BS)")
+                        _tc1, _tc2 = st.columns(2)
+                        with _tc1:
+                            _tbl_lo = st.number_input(
+                                "Spot až po (USD)",
+                                min_value=1.0,
+                                value=170.0,
+                                step=1.0,
+                                key=f"pf_sl_tbl_lo_{_gkey}",
                             )
-                            _src_set = set(_long_src_by_tid.values())
-                            if _long_pl_by_tid:
-                                _sum_note = f" **Σ Long (PL):** {int(round(_long_sum))} USD."
-                                if _src_set == {"ib"}:
-                                    _sum_note += " Všetky Long z IB."
-                                elif _src_set == {"bs"}:
-                                    _sum_note += " Všetky Long z BS modelu (zhoda IB chýba)."
-                                elif _src_set <= {"ib", "bs"} and len(_src_set) > 1:
-                                    _sum_note += " Long: kombinácia IB a BS."
-                            elif _has_any_long:
-                                _sum_note = (
-                                    " Long: dopln **Obnoviť údaje z TWS**, **vstupnú cenu** v žurnáli "
-                                    "alebo údaje nohy (expirácia, strike, IV), aby sa doplnil PL."
+                        with _tc2:
+                            _tbl_step = st.number_input(
+                                "Krok (USD)",
+                                min_value=0.05,
+                                value=0.5,
+                                step=0.05,
+                                format="%.2f",
+                                key=f"pf_sl_tbl_st_{_gkey}",
+                            )
+                        _lv = journal_spot_levels_descending(float(_hi_tbl), float(_tbl_lo), float(_tbl_step))
+    
+                        # ── Tabuľka P&L: IB-anchored delta aprox. ──────────────────────────────
+                        # Pre každú nohu:
+                        #   P&L(S) = unrealized_pnl_IB  +  delta_IB × (S − S_now) × contracts × 100
+                        # kde S_now = aktuálny spot (z IB / Symboly).
+                        # Výhoda: presné číslo pri aktuálnom spote (zhoduje sa s TWS),
+                        # správny smer (delta z IB) pre ostatné scenáre.
+                        # Fallback na BS model ak IB greky/unrealized nie sú dostupné.
+    
+                        _s_now = float(_s0sl) if _s0sl is not None and float(_s0sl or 0) > 0 else None
+                        _tws_rows: list[dict] = []
+                        _used_ib = False
+                        for _sv in _lv:
+                            _spot_r = round(float(_sv), 2)
+                            _leg_rows = []
+                            _net_pl = 0
+                            for _leg in (_legs_display_order_ui(legs_edit) if True else legs_edit):
+                                _lt = str(_leg.get("leg_type") or "").strip().capitalize()
+                                _ks = abs(int(round(float(_leg.get("contracts") or 1))))
+                                _ks_signed = _ks if _lt == "Long" else -_ks
+                                _lbl = _journal_leg_instrument_label_ui(_leg)
+    
+                                _ib_opt = find_ibkr_option_for_trade(_leg, _pf_live_pos)
+                                _pl_leg: int | None = None
+                                if _ib_opt is not None and _s_now is not None:
+                                    try:
+                                        _unrl = float(_ib_opt.get("unrealized_pnl") or 0.0)
+                                        _delta_ps = float(_ib_opt.get("delta") or 0.0)
+                                        _sgn_pos = 1.0 if _lt == "Long" else -1.0
+                                        _dS = float(_sv) - _s_now
+                                        _pl_leg = int(round(_unrl + _sgn_pos * _delta_ps * _dS * _ks * 100.0))
+                                        _used_ib = True
+                                    except Exception:
+                                        _pl_leg = None
+    
+                                if _pl_leg is None:
+                                    # fallback: BS model (pôvodná logika)
+                                    _pl_bs = _single_leg_pl_now_usd(_leg, float(_sv), 0.045)
+                                    _pl_leg = int(round(float(_pl_bs))) if _pl_bs is not None else 0
+    
+                                _net_pl += _pl_leg
+                                _leg_rows.append({
+                                    "spot": _spot_r,
+                                    "kontrakt": _lbl,
+                                    "noha": _lt or "—",
+                                    "ks": f"{_ks_signed:+d}",
+                                    "pl_usd": _pl_leg,
+                                    "_typ": "noha",
+                                })
+                            _tws_rows.extend(_leg_rows)
+                            _tws_rows.append({
+                                "spot": _spot_r,
+                                "kontrakt": "Σ NET",
+                                "noha": "",
+                                "ks": "",
+                                "pl_usd": _net_pl,
+                                "_typ": "net",
+                            })
+    
+                        if _tws_rows:
+                            _tdf = pd.DataFrame(_tws_rows).drop(columns=["_typ"], errors="ignore")
+                            _tdf = _tdf.rename(
+                                columns={
+                                    "spot": "Spot",
+                                    "kontrakt": "Kontrakt",
+                                    "noha": "Noha",
+                                    "ks": "Ks.",
+                                    "pl_usd": "P&L (USD)",
+                                }
+                            )
+                            _tdf["Spot"] = _tdf["Spot"].map(_journal_fmt_spot_cell_str)
+                            _tdf["P&L (USD)"] = _tdf["P&L (USD)"].map(_journal_fmt_pl_usd_cell_str)
+                            _cc_tws: dict = {}
+                            if "Spot" in _tdf.columns:
+                                _cc_tws["Spot"] = st.column_config.TextColumn(
+                                    "Spot",
+                                    help="Scenár ceny podkladu (text = zarovnanie vľavo).",
+                                    width="small",
                                 )
-                            else:
-                                _sum_note = ""
-
-                            with st.expander(
-                                "Čo znamenajú čísla — rozšíriť",
-                                expanded=False,
-                            ):
-                                st.markdown(
-                                    """
-**Čo znamenajú čísla** (bez poplatkov, orientačne):
-
-- **Krátka — PL:** pre **Spot** v danom riadku: na 1 akciu podkladu  
-  **|vstupná prémia| + strike − spot**, na celú nohu **× kontrakty × 100**.  
-  Je to **jeden riadok** so zjednodušeným účinkom short opcie pri údere: v čísle je naraz aj **prémia** (čo ste za opciu dostali / zaplatili podľa znamienka v journali berieme cez abs) aj časť **(strike − spot)** na akciu — teda nie je to len „prémia × ks × 100“, ale **prémia + (K − S)** na akciu × 100 × ks.
-
-- **Dlhá — PL:** **iba long opcia**, nie nákup akcie pri údere:  
-  **(aktuálna cena opcie $/akcia − kúpna prémia $/akcia) × kontrakty × 100**.  
-  Cena z IB (**Last** / mark / mid) alebo z BS, ak chýba zhoda s TWS. Kúpna prémia z **vstupnej ceny** v žurnáli, prípadne z **IB avg_cost/100**.
-
-- **Prečo nie „−S×ks×100 + K×ks×100 + opcia…“ na dlhej nohe?**  
-  Súčet **−spot + strike** na akciu (× 100 × ks) je pri tomto zjednodušení **už obsiahnutý v riadku krátkej nohy** (v člene **+ K − S**). Keby sme ten istý **(K − S)×100×ks** pripočítali ešte raz na dlhej nohe, **Σ NET** by **podklad dvojnásobne** započítal.  
-  Rozklad, ktorý popisuješ (**podklad (K−S) + zostatok long opcie (mark − nákup)**), sedí s **Σ NET**, len je u nás rozdelený: **(K−S) a prémia shortu** sú v **krátkej** bunke, **(cena long opcie − nákup)** v **dlhej**.
-
-- **Σ NET:** súčet PL v riadku (**krátka** + **dlhá**).
-
-**Layout:** ako tabuľka **P&L vs. spot** — scenár **Spot**, stĺpec **Δ spot** = o koľko USD je scenár nad/pod **referenčným spotom** (bázis z IB / Symboly), riadky nôh, **Σ NET**. Dlhá noha: PL **nezávisí od Spot** v stĺpci (opcia sa oceňuje referenčne / IB), mení sa len krátka časť podľa **Spot** v riadku.
-
-*Poznámka:* pre **short put** je reálny cashflow pri údere iný než pre **short call**; tá istá jednoradová formula je len **orientačný model** pre obe nohy.
-"""
+                            if "Kontrakt" in _tdf.columns:
+                                _cc_tws["Kontrakt"] = st.column_config.TextColumn(
+                                    "Kontrakt",
+                                    help="Opčný kontrakt (z denníka).",
+                                    width="large",
                                 )
-                                st.markdown(
-                                    f"**Referenčný spot** (bázis pre stĺpec Δ) = **{_hi_asn:.2f}** ({_src_asn_hi or '—'})."
-                                    + _sum_note
+                            if "Noha" in _tdf.columns:
+                                _cc_tws["Noha"] = st.column_config.TextColumn(
+                                    "Noha",
+                                    help="Long alebo Short.",
+                                    width="small",
                                 )
-
-                            _ac1, _ac2, _ac3 = st.columns(3)
-                            with _ac1:
-                                _asn_above = st.number_input(
-                                    "Nad spotom (USD)",
-                                    min_value=0.0,
-                                    value=25.0,
-                                    step=1.0,
-                                    help="Scenáre s podkladom vyšším ako referenčný spot o túto sumu (horná hranica rebríka).",
-                                    key=f"pf_asn_tbl_ab_{_gkey}",
+                            if "Ks." in _tdf.columns:
+                                _cc_tws["Ks."] = st.column_config.TextColumn(
+                                    "Ks.",
+                                    help="Počet kontraktov so znamienkom (+ long, − short).",
+                                    width="small",
                                 )
-                            with _ac2:
-                                _asn_below = st.number_input(
-                                    "Pod spotom (USD)",
-                                    min_value=0.0,
-                                    value=50.0,
-                                    step=1.0,
-                                    help="Scenáre s podkladom nižším ako referenčný spot o túto sumu (dolná hranica rebríka).",
-                                    key=f"pf_asn_tbl_be_{_gkey}",
+                            if "P&L (USD)" in _tdf.columns:
+                                _pl_help = (
+                                    "P&L v USD: pri aktuálnom spote z IB (TWS); ostatné spoty = delta aproximácia. "
+                                    "Riadok Σ NET = súčet nôh."
                                 )
-                            with _ac3:
-                                _asn_step = st.number_input(
-                                    "Krok (USD)",
-                                    min_value=0.05,
-                                    value=0.5,
-                                    step=0.05,
-                                    format="%.2f",
-                                    key=f"pf_asn_tbl_st_{_gkey}",
+                                _cc_tws["P&L (USD)"] = st.column_config.TextColumn(
+                                    "P&L (USD)",
+                                    help=_pl_help + " Hodnoty ako text kvôli čitateľnému zarovnaniu.",
+                                    width="small",
                                 )
+                            st.dataframe(
+                                _tdf,
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config=_cc_tws,
+                            )
+                            _src_note = "IB delta aprox. (baseline = live unrealized P&L z TWS)" if _used_ib else "BS model (IB data nie sú dostupné – klikni Obnoviť údaje z TWS)"
                             st.caption(
-                                f"Rebrík spotov: od **{_hi_asn + float(_asn_above):.2f}** nadol po **{max(1.0, _hi_asn - float(_asn_below)):.2f}** "
-                                f"(referencia **{_hi_asn:.2f}** uprostred rozsahu; krok **{_asn_step:g}** USD)."
+                                f"**Layout ako v TWS:** Spot | Kontrakt | Noha | Ks. | P&L. "
+                                f"P&L pri aktuálnom spote = presné IB číslo; ostatné spoty = lineárna delta aprox. "
+                                f"**Zdroj:** {_src_note}."
                             )
-                            _lv_asn = journal_spot_levels_band(
-                                float(_hi_asn),
-                                float(_asn_above),
-                                float(_asn_below),
-                                float(_asn_step),
+                    else:
+                        st.caption("**Tabuľka:** dopln **spot** (IB / Symboly), aby bolo od čoho počítať krok nadol.")
+    
+            _watch_rows: list[dict] = []
+            for _, row in edited.iterrows():
+                lt = str(row.get("Noha") or "")
+                de = _nan_to_none(row["Δ vstup"])
+                dc = _nan_to_none(row["Δ aktuálna"])
+                ratio = _short_delta_abs_ratio(lt, de, dc)
+                spot_w = spot_a = None
+                if lt != "Short":
+                    p_str, st_lbl = "—", "—"
+                elif ratio is None:
+                    p_str, st_lbl = "—", "doplň Δ vstup + Δ aktuálnu"
+                elif ratio >= _SHORT_DELTA_ALERT_RATIO:
+                    p_str, st_lbl = f"{ratio:.2f}×", "⛔ |Δ| ≥ 2× oproti vstupu"
+                elif ratio >= _SHORT_DELTA_WARN_RATIO:
+                    p_str, st_lbl = f"{ratio:.2f}×", "⚠ blíži sa k 2×"
+                else:
+                    p_str, st_lbl = f"{ratio:.2f}×", "OK"
+    
+                # Orientačný podklad pri |Δ| = ratio × |Δ vstup| (BS; IV z journalu / Symboly)
+                iv_bs, iv_src = None, ""
+                strike_v = float(row.get("Strike") or 0)
+                exp_s = str(row.get("Expirácia") or "")
+                dte_sig = _dte_signed(exp_s)
+                rc = _option_right_from_typ(row.get("Typ"))
+                tk_up = str(row.get("Ticker") or "").strip().upper()
+                spot_hint = ""
+                if lt == "Short":
+                    iv_bs, iv_src = _resolve_iv_bs_for_spot_row(row, tk_up)
+                    spot_hint = _spot_missing_reason_short(
+                        iv_bs=iv_bs,
+                        strike_v=strike_v,
+                        dte_signed=dte_sig,
+                        rc=rc,
+                        entry_delta_ok=de is not None,
+                    )
+    
+                if lt == "Short" and de is not None:
+                    if (
+                        iv_bs is not None
+                        and strike_v > 0
+                        and dte_sig is not None
+                        and dte_sig >= 0
+                        and rc
+                    ):
+                        ae = abs(float(de))
+                        tw = _target_abs_delta_for_ratio(ae, _SHORT_DELTA_WARN_RATIO)
+                        ta = _target_abs_delta_for_ratio(ae, _SHORT_DELTA_ALERT_RATIO)
+                        if tw is not None:
+                            spot_w = spot_for_abs_delta_bs(
+                                strike_v, int(dte_sig), float(iv_bs), rc, tw
                             )
-                            _asn_tws_rows: list[dict] = []
-                            _ref_asn = float(_hi_asn)
-                            for _sv in _lv_asn:
-                                _spot_r = round(float(_sv), 2)
-                                _dspot_r = round(_spot_r - _ref_asn, 2)
-                                _net_asn = 0
-                                for _leg in _legs_display_order_ui(legs_edit):
-                                    _lt = str(_leg.get("leg_type") or "").strip().capitalize()
-                                    _ks = abs(int(round(float(_leg.get("contracts") or 1))))
-                                    _ks_signed = _ks if _lt == "Long" else -_ks
-                                    _lbl = _journal_leg_instrument_label_ui(_leg)
-                                    if _lt == "Long":
-                                        _lid2 = _leg.get("id")
-                                        _mv_l = (
-                                            _long_pl_by_tid.get(int(_lid2))
-                                            if _lid2 is not None
-                                            else None
-                                        )
-                                        if _mv_l is not None:
-                                            _pi_l = int(round(float(_mv_l)))
-                                            _net_asn += _pi_l
-                                            _pv_l = float(_pi_l)
-                                        else:
-                                            _pv_l = float("nan")
-                                        _asn_tws_rows.append(
-                                            {
-                                                "spot": _spot_r,
-                                                "dspot_usd": _dspot_r,
-                                                "kontrakt": _lbl,
-                                                "noha": _lt or "—",
-                                                "ks": f"{_ks_signed:+d}",
-                                                "pl_usd": _pv_l,
-                                                "_typ": "noha",
-                                            }
-                                        )
-                                        continue
-                                    if _lt != "Short":
-                                        _asn_tws_rows.append(
-                                            {
-                                                "spot": _spot_r,
-                                                "dspot_usd": _dspot_r,
-                                                "kontrakt": _lbl,
-                                                "noha": _lt or "—",
-                                                "ks": f"{_ks_signed:+d}",
-                                                "pl_usd": float("nan"),
-                                                "_typ": "noha",
-                                            }
-                                        )
-                                        continue
-                                    _pl_a = _assignment_short_pl_usd(_leg, float(_sv))
-                                    if _pl_a is not None:
-                                        _pi = int(round(float(_pl_a)))
-                                        _net_asn += _pi
-                                        _pv = float(_pi)
+                        if ta is not None:
+                            spot_a = spot_for_abs_delta_bs(
+                                strike_v, int(dte_sig), float(iv_bs), rc, ta
+                            )
+                        if spot_w is not None or spot_a is not None:
+                            spot_hint = ""
+                        if spot_w is None and spot_a is None and spot_hint == "":
+                            spot_hint = (
+                                "Numericky sa nepodarilo dopočítať spot (extrémne IV alebo údaje)."
+                            )
+    
+                _watch_rows.append(
+                    {
+                        "ID": int(row["ID"]),
+                        "Ticker": row.get("Ticker") or "",
+                        "Noha": lt,
+                        "|Δ aktuál| / |Δ vstup|": p_str,
+                        "Stav": st_lbl,
+                        "IV v BS": _fmt_iv_bs_line(iv_bs, iv_src),
+                        f"Podklad @ {_SHORT_DELTA_WARN_RATIO:g}× (BS)": _fmt_underlying_spot(spot_w),
+                        f"Podklad @ {_SHORT_DELTA_ALERT_RATIO:g}× (BS)": _fmt_underlying_spot(spot_a),
+                        "Pre spot": spot_hint if lt == "Short" else "",
+                    }
+                )
+            if any(str(r.get("Noha")) == "Short" for r in _watch_rows):
+                with st.expander(
+                    "Sledovanie delty (shortové nohy)",
+                    expanded=False,
+                ):
+                    st.info(
+                        "**Podklad @ …×** sa dopočíta z buniek v tabuľke vyššie pri každom obnovení stránky "
+                        "(po úprave bunky Streamlit znova spustí výpočet; **Uložiť journal** len uloží hodnoty do DB). "
+                        "Potrebné: **Δ vstup**, **IV aktuálna** alebo **IV vstup** — môžeš zadať ako **0,767** alebo ako percentá z brokera (**76,7**). "
+                        "Ak je IV v journalu prázdne, použije sa **IV %** zo záložky **Symboly** (rovnaký ticker)."
+                    )
+                    st.caption(
+                        f"Pomer |Δ aktuálna| ÷ |Δ vstup|. Varovanie od **{_SHORT_DELTA_WARN_RATIO}×**, "
+                        f"silné od **{_SHORT_DELTA_ALERT_RATIO}×**. "
+                        f"Stĺpce **Podklad @ …×** = orientačná cena podkladu (Black–Scholes), pri ktorej by **|delta opcie|** "
+                        f"bola **≈ {_SHORT_DELTA_WARN_RATIO:g}× / {_SHORT_DELTA_ALERT_RATIO:g}×** oproti **|Δ vstup|**. "
+                        "**IV v BS** = akú IV model použil (percentá zo vstupu sa normalizujú na zlomok). "
+                        "Bez dividend, **r = 4,5 %**. Pri rollovaní len ako vodítko."
+                    )
+                    st.dataframe(
+                        pd.DataFrame(_watch_rows),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+    
+                with st.expander(
+                    "PL pri assignment",
+                    expanded=False,
+                ):
+                    _tk_asn = str(legs_edit[0].get("ticker") or "").strip().upper() if legs_edit else ""
+                    _hi_asn, _src_asn_hi = _journal_resolve_spot_for_pl(_tk_asn, _pf_live_pos)
+                    if _hi_asn is not None and float(_hi_asn) > 0:
+                        _long_pl_by_tid: dict[int, float] = {}
+                        _long_src_by_tid: dict[int, str] = {}
+                        for _lg in legs_edit:
+                            if str(_lg.get("leg_type") or "").strip().capitalize() != "Long":
+                                continue
+                            _lid = _lg.get("id")
+                            if _lid is None:
+                                continue
+                            _val, _src = _journal_long_leg_assignment_column_usd(
+                                _lg, _pf_live_pos, float(_hi_asn)
+                            )
+                            if _val is not None:
+                                _long_pl_by_tid[int(_lid)] = float(_val)
+                                _long_src_by_tid[int(_lid)] = _src
+                        _long_sum = sum(_long_pl_by_tid.values())
+                        _has_any_long = any(
+                            str(lg.get("leg_type") or "").strip().capitalize() == "Long"
+                            for lg in legs_edit
+                        )
+                        _src_set = set(_long_src_by_tid.values())
+                        if _long_pl_by_tid:
+                            _sum_note = f" **Σ Long (PL):** {int(round(_long_sum))} USD."
+                            if _src_set == {"ib"}:
+                                _sum_note += " Všetky Long z IB."
+                            elif _src_set == {"bs"}:
+                                _sum_note += " Všetky Long z BS modelu (zhoda IB chýba)."
+                            elif _src_set <= {"ib", "bs"} and len(_src_set) > 1:
+                                _sum_note += " Long: kombinácia IB a BS."
+                        elif _has_any_long:
+                            _sum_note = (
+                                " Long: dopln **Obnoviť údaje z TWS**, **vstupnú cenu** v žurnáli "
+                                "alebo údaje nohy (expirácia, strike, IV), aby sa doplnil PL."
+                            )
+                        else:
+                            _sum_note = ""
+    
+                        with st.expander(
+                            "Čo znamenajú čísla — rozšíriť",
+                            expanded=False,
+                        ):
+                            st.markdown(
+                                """
+    **Čo znamenajú čísla** (bez poplatkov, orientačne):
+    
+    - **Krátka — PL:** pre **Spot** v danom riadku: na 1 akciu podkladu  
+      **|vstupná prémia| + strike − spot**, na celú nohu **× kontrakty × 100**.  
+      Je to **jeden riadok** so zjednodušeným účinkom short opcie pri údere: v čísle je naraz aj **prémia** (čo ste za opciu dostali / zaplatili podľa znamienka v journali berieme cez abs) aj časť **(strike − spot)** na akciu — teda nie je to len „prémia × ks × 100“, ale **prémia + (K − S)** na akciu × 100 × ks.
+    
+    - **Dlhá — PL:** **iba long opcia**, nie nákup akcie pri údere:  
+      **(aktuálna cena opcie $/akcia − kúpna prémia $/akcia) × kontrakty × 100**.  
+      Cena z IB (**Last** / mark / mid) alebo z BS, ak chýba zhoda s TWS. Kúpna prémia z **vstupnej ceny** v žurnáli, prípadne z **IB avg_cost/100**.
+    
+    - **Prečo nie „−S×ks×100 + K×ks×100 + opcia…“ na dlhej nohe?**  
+      Súčet **−spot + strike** na akciu (× 100 × ks) je pri tomto zjednodušení **už obsiahnutý v riadku krátkej nohy** (v člene **+ K − S**). Keby sme ten istý **(K − S)×100×ks** pripočítali ešte raz na dlhej nohe, **Σ NET** by **podklad dvojnásobne** započítal.  
+      Rozklad, ktorý popisuješ (**podklad (K−S) + zostatok long opcie (mark − nákup)**), sedí s **Σ NET**, len je u nás rozdelený: **(K−S) a prémia shortu** sú v **krátkej** bunke, **(cena long opcie − nákup)** v **dlhej**.
+    
+    - **Σ NET:** súčet PL v riadku (**krátka** + **dlhá**).
+    
+    **Layout:** ako tabuľka **P&L vs. spot** — scenár **Spot**, stĺpec **Δ spot** = o koľko USD je scenár nad/pod **referenčným spotom** (bázis z IB / Symboly), riadky nôh, **Σ NET**. Dlhá noha: PL **nezávisí od Spot** v stĺpci (opcia sa oceňuje referenčne / IB), mení sa len krátka časť podľa **Spot** v riadku.
+    
+    *Poznámka:* pre **short put** je reálny cashflow pri údere iný než pre **short call**; tá istá jednoradová formula je len **orientačný model** pre obe nohy.
+    """
+                            )
+                            st.markdown(
+                                f"**Referenčný spot** (bázis pre stĺpec Δ) = **{_hi_asn:.2f}** ({_src_asn_hi or '—'})."
+                                + _sum_note
+                            )
+    
+                        _ac1, _ac2, _ac3 = st.columns(3)
+                        with _ac1:
+                            _asn_above = st.number_input(
+                                "Nad spotom (USD)",
+                                min_value=0.0,
+                                value=25.0,
+                                step=1.0,
+                                help="Scenáre s podkladom vyšším ako referenčný spot o túto sumu (horná hranica rebríka).",
+                                key=f"pf_asn_tbl_ab_{_gkey}",
+                            )
+                        with _ac2:
+                            _asn_below = st.number_input(
+                                "Pod spotom (USD)",
+                                min_value=0.0,
+                                value=50.0,
+                                step=1.0,
+                                help="Scenáre s podkladom nižším ako referenčný spot o túto sumu (dolná hranica rebríka).",
+                                key=f"pf_asn_tbl_be_{_gkey}",
+                            )
+                        with _ac3:
+                            _asn_step = st.number_input(
+                                "Krok (USD)",
+                                min_value=0.05,
+                                value=0.5,
+                                step=0.05,
+                                format="%.2f",
+                                key=f"pf_asn_tbl_st_{_gkey}",
+                            )
+                        st.caption(
+                            f"Rebrík spotov: od **{_hi_asn + float(_asn_above):.2f}** nadol po **{max(1.0, _hi_asn - float(_asn_below)):.2f}** "
+                            f"(referencia **{_hi_asn:.2f}** uprostred rozsahu; krok **{_asn_step:g}** USD)."
+                        )
+                        _lv_asn = journal_spot_levels_band(
+                            float(_hi_asn),
+                            float(_asn_above),
+                            float(_asn_below),
+                            float(_asn_step),
+                        )
+                        _asn_tws_rows: list[dict] = []
+                        _ref_asn = float(_hi_asn)
+                        for _sv in _lv_asn:
+                            _spot_r = round(float(_sv), 2)
+                            _dspot_r = round(_spot_r - _ref_asn, 2)
+                            _net_asn = 0
+                            for _leg in _legs_display_order_ui(legs_edit):
+                                _lt = str(_leg.get("leg_type") or "").strip().capitalize()
+                                _ks = abs(int(round(float(_leg.get("contracts") or 1))))
+                                _ks_signed = _ks if _lt == "Long" else -_ks
+                                _lbl = _journal_leg_instrument_label_ui(_leg)
+                                if _lt == "Long":
+                                    _lid2 = _leg.get("id")
+                                    _mv_l = (
+                                        _long_pl_by_tid.get(int(_lid2))
+                                        if _lid2 is not None
+                                        else None
+                                    )
+                                    if _mv_l is not None:
+                                        _pi_l = int(round(float(_mv_l)))
+                                        _net_asn += _pi_l
+                                        _pv_l = float(_pi_l)
                                     else:
-                                        _pv = float("nan")
+                                        _pv_l = float("nan")
                                     _asn_tws_rows.append(
                                         {
                                             "spot": _spot_r,
@@ -2749,164 +2777,196 @@ else:
                                             "kontrakt": _lbl,
                                             "noha": _lt or "—",
                                             "ks": f"{_ks_signed:+d}",
-                                            "pl_usd": _pv,
+                                            "pl_usd": _pv_l,
                                             "_typ": "noha",
                                         }
                                     )
+                                    continue
+                                if _lt != "Short":
+                                    _asn_tws_rows.append(
+                                        {
+                                            "spot": _spot_r,
+                                            "dspot_usd": _dspot_r,
+                                            "kontrakt": _lbl,
+                                            "noha": _lt or "—",
+                                            "ks": f"{_ks_signed:+d}",
+                                            "pl_usd": float("nan"),
+                                            "_typ": "noha",
+                                        }
+                                    )
+                                    continue
+                                _pl_a = _assignment_short_pl_usd(_leg, float(_sv))
+                                if _pl_a is not None:
+                                    _pi = int(round(float(_pl_a)))
+                                    _net_asn += _pi
+                                    _pv = float(_pi)
+                                else:
+                                    _pv = float("nan")
                                 _asn_tws_rows.append(
                                     {
                                         "spot": _spot_r,
                                         "dspot_usd": _dspot_r,
-                                        "kontrakt": "Σ NET",
-                                        "noha": "",
-                                        "ks": "",
-                                        "pl_usd": float(_net_asn),
-                                        "_typ": "net",
+                                        "kontrakt": _lbl,
+                                        "noha": _lt or "—",
+                                        "ks": f"{_ks_signed:+d}",
+                                        "pl_usd": _pv,
+                                        "_typ": "noha",
                                     }
                                 )
-                            if _asn_tws_rows:
-                                _adf_asn = pd.DataFrame(_asn_tws_rows).drop(columns=["_typ"], errors="ignore")
-                                _adf_asn = _adf_asn.rename(
-                                    columns={
-                                        "spot": "Spot",
-                                        "dspot_usd": "Δ spot (USD)",
-                                        "kontrakt": "Kontrakt",
-                                        "noha": "Noha",
-                                        "ks": "Ks.",
-                                        "pl_usd": "PL (USD)",
-                                    }
+                            _asn_tws_rows.append(
+                                {
+                                    "spot": _spot_r,
+                                    "dspot_usd": _dspot_r,
+                                    "kontrakt": "Σ NET",
+                                    "noha": "",
+                                    "ks": "",
+                                    "pl_usd": float(_net_asn),
+                                    "_typ": "net",
+                                }
+                            )
+                        if _asn_tws_rows:
+                            _adf_asn = pd.DataFrame(_asn_tws_rows).drop(columns=["_typ"], errors="ignore")
+                            _adf_asn = _adf_asn.rename(
+                                columns={
+                                    "spot": "Spot",
+                                    "dspot_usd": "Δ spot (USD)",
+                                    "kontrakt": "Kontrakt",
+                                    "noha": "Noha",
+                                    "ks": "Ks.",
+                                    "pl_usd": "PL (USD)",
+                                }
+                            )
+                            _adf_asn["Spot"] = _adf_asn["Spot"].map(_journal_fmt_spot_cell_str)
+                            if "Δ spot (USD)" in _adf_asn.columns:
+                                _adf_asn["Δ spot (USD)"] = _adf_asn["Δ spot (USD)"].map(
+                                    _journal_fmt_dspot_cell_str
                                 )
-                                _adf_asn["Spot"] = _adf_asn["Spot"].map(_journal_fmt_spot_cell_str)
-                                if "Δ spot (USD)" in _adf_asn.columns:
-                                    _adf_asn["Δ spot (USD)"] = _adf_asn["Δ spot (USD)"].map(
-                                        _journal_fmt_dspot_cell_str
-                                    )
-                                _adf_asn["PL (USD)"] = _adf_asn["PL (USD)"].map(_journal_fmt_pl_usd_cell_str)
-                                _cc_asn: dict = {}
-                                if "Spot" in _adf_asn.columns:
-                                    _cc_asn["Spot"] = st.column_config.TextColumn(
-                                        "Spot",
-                                        help="Scenár ceny podkladu (USD).",
-                                        width="small",
-                                    )
-                                if "Δ spot (USD)" in _adf_asn.columns:
-                                    _cc_asn["Δ spot (USD)"] = st.column_config.TextColumn(
-                                        "Δ spot (USD)",
-                                        help="Scenárny spot mínus referenčný spot (IB / Symboly); + = vyššie podklad.",
-                                        width="small",
-                                    )
-                                if "Kontrakt" in _adf_asn.columns:
-                                    _cc_asn["Kontrakt"] = st.column_config.TextColumn(
-                                        "Kontrakt",
-                                        help="Kontrakt z denníka.",
-                                        width="large",
-                                    )
-                                if "Noha" in _adf_asn.columns:
-                                    _cc_asn["Noha"] = st.column_config.TextColumn(
-                                        "Noha",
-                                        width="small",
-                                    )
-                                if "Ks." in _adf_asn.columns:
-                                    _cc_asn["Ks."] = st.column_config.TextColumn(
-                                        "Ks.",
-                                        help="Kontrakty so znamienkom.",
-                                        width="small",
-                                    )
-                                if "PL (USD)" in _adf_asn.columns:
-                                    _cc_asn["PL (USD)"] = st.column_config.TextColumn(
-                                        "PL (USD)",
-                                        help="Krátka: |prémia|+K−spot na akciu ×ks×100 (zjednoduš. assignment). Dlhá: (last−kúpna)×ks×100. Σ NET = súčet.",
-                                        width="small",
-                                    )
-                                st.dataframe(
-                                    _adf_asn,
-                                    use_container_width=True,
-                                    hide_index=True,
-                                    column_config=_cc_asn,
+                            _adf_asn["PL (USD)"] = _adf_asn["PL (USD)"].map(_journal_fmt_pl_usd_cell_str)
+                            _cc_asn: dict = {}
+                            if "Spot" in _adf_asn.columns:
+                                _cc_asn["Spot"] = st.column_config.TextColumn(
+                                    "Spot",
+                                    help="Scenár ceny podkladu (USD).",
+                                    width="small",
                                 )
-                                st.caption(
-                                    "Stĺpce PL a Σ NET — význam výpočtov je v rozšíriteľnom texte **„Čo znamenajú čísla“** vyššie."
+                            if "Δ spot (USD)" in _adf_asn.columns:
+                                _cc_asn["Δ spot (USD)"] = st.column_config.TextColumn(
+                                    "Δ spot (USD)",
+                                    help="Scenárny spot mínus referenčný spot (IB / Symboly); + = vyššie podklad.",
+                                    width="small",
                                 )
-                        else:
+                            if "Kontrakt" in _adf_asn.columns:
+                                _cc_asn["Kontrakt"] = st.column_config.TextColumn(
+                                    "Kontrakt",
+                                    help="Kontrakt z denníka.",
+                                    width="large",
+                                )
+                            if "Noha" in _adf_asn.columns:
+                                _cc_asn["Noha"] = st.column_config.TextColumn(
+                                    "Noha",
+                                    width="small",
+                                )
+                            if "Ks." in _adf_asn.columns:
+                                _cc_asn["Ks."] = st.column_config.TextColumn(
+                                    "Ks.",
+                                    help="Kontrakty so znamienkom.",
+                                    width="small",
+                                )
+                            if "PL (USD)" in _adf_asn.columns:
+                                _cc_asn["PL (USD)"] = st.column_config.TextColumn(
+                                    "PL (USD)",
+                                    help="Krátka: |prémia|+K−spot na akciu ×ks×100 (zjednoduš. assignment). Dlhá: (last−kúpna)×ks×100. Σ NET = súčet.",
+                                    width="small",
+                                )
+                            st.dataframe(
+                                _adf_asn,
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config=_cc_asn,
+                            )
                             st.caption(
-                                "**PL pri assignment:** dopln **spot** podkladu (IB / Symboly), aby sa dal zobraziť rebrík scenárov."
+                                "Stĺpce PL a Σ NET — význam výpočtov je v rozšíriteľnom texte **„Čo znamenajú čísla“** vyššie."
                             )
-
-                if st.button("Uložiť journal (Gréky, IV, Vega, skupina)", key=f"pf_sv_{_gkey}", type="primary"):
-                    nchg = 0
-                    nsnap = 0
-                    for _, row in edited.iterrows():
-                        tid = int(row["ID"])
-                        orig = orig_by_id.get(tid, {})
-                        sk = _skupina_cell_norm(row.get("Skupina"))
-                        new_gid = None if sk in (PF_GROUP_NONE, "— bez skupiny") else sk
-                        old_gid = (orig.get("group_id") or "").strip() or None
-                        if (new_gid or "") != (old_gid or ""):
-                            db.update_trade(tid, group_id="" if not new_gid else new_gid)
-                            nchg += 1
-
-                        new_iv = _greek_entry_from_current_when_missing(
-                            orig.get("iv_at_entry"),
-                            row["IV vstup"],
-                            row["IV aktuálna"],
-                        )
-                        new_d = _greek_entry_from_current_when_missing(
-                            orig.get("delta_at_entry"),
-                            row["Δ vstup"],
-                            row["Δ aktuálna"],
-                        )
-                        new_th = _greek_entry_from_current_when_missing(
-                            orig.get("theta_at_entry"),
-                            row["Θ vstup ($/deň)"],
-                            row["Θ aktuálna ($/deň)"],
-                        )
-                        new_dc = _greek_cell_to_db(orig.get("delta_current"), row["Δ aktuálna"])
-                        new_tc = _greek_cell_to_db(orig.get("theta_current"), row["Θ aktuálna ($/deň)"])
-                        new_ve = _greek_entry_from_current_when_missing(
-                            orig.get("vega_at_entry"),
-                            row["Vega vstup"],
-                            row["Vega aktuálna"],
-                        )
-                        new_vc = _greek_cell_to_db(orig.get("vega_current"), row["Vega aktuálna"])
-                        new_ivc = _greek_cell_to_db(orig.get("iv_current"), row["IV aktuálna"])
-
-                        greek_changed = (
-                            not _entry_float_eq(orig.get("iv_at_entry"), new_iv)
-                            or not _entry_float_eq(orig.get("delta_at_entry"), new_d)
-                            or not _entry_float_eq(orig.get("theta_at_entry"), new_th)
-                            or not _entry_float_eq(orig.get("delta_current"), new_dc)
-                            or not _entry_float_eq(orig.get("vega_at_entry"), new_ve)
-                            or not _entry_float_eq(orig.get("vega_current"), new_vc)
-                            or not _entry_float_eq(orig.get("iv_current"), new_ivc)
-                            or not _entry_float_eq(orig.get("theta_current"), new_tc)
-                        )
-                        if greek_changed:
-                            db.set_trade_portfolio_greeks(
-                                tid,
-                                new_iv,
-                                new_d,
-                                new_th,
-                                new_dc,
-                                vega_at_entry=new_ve,
-                                vega_current=new_vc,
-                                iv_current=new_ivc,
-                                theta_current=new_tc,
-                            )
-                            nchg += 1
-                        if greek_changed and any(
-                            x is not None for x in (new_dc, new_tc, new_vc, new_ivc)
-                        ):
-                            db.insert_trade_greek_snapshot(
-                                tid,
-                                delta=new_dc,
-                                theta_usd=new_tc,
-                                vega=new_vc,
-                                iv=new_ivc,
-                            )
-                            nsnap += 1
-                    if nchg or nsnap:
-                        st.success(f"Uložené — zmenených záznamov: **{nchg}**, nových bodov histórie: **{nsnap}**.")
-                        st.rerun()
                     else:
-                        st.info("Žiadna zmena.")
-            st.divider()
+                        st.caption(
+                            "**PL pri assignment:** dopln **spot** podkladu (IB / Symboly), aby sa dal zobraziť rebrík scenárov."
+                        )
+    
+            if st.button("Uložiť journal (Gréky, IV, Vega, skupina)", key=f"pf_sv_{_gkey}", type="primary"):
+                nchg = 0
+                nsnap = 0
+                for _, row in edited.iterrows():
+                    tid = int(row["ID"])
+                    orig = orig_by_id.get(tid, {})
+                    sk = _skupina_cell_norm(row.get("Skupina"))
+                    new_gid = None if sk in (PF_GROUP_NONE, "— bez skupiny") else sk
+                    old_gid = (orig.get("group_id") or "").strip() or None
+                    if (new_gid or "") != (old_gid or ""):
+                        db.update_trade(tid, group_id="" if not new_gid else new_gid)
+                        nchg += 1
+    
+                    new_iv = _greek_entry_from_current_when_missing(
+                        orig.get("iv_at_entry"),
+                        row["IV vstup"],
+                        row["IV aktuálna"],
+                    )
+                    new_d = _greek_entry_from_current_when_missing(
+                        orig.get("delta_at_entry"),
+                        row["Δ vstup"],
+                        row["Δ aktuálna"],
+                    )
+                    new_th = _greek_entry_from_current_when_missing(
+                        orig.get("theta_at_entry"),
+                        row["Θ vstup ($/deň)"],
+                        row["Θ aktuálna ($/deň)"],
+                    )
+                    new_dc = _greek_cell_to_db(orig.get("delta_current"), row["Δ aktuálna"])
+                    new_tc = _greek_cell_to_db(orig.get("theta_current"), row["Θ aktuálna ($/deň)"])
+                    new_ve = _greek_entry_from_current_when_missing(
+                        orig.get("vega_at_entry"),
+                        row["Vega vstup"],
+                        row["Vega aktuálna"],
+                    )
+                    new_vc = _greek_cell_to_db(orig.get("vega_current"), row["Vega aktuálna"])
+                    new_ivc = _greek_cell_to_db(orig.get("iv_current"), row["IV aktuálna"])
+    
+                    greek_changed = (
+                        not _entry_float_eq(orig.get("iv_at_entry"), new_iv)
+                        or not _entry_float_eq(orig.get("delta_at_entry"), new_d)
+                        or not _entry_float_eq(orig.get("theta_at_entry"), new_th)
+                        or not _entry_float_eq(orig.get("delta_current"), new_dc)
+                        or not _entry_float_eq(orig.get("vega_at_entry"), new_ve)
+                        or not _entry_float_eq(orig.get("vega_current"), new_vc)
+                        or not _entry_float_eq(orig.get("iv_current"), new_ivc)
+                        or not _entry_float_eq(orig.get("theta_current"), new_tc)
+                    )
+                    if greek_changed:
+                        db.set_trade_portfolio_greeks(
+                            tid,
+                            new_iv,
+                            new_d,
+                            new_th,
+                            new_dc,
+                            vega_at_entry=new_ve,
+                            vega_current=new_vc,
+                            iv_current=new_ivc,
+                            theta_current=new_tc,
+                        )
+                        nchg += 1
+                    if greek_changed and any(
+                        x is not None for x in (new_dc, new_tc, new_vc, new_ivc)
+                    ):
+                        db.insert_trade_greek_snapshot(
+                            tid,
+                            delta=new_dc,
+                            theta_usd=new_tc,
+                            vega=new_vc,
+                            iv=new_ivc,
+                        )
+                        nsnap += 1
+                if nchg or nsnap:
+                    st.success(f"Uložené — zmenených záznamov: **{nchg}**, nových bodov histórie: **{nsnap}**.")
+                    st.rerun()
+                else:
+                    st.info("Žiadna zmena.")
+        st.divider()

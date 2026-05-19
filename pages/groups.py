@@ -402,6 +402,51 @@ with tab_manage:
                                      "Gamma (1x)": st.column_config.NumberColumn(format="%.4f"),
                                  })
 
+                    _rm_map: dict[str, int] = {}
+                    _rm_opts: list[str] = []
+                    for t in legs:
+                        tid = int(t["id"])
+                        tk = str(t.get("ticker") or "").strip()
+                        lt = str(t.get("leg_type") or "").strip()
+                        ot = str(t.get("option_type") or "").strip()
+                        if ot.upper() in ("STK", "STOCK"):
+                            q = int(t.get("contracts") or 1)
+                            lbl = f"#{tid} · {tk} · {lt} · STK · {q} ks"
+                        else:
+                            k = float(t.get("strike") or 0)
+                            ex = str(t.get("expiry") or "").strip()
+                            q = int(t.get("contracts") or 1)
+                            lbl = (
+                                f"#{tid} · {tk} · {lt} · {ot} · strike {k:.0f} · exp {ex} · ×{q}"
+                            )
+                        _rm_opts.append(lbl)
+                        _rm_map[lbl] = tid
+                    st.multiselect(
+                        "Vyber nohy na vyradenie zo skupiny",
+                        options=_rm_opts,
+                        key=f"grp_rm_pick_{g['id']}",
+                        help="Nohám sa vymaže Group ID (skončia bez skupiny). Gréky v DB sa nemenia.",
+                    )
+                    if st.button(
+                        "Vyradiť vybrané zo skupiny",
+                        key=f"grp_rm_btn_{g['id']}",
+                        type="secondary",
+                    ):
+                        _picked_rm = list(st.session_state.get(f"grp_rm_pick_{g['id']}") or [])
+                        n_rm = 0
+                        for lab in _picked_rm:
+                            tid_rm = _rm_map.get(str(lab))
+                            if tid_rm is None:
+                                continue
+                            db.update_trade(int(tid_rm), group_id="")
+                            n_rm += 1
+                        if n_rm:
+                            st.success(f"Vyradených nôh zo skupiny **{gname}**: **{n_rm}**.")
+                            st.session_state[f"grp_rm_pick_{g['id']}"] = []
+                            st.rerun()
+                        else:
+                            st.warning("Vyber aspoň jednu nohu v zozname vyššie.")
+
                     if has_greeks:
                         c_t, c_g, _ = st.columns([1, 1, 2])
                         c_t.metric("Net Theta (skupina)", f"${net_theta:+.2f} / deň")
@@ -689,7 +734,7 @@ with tab_assign:
     st.subheader("Priradiť skupinu obchodom")
     st.caption(
         "**Návod:** Vyber **skupinu**, v tabuľke zaškrtni **Patrí do vybranej skupiny** pri nohách, ktoré do nej majú patriť, "
-        "a stlač **Uložiť zostavu skupiny**. Odškrtnutím nohy, ktorá už v tejto skupine bola, ju zo skupiny odoberieš. "
+        "a stlač **Uložiť zostavu skupiny**. **Vyradenie:** odškrtni nohu, ktorá už v tejto skupine je, a znova **Uložiť zostavu skupiny** — Group ID sa vymaže. "
         "Zoznam sú len **otvorené** nohy (stav Open). **Akcie podkladu** sú v denníku ako nohy s typom **STK** (po **Importe z IB** "
         "alebo cez formulár nižšie) — v tabuľke ich spoznáš podľa popisu „STK · N ks“."
     )

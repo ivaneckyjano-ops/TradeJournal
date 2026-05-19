@@ -15,10 +15,11 @@ from core.portfolio_data import calc_dte, normalize_expiry
 
 
 def _expiry_to_date(expiry_raw: str) -> Optional[date]:
-    if not expiry_raw:
+    toks = str(expiry_raw or "").strip().split()
+    if not toks:
         return None
     try:
-        s = normalize_expiry(str(expiry_raw).strip().split()[0])
+        s = normalize_expiry(toks[0])
         if len(s) >= 10:
             return datetime.strptime(s[:10], "%Y-%m-%d").date()
     except ValueError:
@@ -507,7 +508,8 @@ def _legs_display_order(legs: list[dict]) -> list[dict]:
 
     def _key(leg: dict) -> tuple[int, int]:
         lt = 0 if str(leg.get("leg_type") or "").strip().capitalize() == "Long" else 1
-        ed = _expiry_to_date(str(leg.get("expiry") or "").strip().split()[0])
+        _ex_toks = str(leg.get("expiry") or "").strip().split()
+        ed = _expiry_to_date(_ex_toks[0] if _ex_toks else "")
         return lt, ed.toordinal() if ed else 0
 
     return sorted(legs, key=_key)

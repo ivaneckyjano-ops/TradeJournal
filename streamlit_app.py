@@ -31,12 +31,28 @@ _IB_DEFAULT_CLIENT_IDS = {
 }
 
 
+def _apply_db_mode(mode: str) -> None:
+    """
+    Zosúladí aktívny DB súbor s LIVE/PAPER režimom aj mimo Streamlit UI kontextu.
+
+    Niektoré volania DB môžu bežať mimo hlavného script contextu, kde
+    ``st.session_state`` nie je spoľahlivý. Nastavením ``db.DB_PATH`` tu
+    zabránime zápisom/čítaniam do nesprávnej (typicky LIVE) DB po prepnutí.
+    """
+    mode_n = str(mode or "").strip().upper()
+    if mode_n == "PAPER":
+        db.DB_PATH = db.PAPER_DB_PATH
+    else:
+        db.DB_PATH = db.LIVE_DB_PATH
+
+
 def _apply_ib_mode() -> None:
     mode = str(st.session_state.get("ib_mode") or "LIVE").strip().upper()
     prev_mode = str(st.session_state.get("_ib_mode_prev") or "").strip().upper()
     if mode != prev_mode:
         # Neprepína sa s DB — ostáva margin/účet z predchádzajúceho IB režimu
         st.session_state.pop("account_summary", None)
+    _apply_db_mode(mode)
     if mode != prev_mode and ibkr.get_ib() is not None:
         try:
             ibkr.disconnect()
@@ -64,6 +80,9 @@ if "ib_cid" not in st.session_state:
 
 if "_ib_mode_prev" not in st.session_state:
     st.session_state["_ib_mode_prev"] = st.session_state["ib_mode"]
+
+# Aplikuj mapovanie DB hneď pri každom rerune app shellu.
+_apply_db_mode(str(st.session_state.get("ib_mode") or "LIVE"))
 
 _sidebar_bg = "#f3f8ff" if st.session_state["ib_mode"] == "LIVE" else "#fff8e6"
 st.markdown(
