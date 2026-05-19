@@ -34,6 +34,9 @@ _IB_DEFAULT_CLIENT_IDS = {
 def _apply_ib_mode() -> None:
     mode = str(st.session_state.get("ib_mode") or "LIVE").strip().upper()
     prev_mode = str(st.session_state.get("_ib_mode_prev") or "").strip().upper()
+    if mode != prev_mode:
+        # Neprepína sa s DB — ostáva margin/účet z predchádzajúceho IB režimu
+        st.session_state.pop("account_summary", None)
     if mode != prev_mode and ibkr.get_ib() is not None:
         try:
             ibkr.disconnect()

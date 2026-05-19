@@ -81,7 +81,7 @@ with st.sidebar:
     st.markdown("---")
 
     # ── Tlačidlo na fetch Spot cien z IBKR (background) ────────────────────
-    _spot_job = ibkr.SPOT_FETCH_JOB
+    _spot_job = ibkr.get_spot_fetch_job()
     _spot_running = (_spot_job["status"] == "running")
 
     col_sb1, col_sb2 = st.columns([3, 2])
@@ -389,10 +389,10 @@ with st.sidebar:
 groups     = db.get_groups()
 all_trades = db.get_open_trades()
 
-# Zdroj live dát: session_state (naplnený zo stránky Skupiny)
-# Fallback: FETCH_JOB["positions"] je dict {"positions": [...], "error": ...}
+# Zdroj live dát: session_state (naplnený zo stránky Skupiny / auto-sync)
+# Fallback: slovník z background fetchu {"positions": [...], "error": ...}
 _ss_positions = ibkr.get_scoped_session_value("live_positions", [])
-_job_raw      = ibkr.FETCH_JOB.get("positions")
+_job_raw      = ibkr.get_ib_fetch_job().get("positions")
 _job_positions = (
     _job_raw.get("positions", [])
     if isinstance(_job_raw, dict)
@@ -402,7 +402,7 @@ pos_cache: list = _ss_positions or _job_positions
 
 # ── Tlačidlo na fetch Greeks priamo z tejto stránky ─────────────────────────
 if ibkr.is_connected():
-    _job = ibkr.FETCH_JOB
+    _job = ibkr.get_ib_fetch_job()
     _running = (_job["status"] == "running")
 
     col_f1, col_f2, col_f3 = st.columns([2, 1.5, 3])
@@ -784,10 +784,10 @@ if _do_analyze:
             try:
                 _strat  = st.session_state.get("strategy_params", {})
                 # Live margin z TWS (ak je dostupný), inak manuálne zadaný
-                _tws_acct = ibkr.DASHBOARD_FETCH_JOB.get("account") or {}
+                _tws_acct = ibkr.get_dashboard_fetch_job().get("account") or {}
                 _acct_s   = _tws_acct if _tws_acct else st.session_state.get("account_summary", {})
                 # Otvorené objednávky z TWS (s BAG nohami a podmienkami)
-                _tws_orders = ibkr.DASHBOARD_FETCH_JOB.get("orders")
+                _tws_orders = ibkr.get_dashboard_fetch_job().get("orders")
                 if _tws_orders is None and ibkr.is_connected():
                     _ord_res    = ibkr.fetch_open_orders(use_cache=False)
                     _tws_orders = _ord_res.get("orders", [])

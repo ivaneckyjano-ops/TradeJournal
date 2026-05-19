@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import threading
 import time
+from datetime import date
 
 from core import database as db
 from core import agent as ai_agent
@@ -13,9 +14,8 @@ db.init_db()
 set_tradejournal_page("groups")
 
 
-def _run_fetch_job(stop_event: threading.Event):
+def _run_fetch_job(stop_event: threading.Event, job: dict) -> None:
     """Beží v separátnom vlákne. Stiahne iba pozície s Greeks (čistá matematika)."""
-    job = ibkr.FETCH_JOB
     try:
         res = ibkr.fetch_positions(with_greeks=True)
         if stop_event.is_set():
@@ -29,7 +29,8 @@ def _run_fetch_job(stop_event: threading.Event):
 
 st.title("Správa skupín (Group ID)")
 st.caption(
-    "**Návod:** **Vytvoriť** = nový Group ID. **Prehľad a úprava** = AI, IB dáta a správa poznámok v expandéroch. **Priradiť obchodom** = hromadne nastavíš rovnakú skupinu vybraným nohám. "
+    "**Návod:** **Vytvoriť** = nový Group ID. **Prehľad a úprava** = AI, IB dáta a správa poznámok v expandéroch. **Priradiť obchodom** = tabuľka s celým popisom nohy a zaškrtnutím členstva v skupine "
+    "(funguje aj pre **akcie podkladu** — riadky **STK** z importu IB alebo ručne pridané). "
     "Rovnaké meno skupiny potom vyberáš v Trade Log a Konzultáciách."
 )
 
@@ -174,7 +175,7 @@ with tab_manage:
     ibkr_positions, ibkr_orders = get_live_data()
     
     if ibkr.is_connected():
-        job = ibkr.FETCH_JOB
+        job = ibkr.get_ib_fetch_job()
         job_status = job["status"]
 
         # ── Spracuj výsledok ak vlákno dobehlo ──────────────────────────────
@@ -255,7 +256,7 @@ with tab_manage:
                 "stop_event": stop_evt,
                 "thread": None,
             })
-            t = threading.Thread(target=_run_fetch_job, args=(stop_evt,), daemon=True)
+            t = threading.Thread(target=_run_fetch_job, args=(stop_evt, job), daemon=True)
             job["thread"] = t
             t.start()
             st.rerun()
@@ -667,13 +668,38 @@ TICKER | Short noha | Long noha | Net debet ~$XXX | Theta ~+$X/deň | Podmienka 
 
 
 # ─── Tab: Priradiť obchodom ───────────────────────────────────────────────────
+def _groups_assign_leg_label(t: dict) -> str:
+    """Celý riadok pre tabuľku priradenia — čitateľný v tmavom UI (nie skrátené čipy)."""
+    tid = int(t.get("id") or 0)
+    tk = str(t.get("ticker") or "").strip()
+    lt = str(t.get("leg_type") or "").strip()
+    ot = str(t.get("option_type") or "").strip()
+    cur = (t.get("group_id") or "").strip()
+    cur_s = cur if cur else "— bez skupiny —"
+    if ot.upper() in ("STK", "STOCK"):
+        q = int(t.get("contracts") or 1)
+        return f"#{tid} · {tk} · {lt} · STK · {q} ks · teraz: {cur_s}"
+    k = float(t.get("strike") or 0)
+    ex = str(t.get("expiry") or "").strip()
+    q = int(t.get("contracts") or 1)
+    return f"#{tid} · {tk} · {lt} · {ot} · strike {k:.0f} · exp {ex} · ×{q} · teraz: {cur_s}"
+
+
 with tab_assign:
     st.subheader("Priradiť skupinu obchodom")
     st.caption(
-        "**Návod:** Vyber existujúcu **skupinu**, v multiselect označ všetky nohy, ktoré majú mať rovnaké **Group ID**, a stlač **Priradiť**. "
-        "Zoznam obsahuje len **otvorené** nohy (stav Open) — uzavreté sa sem nedávajú. "
-        "Rovnaké vieš aj v **Trade Log → Upraviť / Zoskupiť**."
+        "**Návod:** Vyber **skupinu**, v tabuľke zaškrtni **Patrí do vybranej skupiny** pri nohách, ktoré do nej majú patriť, "
+        "a stlač **Uložiť zostavu skupiny**. Odškrtnutím nohy, ktorá už v tejto skupine bola, ju zo skupiny odoberieš. "
+        "Zoznam sú len **otvorené** nohy (stav Open). **Akcie podkladu** sú v denníku ako nohy s typom **STK** (po **Importe z IB** "
+        "alebo cez formulár nižšie) — v tabuľke ich spoznáš podľa popisu „STK · N ks“."
     )
+
+    _fb = st.session_state.pop("groups_assign_last_msg", None)
+    if _fb:
+        st.success(_fb)
+    _fb_stk = st.session_state.pop("groups_add_stk_msg", None)
+    if _fb_stk:
+        st.success(_fb_stk)
 
     groups_assign = db.get_groups()
     if not groups_assign:
@@ -681,37 +707,170 @@ with tab_assign:
     else:
         group_options = {g["name"]: g["name"] for g in groups_assign}
         sel_group = st.selectbox("Vyber skupinu", list(group_options.keys()), key="assign_group")
-        st.caption("Pri priraďovaní nezabudni, že správny ticker si spravuj v **Symboly**. Tu sa len viaže už existujúca noha ku skupine.")
+        st.caption(
+            "Správny **ticker** spravuj v **Symboly**. Tu len viažeš existujúcu otvorenú nohu k **Group ID** vybranej skupiny."
+        )
+
+        with st.expander("➕ Pridať akciu podkladu (STK) do denníka a do vybranej skupiny", expanded=False):
+            st.caption(
+                "Pre **delta hedge** alebo akcie, ktoré ešte nie sú v denníku. "
+                "Ak máš rovnakú pozíciu v TWS, pri **Importe pozícií z IB** sa riadok zlúči podľa tickeru / STK (duplicita sa zvyčajne neobjaví)."
+            )
+            with st.form("groups_add_stk_leg_form", clear_on_submit=True):
+                st.text_input("Ticker podkladu", placeholder="napr. AAPL", key="groups_stk_ticker")
+                st.selectbox("Smer pozície", ["Long", "Short"], key="groups_stk_leg")
+                st.number_input("Počet akcií (ks)", min_value=1, value=100, step=1, key="groups_stk_shares")
+                st.number_input(
+                    "Priemerná cena vstupu (USD / ks)",
+                    min_value=0.0,
+                    value=0.0,
+                    step=0.01,
+                    format="%.4f",
+                    key="groups_stk_entry",
+                )
+                st.text_input("Poznámka / stratégia", value="Stock / hedge", key="groups_stk_strat")
+                _stk_sub = st.form_submit_button("Uložiť STK do denníka", type="primary")
+            if _stk_sub:
+                _tn = str(st.session_state.get("groups_stk_ticker") or "").strip().upper()
+                _leg = str(st.session_state.get("groups_stk_leg") or "Long")
+                try:
+                    _sh = int(st.session_state.get("groups_stk_shares") or 1)
+                except (TypeError, ValueError):
+                    _sh = 1
+                if _sh < 1:
+                    _sh = 1
+                try:
+                    _ep = float(st.session_state.get("groups_stk_entry") or 0.0)
+                except (TypeError, ValueError):
+                    _ep = 0.0
+                _strat = str(st.session_state.get("groups_stk_strat") or "Stock / hedge").strip() or "Stock / hedge"
+                if not _tn:
+                    st.warning("Zadaj ticker.")
+                else:
+                    _tid = db.add_trade(
+                        ticker=_tn,
+                        strategy=_strat,
+                        leg_type=_leg,
+                        option_type="STK",
+                        strike=0.0,
+                        expiry="",
+                        contracts=_sh,
+                        entry_price=_ep,
+                        entry_date=date.today().isoformat(),
+                        group_id=sel_group,
+                        delta_at_entry=1.0,
+                    )
+                    st.session_state["groups_add_stk_msg"] = (
+                        f"Pridaná akcia **{_tn}** (ID obchodu **{_tid}**) do skupiny **{sel_group}**."
+                    )
+                    st.rerun()
 
         all_trades_assign = db.get_open_trades()
-        trade_labels = {
-            f"#{t['id']} | {t['ticker']} {t.get('leg_type','')} {t.get('option_type','')} "
-            f"${t.get('strike',0):.0f} {t.get('expiry','')} "
-            f"[{t.get('group_id') or '—'}]": t["id"]
-            for t in all_trades_assign
-        }
+        hide_other = st.checkbox(
+            "Skryť nohy, ktoré sú už v **inej** skupine (menej šumu pri práci s jednou skupinou)",
+            value=True,
+            key="assign_hide_other_groups",
+            help="Vypni, ak chceš naraz presúvať nohy medzi dvoma skupinami alebo vidieť celý portfól.",
+        )
+        leg_kind = st.radio(
+            "Zobraziť v tabuľke",
+            options=["Všetky nohy", "Iba opčné kontrakty", "Iba akcie (STK)"],
+            horizontal=True,
+            key="assign_leg_kind_filter",
+            help="STK = akcia podkladu v denníku (nie opčný kontrakt).",
+        )
+        q_filt = st.text_input(
+            "Filter (časť ID, ticker, expirácia, skupina…)",
+            value="",
+            key="assign_row_filter",
+            placeholder="napr. GLW alebo 202607",
+        ).strip().lower()
 
-        # Predvyber aktuálne priradené (iba otvorené nohy sú v zozname)
-        preselected = [
-            lbl for lbl, tid in trade_labels.items()
-            if next((t for t in all_trades_assign if t["id"] == tid), {}).get("group_id") == sel_group
-        ]
+        rows_src: list[dict] = []
+        for t in sorted(all_trades_assign, key=lambda x: (str(x.get("ticker") or ""), int(x.get("id") or 0))):
+            _ot_a = str(t.get("option_type") or "").strip().upper()
+            _is_stk_row = _ot_a in ("STK", "STOCK")
+            if leg_kind == "Iba opčné kontrakty" and _is_stk_row:
+                continue
+            if leg_kind == "Iba akcie (STK)" and not _is_stk_row:
+                continue
+            cur = (t.get("group_id") or "").strip()
+            if hide_other and cur and cur != sel_group:
+                continue
+            hay = _groups_assign_leg_label(t).lower()
+            if q_filt and q_filt not in hay:
+                continue
+            rows_src.append(t)
 
-        if not trade_labels:
+        if not all_trades_assign:
             st.info(
                 "V denníku nemáš žiadne **otvorené** nohy (stav Open) — nie je čo priradiť. "
                 "Skontroluj režim LIVE/PAPER a načítaj pozície z IB na Dashboarde."
             )
+        elif not rows_src:
+            st.warning(
+                "Pri aktívnom filtri / skrytí iných skupín nezodpovedá žiadna noha — vypni filter alebo checkbox vyššie."
+            )
         else:
-            selected = st.multiselect(
-                "Vyber nohy pre túto skupinu",
-                options=list(trade_labels.keys()),
-                default=preselected,
-                key="assign_trades_ms",
+            st.caption(f"Zobrazených **{len(rows_src)}** z **{len(all_trades_assign)}** otvorených nôh.")
+            df_a = pd.DataFrame(
+                [
+                    {
+                        "ID": int(t["id"]),
+                        "Kontrakt": _groups_assign_leg_label(t),
+                        "Patrí do vybranej skupiny": (t.get("group_id") or "").strip() == sel_group,
+                    }
+                    for t in rows_src
+                ]
+            )
+            edited_a = st.data_editor(
+                df_a,
+                key=f"assign_members_{sel_group}",
+                use_container_width=True,
+                hide_index=True,
+                disabled=["ID", "Kontrakt"],
+                column_config={
+                    "ID": st.column_config.NumberColumn("ID", disabled=True, width="small"),
+                    "Kontrakt": st.column_config.TextColumn(
+                        "Kontrakt (celý popis)",
+                        disabled=True,
+                        width="large",
+                    ),
+                    "Patrí do vybranej skupiny": st.column_config.CheckboxColumn(
+                        f"V skupine „{sel_group}“",
+                        help="Zaškrtni = noha patrí do vybranej skupiny. Odškrtni = odoberie z tejto skupiny (group_id vyprázdni).",
+                    ),
+                },
             )
 
-            if st.button("Priradiť", type="primary", key="assign_btn"):
-                ids = [trade_labels[lbl] for lbl in selected]
-                db.bulk_set_group_id(ids, sel_group)
-                st.success(f"Skupina **{sel_group}** priradená {len(ids)} nohám.")
+            if st.button("Uložiť zostavu skupiny", type="primary", key="assign_btn"):
+                checked_ids = set()
+                for _, row in edited_a.iterrows():
+                    if row.get("Patrí do vybranej skupiny"):
+                        checked_ids.add(int(row["ID"]))
+
+                shown_ids = {int(t["id"]) for t in rows_src}
+                n_clear = 0
+                for t in all_trades_assign:
+                    tid = int(t["id"])
+                    cur = (t.get("group_id") or "").strip()
+                    if cur != sel_group:
+                        continue
+                    if tid not in shown_ids:
+                        continue
+                    if tid not in checked_ids:
+                        db.update_trade(tid, group_id="")
+                        n_clear += 1
+                for tid in checked_ids:
+                    db.update_trade(tid, group_id=sel_group)
+
+                msg = (
+                    f"Skupina **{sel_group}**: uložené. **{len(checked_ids)}** nôh má teraz túto skupinu "
+                    f"(podľa zaškrtnutia v tabuľke). Odpojených od tejto skupiny: **{n_clear}**."
+                )
+                st.session_state["groups_assign_last_msg"] = msg
+                try:
+                    st.toast(msg, icon="✅")
+                except Exception:
+                    pass
                 st.rerun()

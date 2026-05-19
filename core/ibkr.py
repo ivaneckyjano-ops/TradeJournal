@@ -86,16 +86,104 @@ def set_scoped_session_value(base_key: str, value) -> None:
     """Zapíše hodnotu do scope-kľúča pre aktuálne IB pripojenie."""
     st.session_state[scoped_session_key(base_key)] = value
 
-# ─── Background fetch job state (perzistentný medzi Streamlit rerunmi) ────────
-# Uložené na úrovni modulu – modul sa pri rerun NEreimportuje, stav zostáva.
-FETCH_JOB: dict = {
-    "status": "idle",   # idle | running | done | cancelled | error
-    "positions": None,
-    "orders": None,
-    "error": None,
-    "stop_event": None,
-    "thread": None,
-}
+
+def _default_dashboard_fetch_job() -> dict:
+    return {
+        "status": "idle",  # idle | done | error (historicky aj running)
+        "positions": None,
+        "orders": None,
+        "account": None,
+        "error": None,
+        "orders_err": None,
+        "orders_raw": 0,
+    }
+
+
+def get_dashboard_fetch_job() -> dict:
+    """
+    Stav posledného načítania stránky TWS Portfolio Dashboard pre aktuálny IB scope
+    (``host:port:cid`` rovnako ako pri ``scoped_session_key``).
+
+    Jednotný modulový slovník by pri prepnutí LIVE/PAPER nechal ``status=done`` a staré
+    pozície — UI vyzeralo ako paper, ale dáta ostali z live (alebo naopak).
+    """
+    key = scoped_session_key("tws_portfolio_dashboard_job_v1")
+    job = st.session_state.get(key)
+    if not isinstance(job, dict):
+        job = _default_dashboard_fetch_job()
+        st.session_state[key] = job
+    else:
+        for _k, _v in _default_dashboard_fetch_job().items():
+            job.setdefault(_k, _v)
+    return job
+
+
+def _default_ib_fetch_job() -> dict:
+    """Greeks-fetch (Skupiny / Portfolio Agent) — kľúče zhodné s pôvodným FETCH_JOB."""
+    return {
+        "status": "idle",
+        "positions": None,
+        "orders": None,
+        "error": None,
+        "stop_event": None,
+        "thread": None,
+    }
+
+
+def get_ib_fetch_job() -> dict:
+    """
+    Stav background fetchu pozícií s Grékmi podľa aktuálneho IB scope.
+    Jednotný modulový slovník pri LIVE/PAPER nechal staré výsledky zmiešané s aktuálnym režimom.
+    """
+    key = scoped_session_key("ib_greeks_fetch_job_v1")
+    job = st.session_state.get(key)
+    if not isinstance(job, dict):
+        job = _default_ib_fetch_job()
+        st.session_state[key] = job
+    else:
+        for _k, _v in _default_ib_fetch_job().items():
+            job.setdefault(_k, _v)
+    return job
+
+
+def _default_spot_fetch_job() -> dict:
+    return {
+        "status": "idle",
+        "result": None,
+        "error": None,
+    }
+
+
+def get_spot_fetch_job() -> dict:
+    key = scoped_session_key("ib_spot_fetch_job_v1")
+    job = st.session_state.get(key)
+    if not isinstance(job, dict):
+        job = _default_spot_fetch_job()
+        st.session_state[key] = job
+    else:
+        for _k, _v in _default_spot_fetch_job().items():
+            job.setdefault(_k, _v)
+    return job
+
+
+def _default_account_fetch_job() -> dict:
+    return {
+        "status": "idle",
+        "result": None,
+        "error": None,
+    }
+
+
+def get_account_fetch_job() -> dict:
+    key = scoped_session_key("ib_account_fetch_job_v1")
+    job = st.session_state.get(key)
+    if not isinstance(job, dict):
+        job = _default_account_fetch_job()
+        st.session_state[key] = job
+    else:
+        for _k, _v in _default_account_fetch_job().items():
+            job.setdefault(_k, _v)
+    return job
 
 
 # ─── Black-Scholes (delegované na core.greeks) ───────────────────────────────
@@ -1815,36 +1903,29 @@ def fetch_positions(
         return {"positions": [], "error": str(e)}
 
 
-# ─── Spot fetch job (background, podobne ako FETCH_JOB) ──────────────────────
-SPOT_FETCH_JOB: dict = {
-    "status": "idle",   # idle | running | done | error
-    "result": None,     # dict {ticker: price}
-    "error":  None,
-}
-
 
 def fetch_spot_prices_bg(tickers: list[str]) -> None:
     """
     Spustí fetching spot cien v separátnom vlákne.
-    Výsledok sa uloží do SPOT_FETCH_JOB["result"].
+    Výsledok je uložený v slovníku z ``get_spot_fetch_job()`` (per IB scope).
     Volá sa z UI – vlákno samo beží mimo Streamlit loop.
     """
     import threading
 
     def _worker():
-        SPOT_FETCH_JOB["status"] = "running"
-        SPOT_FETCH_JOB["error"]  = None
-        SPOT_FETCH_JOB["result"] = None
+        job_sp = get_spot_fetch_job()
+        job_sp["status"] = "running"
+        job_sp["error"] = None
+        job_sp["result"] = None
         try:
             result = _fetch_spot_prices_sync(tickers)
-            SPOT_FETCH_JOB["result"] = result
-            SPOT_FETCH_JOB["status"] = "done"
+            job_sp["result"] = result
+            job_sp["status"] = "done"
         except Exception as exc:
-            SPOT_FETCH_JOB["error"]  = str(exc)
-            SPOT_FETCH_JOB["status"] = "error"
+            job_sp["error"] = str(exc)
+            job_sp["status"] = "error"
 
-    t = threading.Thread(target=_worker, daemon=True)
-    t.start()
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 def _fetch_spot_prices_sync(tickers: list[str], timeout: float = 10.0) -> dict[str, float]:
@@ -1911,22 +1992,6 @@ def _fetch_spot_prices_sync(tickers: list[str], timeout: float = 10.0) -> dict[s
     return result
 
 
-# ─── Dashboard fetch job (TWS Portfolio stránka; načítanie je sync pod spinnerom) ─
-DASHBOARD_FETCH_JOB: dict = {
-    "status":    "idle",   # idle | done | error (running sa už nepoužíva)
-    "positions": None,
-    "orders":    None,
-    "account":   None,
-    "error":     None,
-}
-
-# ─── Account fetch job (background thread, time.sleep – neblokuje UI) ────────
-ACCOUNT_FETCH_JOB: dict = {
-    "status": "idle",   # idle | running | done | error
-    "result": None,
-    "error":  None,
-}
-
 _ACCOUNT_KEYS_MAP = {
     "AvailableFunds":  "available_funds",
     "NetLiquidation":  "net_liquidation",
@@ -1985,20 +2050,21 @@ def fetch_account_summary_bg() -> None:
     import threading
 
     def _worker():
-        ACCOUNT_FETCH_JOB["status"] = "running"
-        ACCOUNT_FETCH_JOB["error"]  = None
-        ACCOUNT_FETCH_JOB["result"] = None
+        job_ac = get_account_fetch_job()
+        job_ac["status"] = "running"
+        job_ac["error"] = None
+        job_ac["result"] = None
         ib = _IB_INSTANCE
         if not ib or not ib.isConnected():
-            ACCOUNT_FETCH_JOB["error"]  = "IBKR nie je pripojené"
-            ACCOUNT_FETCH_JOB["status"] = "error"
+            job_ac["error"] = "IBKR nie je pripojené"
+            job_ac["status"] = "error"
             return
         try:
             # Skús najprv priamo z cache (ak bola subscription aktívna skôr)
             cached = _parse_account_values(ib.accountValues())
             if cached:
-                ACCOUNT_FETCH_JOB["result"] = cached
-                ACCOUNT_FETCH_JOB["status"] = "done"
+                job_ac["result"] = cached
+                job_ac["status"] = "done"
                 return
 
             # Pošli reqAccountUpdates – event loop hlavného vlákna to spracuje
@@ -2014,18 +2080,18 @@ def fetch_account_summary_bg() -> None:
                 time.sleep(0.3)
 
             ib.reqAccountUpdates(False)
-            ACCOUNT_FETCH_JOB["result"] = result
-            ACCOUNT_FETCH_JOB["status"] = "done" if result else "error"
+            job_ac["result"] = result
+            job_ac["status"] = "done" if result else "error"
             if not result:
                 _all_vals = ib.accountValues()
-                ACCOUNT_FETCH_JOB["error"] = (
+                job_ac["error"] = (
                     f"Žiadne dáta po 8s. accountValues() vrátilo "
                     f"{len(_all_vals)} položiek, "
                     f"tagy: {[getattr(v,'tag','?') for v in _all_vals[:6]]}"
                 )
         except Exception as exc:
-            ACCOUNT_FETCH_JOB["error"]  = str(exc)
-            ACCOUNT_FETCH_JOB["status"] = "error"
+            job_ac["error"] = str(exc)
+            job_ac["status"] = "error"
 
     threading.Thread(target=_worker, daemon=True).start()
 

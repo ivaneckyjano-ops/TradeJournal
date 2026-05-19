@@ -67,8 +67,8 @@ def _plotly_line_trend(series: pd.Series, *, chart_key: str, height: int = 200) 
     st.plotly_chart(fig, use_container_width=True, key=chart_key)
 
 
-# ─── Fetch job je uložený v ibkr module (perzistentný medzi page reruns) ──────
-_JOB = ibkr.DASHBOARD_FETCH_JOB
+# ─── Fetch job: per scope (port/cid) v session_state — pri LIVE↔PAPER nie sú zmiešané snímky ─
+_JOB = ibkr.get_dashboard_fetch_job()
 
 # Staršie verzie nastavovali "running" + thread; pri obnovení stránky to zostalo visieť.
 if _JOB.get("status") == "running":

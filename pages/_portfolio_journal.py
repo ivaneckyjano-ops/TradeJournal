@@ -63,6 +63,14 @@ Súčet cez **všetky nohy** v skupine: **Δ (0–1) × počet kontraktov × 100
 Výsledok je **ekvivalent podkladu v počte akcií** (rovnaká logika ako pri súčtoch nôh v analýze portfólia).  
 **Vstup** = z bunky Δ vstup, **aktuálna** = z bunky Δ aktuálna (z denníka alebo po zápise z TWS).
 
+**Prakticky — vyrovnanie Δ podkladom (cieľ 0):**  
+Číslo pod tabuľkou je „koľko akcií“ ti dávajú opcie (a prípadné **STK** riadky v DB) dokopy.
+
+- **Σ = +10** → na vyrovnanie **predaj** (alebo podshort) cca **10 akcií** podkladu  
+- **Σ = −10** → na vyrovnanie **dokúp** cca **10 akcií** podkladu  
+
+Inak povedané: opačný obchod na podklade v rovnakej veľkosti ako súčet (±). Presné množstvo doladíš podľa cieľa (napr. chceš zostať mierne long +5) a podľa toho, či už v TWS držíš akcie mimo tejto skupiny.
+
 ### Σ čistá Θ vstup · Σ čistá Θ aktuálna
 
 Súčet stĺpcov **Θ … ($/deň)** — theta **v USD za kalendárny deň za celú nohu** (už s kontraktmi a znamienkom).  
@@ -817,6 +825,80 @@ def _journal_group_select_options(legs: list[dict]) -> list[str]:
     return [PF_GROUP_NONE] + registered + extra
 
 
+def _render_add_stk_leg_journal_panel(open_tr_legs: list[dict]) -> None:
+    """
+    Ručne pridaná akcia podkladu (STK) do denníka — rovnaký zámer ako expander na stránke Skupiny.
+    """
+    _pop = st.session_state.pop("pf_journal_add_stk_msg", None)
+    if _pop:
+        st.success(_pop)
+
+    _grp_sel = _journal_group_select_options(open_tr_legs)
+    with st.expander("Pridať akciu podkladu (STK) do denníka", expanded=False):
+        st.caption(
+            "**Delta hedge alebo držba akcií vedľa spreadu.** Riadok má v denníku **Typ STK**; po uložení ho uvidíš "
+            "v záložke skupiny dolu a v **Skupiny → Priradiť**. Pri **Importe z IB** sa rovnaká STK pozícia zvyčajne "
+            "zlúči s týmto záznamom (ticker · Long/Short · ks)."
+        )
+        with st.form("pf_journal_add_stk_form", clear_on_submit=True):
+            st.selectbox(
+                "Skupina (Group ID)",
+                options=_grp_sel,
+                key="pf_journal_stk_group",
+                help='"Bez skupiny" = prázdny group_id; neskôr môžeš doplniť v tabuľke alebo cez Rýchle priradenie.',
+            )
+            st.text_input("Ticker podkladu", placeholder="napr. AAPL", key="pf_journal_stk_ticker")
+            st.selectbox("Smer pozície", ["Long", "Short"], key="pf_journal_stk_leg")
+            st.number_input("Počet akcií (ks)", min_value=1, value=100, step=1, key="pf_journal_stk_shares")
+            st.number_input(
+                "Priemerná cena vstupu (USD / ks)",
+                min_value=0.0,
+                value=0.0,
+                step=0.01,
+                format="%.4f",
+                key="pf_journal_stk_entry",
+            )
+            st.text_input("Poznámka / stratégia", value="Stock / hedge", key="pf_journal_stk_strat")
+            _sub = st.form_submit_button("Uložiť STK do denníka", type="primary")
+        if _sub:
+            _g_raw = _skupina_cell_norm(st.session_state.get("pf_journal_stk_group"))
+            _gid: str | None = None if _g_raw == PF_GROUP_NONE else str(_g_raw).strip()
+            _tn = str(st.session_state.get("pf_journal_stk_ticker") or "").strip().upper()
+            _leg = str(st.session_state.get("pf_journal_stk_leg") or "Long")
+            try:
+                _sh = int(st.session_state.get("pf_journal_stk_shares") or 1)
+            except (TypeError, ValueError):
+                _sh = 1
+            if _sh < 1:
+                _sh = 1
+            try:
+                _ep = float(st.session_state.get("pf_journal_stk_entry") or 0.0)
+            except (TypeError, ValueError):
+                _ep = 0.0
+            _strat = str(st.session_state.get("pf_journal_stk_strat") or "Stock / hedge").strip() or "Stock / hedge"
+            if not _tn:
+                st.warning("Zadaj ticker.")
+            else:
+                _tid = db.add_trade(
+                    ticker=_tn,
+                    strategy=_strat,
+                    leg_type=_leg,
+                    option_type="STK",
+                    strike=0.0,
+                    expiry="",
+                    contracts=_sh,
+                    entry_price=_ep,
+                    entry_date=date.today().isoformat(),
+                    group_id=_gid,
+                    delta_at_entry=1.0,
+                )
+                _g_disp = PF_GROUP_NONE if not (_gid or "").strip() else _gid.strip()
+                st.session_state["pf_journal_add_stk_msg"] = (
+                    f"Pridaná akcia **{_tn}** (ID **{_tid}**), skupina: **{_g_disp}**."
+                )
+                st.rerun()
+
+
 def _journal_group_tab_label(gname: str, *, max_len: int = 28) -> str:
     """Názov skupiny pre záložku ``st.tabs`` (krátke mená sa vo UI lmú lepšie)."""
     if gname == PF_GROUP_NONE:
@@ -1569,6 +1651,8 @@ st.subheader("Otvorené pozície")
 st.divider()
 _render_delta_hedge_panel()
 st.divider()
+_render_add_stk_leg_journal_panel(open_trades)
+st.divider()
 
 if not open_trades:
     st.warning(
@@ -1587,7 +1671,8 @@ else:
         "Ak je **vstup** ešte prázdny, ale vyplníš **aktuálnu** hodnotu, uloží sa aj ako vstup. "
         "Pod editorom sú **súčty za skupinu**; podrobnosti metrík sú v expanderi **Vysvetlivky k metrikám** (predvolene zbalený). "
         "Zápis sa uloží do DB a zostane aj na ďalší deň. "
-        "**Skupiny:** každá skupina z denníka má **vlastnú hornú záložku** (napr. Kal.01) — klikni na názov a uprav len tú časť portfólia."
+        "**Skupiny:** na presun viacerých nôh naraz použi expander **Rýchle priradenie skupiny** nižšie. "
+        "Inak zmeň stĺpec **Skupina** v tabuľke a v tej istej záložke stlač **Uložiť journal** — záložky sú len pre prehľad (filtrované nohy podľa aktuálnej skupiny)."
     )
     _fb = st.session_state.pop("pf_journal_tws_refresh_msg", None)
     if _fb:
@@ -1598,6 +1683,74 @@ else:
             st.error(_txt)
     with st.expander("Vysvetlivky k metrikám (súčty pod tabuľkou skupiny)", expanded=False):
         st.markdown(_JOURNAL_METRICS_HELP_MD)
+
+    with st.expander("Rýchle priradenie skupiny — viac nôh naraz", expanded=False):
+        st.markdown(
+            "**Problém:** stĺpec *Skupina* je v širokej tabuľke ďaleko od kontraktu a pri presune nohy medzi skupinami "
+            "musíš potom hľadať správnu hornú záložku.\n\n"
+            "**Tu:** vyber **cieľovú skupinu**, označ **nohy** (multiselect), **Priradiť** — uloží sa len `group_id` v DB "
+            "(Gréky/IV sa nemenia). Potom **obnov stránku** alebo prepni záložku, ak nohy „preskočili“ medzi skupinami."
+        )
+        _bo1, _bo2 = st.columns([1, 1])
+        with _bo1:
+            _bulk_target = st.selectbox(
+                "Cieľová skupina",
+                options=_grp_opts,
+                index=0,
+                key="pf_journal_bulk_group_target",
+                help='Rovnaké mená ako v záložke **Skupiny**. „Bez skupiny“ = vyprázdni group_id.',
+            )
+        with _bo2:
+            _bulk_filt = st.text_input(
+                "Filter ticker (voliteľné)",
+                value="",
+                key="pf_journal_bulk_ticker_filt",
+                placeholder="napr. MSFT",
+            ).strip().upper()
+        _legs_bulk = list(open_trades)
+        if _bulk_filt:
+            _legs_bulk = [t for t in _legs_bulk if _bulk_filt in str(t.get("ticker") or "").upper()]
+        _bulk_labels: list[str] = []
+        _bulk_tid: dict[str, int] = {}
+        for t in sorted(_legs_bulk, key=lambda x: (str(x.get("ticker") or ""), int(x.get("id") or 0))):
+            tid = int(t["id"])
+            _gcur = (t.get("group_id") or "").strip() or "—"
+            _lbl = (
+                f"[{tid}] {t.get('ticker') or ''} · {t.get('leg_type') or ''} {t.get('option_type') or ''} "
+                f"K{t.get('strike') or ''} {t.get('expiry') or ''} ×{int(t.get('contracts') or 1)} "
+                f"— teraz: {_gcur}"
+            )
+            _bulk_labels.append(_lbl)
+            _bulk_tid[_lbl] = tid
+        st.multiselect(
+            "Nohy na priradenie",
+            options=_bulk_labels,
+            default=[],
+            key="pf_journal_bulk_pick",
+            help="Vyber všetky nohy, ktoré majú ísť do cieľovej skupiny vyššie.",
+        )
+        if st.button(
+            "Priradiť vybrané nohy do cieľovej skupiny",
+            key="pf_journal_bulk_apply",
+            type="primary",
+        ):
+            _picked = list(st.session_state.get("pf_journal_bulk_pick") or [])
+            _sk_norm = _skupina_cell_norm(_bulk_target)
+            _new_gid: str | None = None if _sk_norm == PF_GROUP_NONE else _sk_norm
+            n_up = 0
+            for lab in _picked:
+                tid = _bulk_tid.get(str(lab))
+                if tid is None:
+                    continue
+                db.update_trade(tid, group_id="" if not _new_gid else str(_new_gid))
+                n_up += 1
+            if n_up:
+                st.success(f"Priradených nôh: **{n_up}** (cieľová skupina: **{_sk_norm}**).")
+                st.session_state["pf_journal_bulk_pick"] = []
+                st.rerun()
+            else:
+                st.warning("Vyber aspoň jednu nohu v zozname vyššie.")
+
     _pf_live_pos: list[dict] = list(ibkr.get_scoped_session_value("live_positions", []) or [])
     _journal_tab_labels = [_journal_group_tab_label(g) for g in _sort_keys]
     _grp_tabs = st.tabs(_journal_tab_labels)
@@ -1716,7 +1869,8 @@ else:
                         "Skupina",
                         options=_grp_opts_editor,
                         required=False,
-                        help="Rovnaké mená ako v záložke **Skupiny** ako pri úpravách v denníku. Ak sa výber neuloží, skús znova po obnovení stránky.",
+                        help="Presun nohy do inej skupiny: zmeň hodnotu a v tejto záložke stlač **Uložiť journal** nižšie. "
+                        "Na viac nôh naraz použi expander **Rýchle priradenie skupiny** nad záložkami.",
                     ),
                     "Strike": st.column_config.NumberColumn(format="$%.2f"),
                     "Entry $": st.column_config.NumberColumn(format="$%.2f"),

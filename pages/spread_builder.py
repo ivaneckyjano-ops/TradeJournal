@@ -2748,7 +2748,7 @@ else:
                 f" | Delta ${_g['delta']:+.2f} | Theta ${_g['theta']:+.2f}/deň"
             )
         _tws_ord_lines = []
-        _tws_orders = ibkr.DASHBOARD_FETCH_JOB.get("orders") or []
+        _tws_orders = ibkr.get_dashboard_fetch_job().get("orders") or []
         for o in _tws_orders:
             if o.get("ticker", "").upper() == _ticker.upper():
                 sec = o.get("sec_type", "")
