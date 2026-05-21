@@ -8,6 +8,7 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
+from core.charts import simple_dataframe_line_figure
 from core.page_context import set_tradejournal_page
 from core.roll_breakeven import ManualLeg, breakeven_spots, net_premium
 
@@ -137,7 +138,11 @@ if go:
             s_cur += step
         df = pd.DataFrame(rows)
         st.dataframe(df, use_container_width=True, height=min(400, 24 * len(df)))
-        st.line_chart(df.set_index("spot")["net"])
+        st.plotly_chart(
+            simple_dataframe_line_figure(df.set_index("spot"), height=280, y_column="net"),
+            use_container_width=True,
+            key="rb_net_vs_spot",
+        )
 
 
 st.divider()

@@ -100,9 +100,12 @@ def _atm_iv_pct_from_chain(t: Any) -> float | None:
 
 
 def fetch_yahoo_symbol_row(ticker: str) -> dict[str, Any]:
-    sym_api = yahoo_symbol_for_api(ticker)
+    from core.database import normalize_symbol_ticker
+
+    clean = normalize_symbol_ticker(ticker)
+    sym_api = yahoo_symbol_for_api(clean)
     out: dict[str, Any] = {
-        "ticker": (ticker or "").strip().upper(),
+        "ticker": clean,
         "ok": False,
         "error": None,
         "company_name": None,
@@ -144,7 +147,7 @@ def fetch_yahoo_symbol_row(ticker: str) -> dict[str, Any]:
 def sync_symbol_from_yahoo(symbol_row: dict, *, sleep_s: float = 0.0) -> dict[str, Any]:
     from core import database as db
 
-    tid = str(symbol_row["ticker"]).strip().upper()
+    tid = db.normalize_symbol_ticker(str(symbol_row["ticker"]))
     sid = int(symbol_row["id"])
     if sleep_s > 0:
         time.sleep(sleep_s)
@@ -190,8 +193,8 @@ def sync_all_symbols_from_yahoo(
 
     rows = db.get_symbols()
     if tickers:
-        want = {str(t).strip().upper() for t in tickers if t and str(t).strip()}
-        rows = [r for r in rows if str(r["ticker"]).strip().upper() in want]
+        want = {db.normalize_symbol_ticker(str(t)) for t in tickers if t and str(t).strip()}
+        rows = [r for r in rows if db.normalize_symbol_ticker(str(r["ticker"])) in want]
     out: list[dict[str, Any]] = []
     for i, sym in enumerate(rows):
         pause = pause_s if i > 0 else 0.0

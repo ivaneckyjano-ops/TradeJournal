@@ -534,12 +534,21 @@ def delete_group(group_id: int) -> None:
 
 # ─── SYMBOLS ───────────────────────────────────────────────────────────────────
 
+def normalize_symbol_ticker(ticker: str) -> str:
+    """
+    Ticker z UI / CSV / skenu — strip, upper, odstráni bežné trailing znaky z kopírovania
+    (napr. ``NVDA,`` alebo ``NVDA-``), aby Yahoo/IB a vyhľadávanie v DB sedeli.
+    """
+    t = (ticker or "").strip().upper()
+    return t.rstrip(" .,;-_/\\")
+
+
 def add_symbol(ticker: str, company_name: str = "", sector: str = "",
                asset_type: str = "Stock", description: str = "",
                earnings_date: str = None, iv_rank: float = None,
                earnings_date_2: str = None, earnings_date_3: str = None,
                earnings_date_4: str = None, ir_url: str = None) -> int:
-    ticker = ticker.strip().upper()
+    ticker = normalize_symbol_ticker(ticker)
     with get_connection() as conn:
         cur = conn.execute(
             "INSERT OR IGNORE INTO symbols "
@@ -567,6 +576,13 @@ def get_symbol_tickers() -> list[str]:
     return [s["ticker"] for s in get_symbols()]
 
 
+def get_symbol(ticker: str) -> Optional[dict]:
+    t = normalize_symbol_ticker(ticker)
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM symbols WHERE ticker=?", (t,)).fetchone()
+    return dict(row) if row else None
+
+
 def get_distinct_trade_tickers() -> list[str]:
     """Distinct tickery z Trade Log (obchody) — underlying symboly z nôh."""
     with get_connection() as conn:
@@ -577,10 +593,195 @@ def get_distinct_trade_tickers() -> list[str]:
     return [r["t"] for r in rows]
 
 
-def get_symbol(ticker: str) -> Optional[dict]:
-    with get_connection() as conn:
-        row = conn.execute("SELECT * FROM symbols WHERE ticker=?", (ticker.upper(),)).fetchone()
-    return dict(row) if row else None
+def _propagate_symbol_ticker_rename_conn(conn: sqlite3.Connection, old_c: str, new_c: str) -> dict[str, int]:
+    """
+    Prepíše underlying ticker v súvisiacich tabuľkách (rovnaká DB spojenie = jedna transakcia).
+
+    ``old_c`` / ``new_c`` musia byť už normalizované a líšiť sa.
+    """
+    counts: dict[str, int] = {}
+
+    def _rows_match_ticker(tval: str | None) -> bool:
+        return bool(tval) and normalize_symbol_ticker(str(tval)) == old_c
+
+    # --- trades ---
+    ids = [
+        int(r["id"])
+        for r in conn.execute("SELECT id, ticker FROM trades").fetchall()
+        if _rows_match_ticker(r["ticker"])
+    ]
+    for tid in ids:
+        conn.execute("UPDATE trades SET ticker=? WHERE id=?", (new_c, tid))
+    if ids:
+        counts["trades"] = len(ids)
+
+    # --- groups.ticker (podklad skupiny) ---
+    gids = [
+        int(r["id"])
+        for r in conn.execute("SELECT id, ticker FROM groups WHERE ticker IS NOT NULL").fetchall()
+        if _rows_match_ticker(r["ticker"])
+    ]
+    for gid in gids:
+        conn.execute("UPDATE groups SET ticker=? WHERE id=?", (new_c, gid))
+    if gids:
+        counts["groups"] = len(gids)
+
+    # --- events.ticker ---
+    eids = [
+        int(r["id"])
+        for r in conn.execute("SELECT id, ticker FROM events WHERE ticker IS NOT NULL").fetchall()
+        if _rows_match_ticker(r["ticker"])
+    ]
+    for eid in eids:
+        conn.execute("UPDATE events SET ticker=? WHERE id=?", (new_c, eid))
+    if eids:
+        counts["events"] = len(eids)
+
+    # --- trading_commands (ak existuje tabuľka) ---
+    try:
+        cids = [
+            int(r["id"])
+            for r in conn.execute(
+                "SELECT id, ticker FROM trading_commands WHERE ticker IS NOT NULL"
+            ).fetchall()
+            if _rows_match_ticker(r["ticker"])
+        ]
+        for cid in cids:
+            conn.execute("UPDATE trading_commands SET ticker=? WHERE id=?", (new_c, cid))
+        if cids:
+            counts["trading_commands"] = len(cids)
+    except sqlite3.OperationalError:
+        pass
+
+    # --- spread_builder_ideas ---
+    try:
+        sbids = [
+            int(r["id"])
+            for r in conn.execute(
+                "SELECT id, ticker FROM spread_builder_ideas WHERE ticker IS NOT NULL"
+            ).fetchall()
+            if _rows_match_ticker(r["ticker"])
+        ]
+        for sbid in sbids:
+            conn.execute("UPDATE spread_builder_ideas SET ticker=? WHERE id=?", (new_c, sbid))
+        if sbids:
+            counts["spread_builder_ideas"] = len(sbids)
+    except sqlite3.OperationalError:
+        pass
+
+    # --- steady_yield_roll_events ---
+    try:
+        ryids = [
+            int(r["id"])
+            for r in conn.execute(
+                "SELECT id, ticker FROM steady_yield_roll_events WHERE ticker IS NOT NULL"
+            ).fetchall()
+            if _rows_match_ticker(r["ticker"])
+        ]
+        for rid in ryids:
+            conn.execute(
+                "UPDATE steady_yield_roll_events SET ticker=? WHERE id=?",
+                (new_c, rid),
+            )
+        if ryids:
+            counts["steady_yield_roll_events"] = len(ryids)
+    except sqlite3.OperationalError:
+        pass
+
+    # --- symbol_market_snapshots (UNIQUE ticker + recorded_date; v DB môže byť nekanonický ticker) ---
+    try:
+        snap_rows = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT id, ticker, recorded_date FROM symbol_market_snapshots"
+            ).fetchall()
+            if _rows_match_ticker(r["ticker"])
+        ]
+        n_snap = 0
+        for sr in snap_rows:
+            sid = int(sr["id"])
+            rd = str(sr["recorded_date"] or "")
+            clash = conn.execute(
+                "SELECT 1 FROM symbol_market_snapshots WHERE ticker=? AND recorded_date=? AND id!=?",
+                (new_c, rd, sid),
+            ).fetchone()
+            if clash:
+                conn.execute("DELETE FROM symbol_market_snapshots WHERE id=?", (sid,))
+            else:
+                conn.execute(
+                    "UPDATE symbol_market_snapshots SET ticker=? WHERE id=?",
+                    (new_c, sid),
+                )
+            n_snap += 1
+        if n_snap:
+            counts["symbol_market_snapshots"] = n_snap
+    except sqlite3.OperationalError:
+        pass
+
+    # --- symbol_ib_option_snapshots ---
+    try:
+        ib_ids = [
+            int(r["id"])
+            for r in conn.execute("SELECT id, ticker FROM symbol_ib_option_snapshots").fetchall()
+            if _rows_match_ticker(r["ticker"])
+        ]
+        for iid in ib_ids:
+            conn.execute(
+                "UPDATE symbol_ib_option_snapshots SET ticker=? WHERE id=?",
+                (new_c, iid),
+            )
+        if ib_ids:
+            counts["symbol_ib_option_snapshots"] = len(ib_ids)
+    except sqlite3.OperationalError:
+        pass
+
+    # --- ticker_hist_snapshots (môže byť uložený aj nekanonický reťazec) ---
+    try:
+        th_ids = [
+            int(r["id"])
+            for r in conn.execute("SELECT id, ticker FROM ticker_hist_snapshots").fetchall()
+            if _rows_match_ticker(r["ticker"])
+        ]
+        for hid in th_ids:
+            conn.execute("UPDATE ticker_hist_snapshots SET ticker=? WHERE id=?", (new_c, hid))
+        if th_ids:
+            counts["ticker_hist_snapshots"] = len(th_ids)
+    except sqlite3.OperationalError:
+        pass
+
+    # --- portfolio_greek_history: scope = často čistý ticker (normalizovaný) ---
+    try:
+        p_rows = conn.execute(
+            "SELECT ticker_scope, snapshot_date FROM portfolio_greek_history"
+        ).fetchall()
+        n_p = 0
+        for pr in p_rows:
+            sc0 = str(pr["ticker_scope"] or "")
+            if normalize_symbol_ticker(sc0) != old_c:
+                continue
+            sd = str(pr["snapshot_date"] or "")
+            clash = conn.execute(
+                "SELECT 1 FROM portfolio_greek_history WHERE ticker_scope=? AND snapshot_date=?",
+                (new_c, sd),
+            ).fetchone()
+            if clash and sc0 != new_c:
+                conn.execute(
+                    "DELETE FROM portfolio_greek_history WHERE ticker_scope=? AND snapshot_date=?",
+                    (sc0, sd),
+                )
+            else:
+                conn.execute(
+                    "UPDATE portfolio_greek_history SET ticker_scope=? "
+                    "WHERE ticker_scope=? AND snapshot_date=?",
+                    (new_c, sc0, sd),
+                )
+            n_p += 1
+        if n_p:
+            counts["portfolio_greek_history"] = n_p
+    except sqlite3.OperationalError:
+        pass
+
+    return counts
 
 
 def update_symbol(symbol_id: int, ticker: str, company_name: str, sector: str,
@@ -590,18 +791,31 @@ def update_symbol(symbol_id: int, ticker: str, company_name: str, sector: str,
                   earnings_date_4: str = None, ir_url: str = None,
                   spot: float = None, iv_pct: float = None,
                   iv_rank_13w: Optional[float] = None,
-                  iv_rank_52w: Optional[float] = None) -> None:
+                  iv_rank_52w: Optional[float] = None) -> dict[str, int]:
+    """
+    Aktualizuje riadok ``symbols``. Pri **zmene tickeru** prepíše rovnaký underlying
+    aj v obchodoch, skupinách, kalendári, snímok trhu atď. (vráti počty podľa tabuľky).
+    """
+    new_t = normalize_symbol_ticker(ticker)
     with get_connection() as conn:
+        row = conn.execute("SELECT ticker FROM symbols WHERE id=?", (int(symbol_id),)).fetchone()
+        if not row:
+            return {}
+        old_c = normalize_symbol_ticker(str(row["ticker"] or ""))
+        rename_counts: dict[str, int] = {}
+        if old_c and new_t and old_c != new_t:
+            rename_counts = _propagate_symbol_ticker_rename_conn(conn, old_c, new_t)
         conn.execute(
             "UPDATE symbols SET ticker=?, company_name=?, sector=?, asset_type=?, "
             "description=?, earnings_date=?, earnings_date_2=?, earnings_date_3=?, "
             "earnings_date_4=?, ir_url=?, iv_rank=?, spot=?, iv_pct=?, "
             "iv_rank_13w=?, iv_rank_52w=? WHERE id=?",
-            (ticker.strip().upper(), company_name, sector, asset_type,
+            (new_t, company_name, sector, asset_type,
              description, earnings_date, earnings_date_2, earnings_date_3,
              earnings_date_4, ir_url, iv_rank, spot, iv_pct,
              iv_rank_13w, iv_rank_52w, symbol_id),
         )
+    return rename_counts
 
 
 def delete_symbol(symbol_id: int) -> None:
@@ -617,7 +831,7 @@ def upsert_symbol_market_snapshot(
     spot: Optional[float] = None,
     source: str = "yahoo",
 ) -> None:
-    tk = (ticker or "").strip().upper()
+    tk = normalize_symbol_ticker(ticker)
     if not tk:
         return
     d = (recorded_date or "")[:10]

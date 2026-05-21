@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import streamlit as st
 
 from core import database as db, ibkr
-from core.page_context import TWS_DASHBOARD_PAGE
+from core.page_context import skip_global_autorefresh_for_current_page
 
 st.set_page_config(
     page_title="TradeJournal",
@@ -103,12 +103,12 @@ def _render_ib_mode_badge() -> None:
     if mode == "PAPER":
         bg = "#fff3c4"
         fg = "#7a5b00"
-        label = "PAPER"
+        label_sk = "PAPIER"
         dot = "#eab308"
     else:
         bg = "#dbeafe"
         fg = "#1d4ed8"
-        label = "LIVE"
+        label_sk = "NAŽIVO"
         dot = "#3b82f6"
     st.markdown(
         f"""
@@ -129,7 +129,7 @@ def _render_ib_mode_badge() -> None:
         ">
             <span style="width:0.55rem;height:0.55rem;border-radius:50%;background:{dot};display:inline-block;"></span>
             <span style="opacity:0.78;">IB režim</span>
-            <span>{label}</span>
+            <span>{label_sk}</span>
         </div>
         """,
         unsafe_allow_html=True,
@@ -211,8 +211,6 @@ if "note_id" in st.query_params:
     
     st.stop()  # Ukonči vykonávanie, nezobrazuj zvyšok aplikácie
 
-_render_ib_mode_badge()
-
 # ─── Globálny auto-refresh (beží na VŠETKÝCH stránkach) ───────────────────────
 from streamlit_autorefresh import st_autorefresh
 
@@ -225,9 +223,10 @@ if "sync_count" not in st.session_state:
 
 auto_on = st.session_state.get("auto_refresh_on", False)
 
-# Počas predchádzajúceho behu nastavila aktuálna stránka túto hodnotu.
-# Na TWS Dash je veľký dataframe — globálny st_autorefresh + sync spôsobovali NotFoundError removeChild.
-_tj_skip_global = st.session_state.get("tj_active_page") == TWS_DASHBOARD_PAGE
+# Globálny autorefresh + sync v entrypointe musia vedieť **aktuálnu** stránku už v tomto behu.
+# ``tj_active_page`` sa nastaví až v ``pg.run()`` → bol vždy o 1 rerun pozadu a na ťažkých
+# stránkach (Časopis, Spread Builder, …) ostával zapnutý → React removeChild v prehliadači.
+_tj_skip_global = skip_global_autorefresh_for_current_page()
 
 with st.sidebar:
     st.markdown("### LIVE / PAPER")
@@ -268,11 +267,16 @@ with st.sidebar:
             )
         else:
             st.caption(
-                "Na **TWS Dashboard** je globálna synchronizácia vypnutá (stabilita prehliadača). "
-                "Obnov dáta tlačidlom na stránke."
+                "Na tejto stránke je **globálna synchronizácia** vypnutá (stabilita prehliadača pri veľkom UI). "
+                "Obnov dáta tlačidlom na stránke alebo choď na **Dashboard** / **Pomocník**, kde môže zostať zapnutá."
             )
     st.caption(f"Aktívne IB pripojenie: `{ibkr.current_connection_label()}`")
     st.caption(f"Aktívna DB: `{os.path.basename(db.get_active_db_path())}`")
+
+# Odznak IB režimu až **po** ``st.radio(..., key="ib_mode")`` v sidebari — inak Streamlit
+# v tom istom behu ešte nemusí zosúladiť ``session_state["ib_mode"]`` s výberom z UI
+# (v hlavnom paneli ostal starý „LIVE“ odznak pri prepnutí na PAPER).
+_render_ib_mode_badge()
 
 # ─── Globálna auto-synchronizácia (funguje na každej stránke) ─────────────────
 if auto_on and not _tj_skip_global:

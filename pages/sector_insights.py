@@ -20,6 +20,7 @@ from core import barchart_historical_csv as bhc
 from core import database as db
 from core import sector_insights_engine as sie
 from core import sector_performance_ocr as spo
+from core.charts import simple_dataframe_line_figure
 from core.page_context import set_tradejournal_page
 from core.sector_select_options import barchart_insight_sector_guide_markdown
 
@@ -131,7 +132,11 @@ with st.expander("Korelácia uzatváracích cien (CSV z Barchartu, DB, matica)",
                     },
                     index=merged["date"],
                 )
-                st.line_chart(norm, height=220)
+                st.plotly_chart(
+                    simple_dataframe_line_figure(norm, height=220),
+                    use_container_width=True,
+                    key="si_corr_norm_chart",
+                )
                 if save_a:
                     sj, f0, f1 = bhc.hist_dataframe_to_series_json(da)
                     sid = db.insert_ticker_hist_snapshot(

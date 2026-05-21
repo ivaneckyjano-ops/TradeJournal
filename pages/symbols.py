@@ -41,9 +41,56 @@ def _parse_date(s: str | None):
         return None
 
 
+def _symbol_db_snapshot_sig(sym: dict) -> tuple:
+    """Podpis riadku z DB — pri zmene zosúladíme draft polí vo formulári editácie."""
+    return (
+        str(sym.get("ticker") or ""),
+        str(sym.get("company_name") or ""),
+        str(sym.get("sector") or ""),
+        str(sym.get("asset_type") or "Stock"),
+        str(sym.get("description") or ""),
+        str(sym.get("ir_url") or ""),
+        float(sym.get("iv_rank") or 0.0),
+        float(sym.get("iv_rank_13w") or 0.0),
+        float(sym.get("iv_rank_52w") or 0.0),
+        float(sym.get("spot") or 0.0),
+        float(sym.get("iv_pct") or 0.0),
+    )
+
+
+def _sync_symbol_edit_widgets_from_db(sym: dict, sector_options: list[str]) -> None:
+    """Streamlit: pri ``value=`` + ``key`` vie ostať starý draft — obnov z DB keď sa riadok zmenil."""
+    sid = int(sym["id"])
+    sig_key = f"_sym_db_sig_{sid}"
+    sig = _symbol_db_snapshot_sig(sym)
+    if st.session_state.get(sig_key) == sig:
+        return
+    st.session_state[sig_key] = sig
+
+    st.session_state[f"st_{sid}"] = str(sym.get("ticker") or "")
+    st.session_state[f"sc_{sid}"] = str(sym.get("company_name") or "")
+    at = str(sym.get("asset_type") or "Stock")
+    st.session_state[f"sat_{sid}"] = at if at in ASSET_TYPES else "Stock"
+
+    cur = (sym.get("sector") or "").strip() or "—"
+    opts = list(sector_options)
+    if cur != "—" and cur not in opts:
+        opts = opts + [cur]
+    st.session_state[f"ss_{sid}"] = cur if cur in opts else (opts[0] if opts else "—")
+
+    st.session_state[f"siv_{sid}"] = float(sym.get("iv_rank") or 0.0)
+    st.session_state[f"siv13_{sid}"] = float(sym.get("iv_rank_13w") or 0.0)
+    st.session_state[f"siv52_{sid}"] = float(sym.get("iv_rank_52w") or 0.0)
+    st.session_state[f"sir_{sid}"] = str(sym.get("ir_url") or "")
+    st.session_state[f"sd_{sid}"] = str(sym.get("description") or "")
+
+    st.session_state[f"sspot_{sid}"] = float(sym.get("spot") or 0.0)
+    st.session_state[f"sivp_{sid}"] = float(sym.get("iv_pct") or 0.0)
+
+
 st.title("📌 Symboly")
 st.caption(
-    "**Návod:** **Pridať symbol** = nový ticker do zoznamu. **Prehľad a úprava** = horná tabuľka (prehľad); **skutočná zmena** (sektor, IV, earnings…) je v **expandéri Editácia** pri tickri. "
+    "**Návod:** **Pridať symbol** = nový ticker do zoznamu. **Prehľad a úprava** = horná tabuľka (prehľad); **skutočná zmena** (ticker, sektor, spot, IV, earnings…) je v **expandéri Editácia** pri tickri — klikni na riadok s tickerom. "
     "Yahoo a IB bloky doplnia trhové dáta. Ticker potom vyberáš v Trade Log a inde."
 )
 st.caption(
@@ -69,7 +116,13 @@ if symbol_section == "Pridať symbol":
         # ── Základné info ──────────────────────────────────────────────────────
         c1, c2, c3 = st.columns([1, 2, 1])
         with c1:
-            s_ticker = st.text_input("Ticker *", placeholder="napr. AMZN").upper().strip()
+            s_ticker_raw = st.text_input(
+                "Ticker *",
+                placeholder="napr. AMZN",
+                key="sym_add_ticker_in",
+                help="Bez čiarky na konci — inak Yahoo nevráti cenu.",
+            )
+            s_ticker = db.normalize_symbol_ticker(s_ticker_raw)
         with c2:
             s_company = st.text_input("Názov spoločnosti", placeholder="napr. Amazon.com, Inc.")
         with c3:
@@ -195,8 +248,8 @@ if symbol_section == "Pridať symbol":
 elif symbol_section == "Prehľad a úprava":
     st.subheader("Všetky symboly")
     st.caption(
-        "**Návod:** Horná tabuľka je **prehľad** (vrátane sektora). **Úprava** — klikni na **expandér** s tickerom nižšie v sekcii **Editácia**: "
-        "tam zmeníš sektor, IV rank, earnings, URL a uložíš **Uložiť**. Yahoo a IB sekcie slúžia na doplnenie trhových dát."
+        "**Návod:** Horná tabuľka je **prehľad**. **Úprava** — rozbaľ **expandér** s tickerom v sekcii **Editácia** nižšie: "
+        "zmeníš **ticker** (oprava preklepu), **spot $** a **IV %** ručne alebo doplníš cez Yahoo/IB a stlačíš **Uložiť**."
     )
 
     symbols = db.get_symbols()
@@ -433,82 +486,94 @@ elif symbol_section == "Prehľad a úprava":
                         unsafe_allow_html=False,
                     )
 
+                cur_sector_raw = (sym.get("sector") or "").strip()
+                cur_sector = cur_sector_raw or "—"
+                sector_opts_edit = list(_sector_opts_manage)
+                if cur_sector != "—" and cur_sector not in sector_opts_edit:
+                    sector_opts_edit = sector_opts_edit + [cur_sector]
+                _sync_symbol_edit_widgets_from_db(sym, sector_opts_edit)
+
+                st.caption(
+                    "Ak Yahoo **nenatiahne spot** (zlý ticker napr. s čiarkou), oprav **Ticker** a ulož, prípadne zadaj **Spot $** ručne."
+                )
+
                 with st.form(f"edit_sym_{sym['id']}"):
-                    # ── Základné polia ─────────────────────────────────────────
+                    sid = int(sym["id"])
+                    # ── Základné polia (iba ``key`` — draft zosúladzuje ``_sync_symbol_edit_widgets_from_db``) ──
                     ec1, ec2, ec3 = st.columns([1, 2, 1])
                     with ec1:
-                        e_ticker = st.text_input(
-                            "Ticker", value=sym["ticker"], key=f"st_{sym['id']}"
-                        ).upper().strip()
-                    with ec2:
-                        e_company = st.text_input(
-                            "Názov", value=sym.get("company_name") or "",
-                            key=f"sc_{sym['id']}"
+                        st.text_input(
+                            "Ticker",
+                            key=f"st_{sid}",
+                            help="Bez čiarky bodky na konci. Uložením sa normalizuje (trim, veľké písmená).",
                         )
+                    with ec2:
+                        st.text_input("Názov", key=f"sc_{sid}")
                     with ec3:
-                        e_type = st.selectbox(
-                            "Typ", ASSET_TYPES,
-                            index=ASSET_TYPES.index(sym["asset_type"])
-                            if sym.get("asset_type") in ASSET_TYPES else 0,
-                            key=f"sat_{sym['id']}"
+                        st.selectbox("Typ", ASSET_TYPES, key=f"sat_{sid}")
+
+                    spot_iv1, spot_iv2 = st.columns(2)
+                    with spot_iv1:
+                        st.number_input(
+                            "Spot ($)",
+                            min_value=0.0,
+                            step=0.01,
+                            format="%.2f",
+                            key=f"sspot_{sid}",
+                            help="**0** = v DB vymaž spot (NULL).",
+                        )
+                    with spot_iv2:
+                        st.number_input(
+                            "IV % (impl.)",
+                            min_value=0.0,
+                            max_value=500.0,
+                            step=0.1,
+                            key=f"sivp_{sid}",
+                            help="Percentá (35 = 35 %). **0** = v DB vymaž IV % (NULL).",
                         )
 
                     ec4, ec5 = st.columns(2)
                     with ec4:
-                        cur_sector_raw = (sym.get("sector") or "").strip()
-                        cur_sector = cur_sector_raw or "—"
-                        sector_opts_edit = list(_sector_opts_manage)
-                        if cur_sector != "—" and cur_sector not in sector_opts_edit:
-                            sector_opts_edit = sector_opts_edit + [cur_sector]
-                        sector_idx = (
-                            sector_opts_edit.index(cur_sector)
-                            if cur_sector in sector_opts_edit
-                            else 0
-                        )
-                        e_sector = st.selectbox(
+                        st.selectbox(
                             "Sektor (databáza — S&P, symboly, snímky Sektory)",
                             sector_opts_edit,
-                            index=sector_idx,
-                            key=f"ss_{sym['id']}",
-                            help="Rovnaký zdroj ako stránka **Sektory — insight**: 11 slovenských S&P sektorov, hodnoty už použité pri symboloch a názvy riadkov z posledných snímok výkonnosti.",
+                            key=f"ss_{sid}",
+                            help="Rovnaký zdroj ako stránka **Sektory — insight**.",
                         )
                     with ec5:
-                        e_iv = st.number_input(
-                            "IV Rank (%)", min_value=0.0, max_value=100.0,
-                            value=float(sym.get("iv_rank") or 0.0), step=0.5,
-                            key=f"siv_{sym['id']}"
+                        st.number_input(
+                            "IV Rank (%)",
+                            min_value=0.0,
+                            max_value=100.0,
+                            step=0.5,
+                            key=f"siv_{sid}",
                         )
 
                     ivh1, ivh2 = st.columns(2)
                     with ivh1:
-                        e_iv13 = st.number_input(
+                        st.number_input(
                             "IV Rank 13 týžd. (%) — z TWS",
                             min_value=0.0,
                             max_value=100.0,
-                            value=float(sym.get("iv_rank_13w") or 0.0),
                             step=0.5,
-                            key=f"siv13_{sym['id']}",
-                            help="Pre Steady Yields skener: kontext či môžeš čakať na rast IV na dlhej nohe.",
+                            key=f"siv13_{sid}",
+                            help="Pre Steady Yields skener.",
                         )
                     with ivh2:
-                        e_iv52 = st.number_input(
+                        st.number_input(
                             "IV Rank 52 týžd. (%) — z TWS",
                             min_value=0.0,
                             max_value=100.0,
-                            value=float(sym.get("iv_rank_52w") or 0.0),
                             step=0.5,
-                            key=f"siv52_{sym['id']}",
+                            key=f"siv52_{sid}",
                         )
 
-                    # ── Investor Relations URL ─────────────────────────────────
-                    e_ir = st.text_input(
+                    st.text_input(
                         "Investor Relations URL",
-                        value=sym.get("ir_url") or "",
                         placeholder="https://ir.aboutamazon.com",
-                        key=f"sir_{sym['id']}",
+                        key=f"sir_{sid}",
                     )
 
-                    # ── 4 Earnings termíny ─────────────────────────────────────
                     st.markdown("**Earnings termíny**")
                     earn_cols = st.columns(4)
                     earn_keys = ["earnings_date", "earnings_date_2",
@@ -524,14 +589,11 @@ elif symbol_section == "Prehľad a úprava":
                                     value=_parse_date(sym.get(key)),
                                     min_value=date(2020, 1, 1),
                                     max_value=date(date.today().year + 3, 12, 31),
-                                    key=f"se{i}_{sym['id']}",
+                                    key=f"se{i}_{sid}",
                                 )
                             )
 
-                    e_desc = st.text_area(
-                        "Poznámky", value=sym.get("description") or "",
-                        height=70, key=f"sd_{sym['id']}"
-                    )
+                    st.text_area("Poznámky", height=70, key=f"sd_{sid}")
 
                     col_s, col_d = st.columns(2)
                     with col_s:
@@ -543,8 +605,8 @@ elif symbol_section == "Prehľad a úprava":
                             "Zmazať symbol", type="secondary", use_container_width=True
                         )
 
-                    # Submit logika musí byť vnútri `st.form` (inak pri viacerých formoch v slučke zlyhá).
                     if del_btn:
+                        st.session_state.pop(f"_sym_db_sig_{sid}", None)
                         db.delete_symbol(sym["id"])
                         st.warning(
                             f"Symbol **{sym['ticker']}** zmazaný. "
@@ -553,6 +615,20 @@ elif symbol_section == "Prehľad a úprava":
                         st.rerun()
 
                     if save_btn:
+                        e_ticker = db.normalize_symbol_ticker(
+                            str(st.session_state.get(f"st_{sid}", "") or "")
+                        )
+                        e_company = str(st.session_state.get(f"sc_{sid}", "") or "")
+                        e_type = str(st.session_state.get(f"sat_{sid}", "Stock") or "Stock")
+                        e_sector = str(st.session_state.get(f"ss_{sid}", "—") or "—")
+                        e_iv = float(st.session_state.get(f"siv_{sid}", 0.0) or 0.0)
+                        e_iv13 = float(st.session_state.get(f"siv13_{sid}", 0.0) or 0.0)
+                        e_iv52 = float(st.session_state.get(f"siv52_{sid}", 0.0) or 0.0)
+                        e_ir = str(st.session_state.get(f"sir_{sid}", "") or "")
+                        e_desc = str(st.session_state.get(f"sd_{sid}", "") or "")
+                        e_spot = float(st.session_state.get(f"sspot_{sid}", 0.0) or 0.0)
+                        e_ivp = float(st.session_state.get(f"sivp_{sid}", 0.0) or 0.0)
+
                         new_earn = [_date_or_none(d) for d in e_earn_dates]
                         if not e_ticker:
                             st.error("Ticker je povinný.")
@@ -567,7 +643,7 @@ elif symbol_section == "Prehľad a úprava":
                                     f"Ticker **{e_ticker}** už má iný záznam v zozname — jeden symbol nemôže byť dvakrát."
                                 )
                             else:
-                                db.update_symbol(
+                                _ren = db.update_symbol(
                                     symbol_id=sym["id"],
                                     ticker=e_ticker,
                                     company_name=e_company,
@@ -580,11 +656,17 @@ elif symbol_section == "Prehľad a úprava":
                                     earnings_date_4=new_earn[3],
                                     ir_url=e_ir.strip() or None,
                                     iv_rank=e_iv if e_iv > 0 else None,
-                                    spot=sym.get("spot"),
-                                    iv_pct=sym.get("iv_pct"),
+                                    spot=e_spot if e_spot > 0 else None,
+                                    iv_pct=e_ivp if e_ivp > 0 else None,
                                     iv_rank_13w=e_iv13 if e_iv13 > 0 else None,
                                     iv_rank_52w=e_iv52 if e_iv52 > 0 else None,
                                 )
+                                st.session_state.pop(f"_sym_db_sig_{sid}", None)
+                                if _ren:
+                                    st.info(
+                                        "**Prepísaný ticker** aj v: "
+                                        + ", ".join(f"{k} ({v}×)" for k, v in sorted(_ren.items()))
+                                    )
                                 st.success(f"Symbol **{e_ticker}** aktualizovaný.")
                                 st.rerun()
 

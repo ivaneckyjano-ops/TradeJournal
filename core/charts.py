@@ -20,6 +20,54 @@ C_SPOT = "rgba(241, 196, 15, 0.9)"
 C_STRIKE = "rgba(231, 76, 60, 0.85)"
 
 
+def simple_dataframe_line_figure(
+    df: "pd.DataFrame",
+    *,
+    height: int = 220,
+    y_column: str | None = None,
+) -> go.Figure:
+    """
+    Jednoduchý čiarový graf (Plotly) ako náhrada za ``st.line_chart``.
+
+    Vega-Lite grafy vo Streamlite pri veľkom DOM občas spôsobia v prehliadači
+    React chybu „removeChild: The node to be removed is not a child of this node“.
+    """
+    import pandas as pd
+
+    if df is None or df.empty:
+        fig = go.Figure()
+        fig.update_layout(height=height, margin=dict(l=8, r=8, t=8, b=36))
+        return fig
+
+    fig = go.Figure()
+    x_vals = df.index
+
+    if y_column is not None:
+        cols = [y_column] if y_column in df.columns else []
+    else:
+        cols = list(df.columns)
+
+    for c in cols:
+        fig.add_trace(
+            go.Scatter(
+                x=x_vals,
+                y=pd.to_numeric(df[c], errors="coerce"),
+                mode="lines",
+                name=str(c),
+                connectgaps=True,
+            )
+        )
+
+    fig.update_layout(
+        height=height,
+        margin=dict(l=8, r=8, t=8, b=36),
+        showlegend=len(cols) > 1,
+        xaxis=dict(showgrid=True, title=None),
+        yaxis=dict(showgrid=True, title=None),
+    )
+    return fig
+
+
 def sd_lines_chart(
     sd: SDLines,
     ticker: str = "Ticker",
