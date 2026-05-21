@@ -15,17 +15,18 @@ st.markdown("""
 """)
 
 # ─── Navigácia ────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+help_sections = [
     "Začíname",
     "Trade Log",
     "Konzultácie",
     "Roll Simulátor",
     "IBKR Pripojenie",
     "Steady Yields",
-])
+]
+help_section = st.selectbox("Sekcia", help_sections, key="help_section")
 
 # ══════════════════════════════════════════════════════════════════════════════
-with tab1:
+if help_section == "Začíname":
     st.caption("**Návod k záložke:** Postup od spustenia cez IBKR a import až po časovú os stratégie v Konzultáciách.")
     st.header("Začíname — prvé kroky")
 
@@ -65,7 +66,7 @@ with tab1:
 """)
 
 # ══════════════════════════════════════════════════════════════════════════════
-with tab2:
+elif help_section == "Trade Log":
     st.caption("**Návod k záložke:** Význam polí pri manuálnom zápise, skupiny a úpravy — zrkadlí obrazovku **Trade Log** v aplikácii.")
     st.header("Trade Log")
 
@@ -124,7 +125,7 @@ napr. `AMZN_DIA_MAR26`, `TSLA_IC_APR26`, `SPY_STRANGLE_MAY26`
 """)
 
 # ══════════════════════════════════════════════════════════════════════════════
-with tab3:
+elif help_section == "Konzultácie":
     st.caption("**Návod k záložke:** Ako písať poznámky (Markdown), priradiť trade/skupinu a čítať Strategy Timeline — zodpovedá stránke **Konzultácie**.")
     st.header("Konzultácie a Poznámky")
 
@@ -174,7 +175,7 @@ with tab3:
 """)
 
 # ══════════════════════════════════════════════════════════════════════════════
-with tab4:
+elif help_section == "Roll Simulátor":
     st.caption("**Návod k záložke:** Postup pri simulácii rollu, význam PoP, SD a grafov — doplnok k obrazovke **Roll Simulátor**.")
     st.header("Roll Simulátor")
 
@@ -226,7 +227,7 @@ Vypočítava sa cez **Black-Scholes model (N(d2))**:
 """)
 
 # ══════════════════════════════════════════════════════════════════════════════
-with tab5:
+elif help_section == "IBKR Pripojenie":
     st.caption("**Návod k záložke:** Porty TWS/Gateway, API nastavenia a čo v aplikácii funguje s pripojením / bez neho. Praktické pripojenie robíš na **Dashboarde**.")
     st.header("IBKR Pripojenie")
 
@@ -277,7 +278,7 @@ with tab5:
     st.info("Všetky import funkcie sú **Read-Only** — denník nikdy neposiela príkazy do TWS.")
 
 # ══════════════════════════════════════════════════════════════════════════════
-with tab6:
+elif help_section == "Steady Yields":
     st.caption("**Návod k záložke:** Vysvetlenie záložiek Monitor, Yield, Monitoring a Skener na stránke **Steady Yields** a závislosť na Group ID.")
     st.header("Steady Yields")
     st.markdown("""

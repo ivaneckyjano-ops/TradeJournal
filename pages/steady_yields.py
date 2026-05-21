@@ -892,13 +892,11 @@ def _sy_style_monitor_df(df: pd.DataFrame):
     return df.style.apply(_row_style, axis=1)
 
 
-# Záložky musia byť hneď pred ``with tab_*`` — veľký blok ``def`` medzi ``st.tabs()`` a obsahom vie v Streamlite rozbiť prepínanie záložiek.
-tab_sy_monitor, tab_yield, tab_mon, tab_scan = st.tabs(
-    ["Monitor", "Yield a APR", "Monitoring a roll", "Skener"]
-)
+steady_yield_sections = ["Monitor", "Yield a APR", "Monitoring a roll", "Skener"]
+steady_yield_section = st.selectbox("Sekcia", steady_yield_sections, key="steady_yields_section")
 
 # ─── Tab: Monitor (prehľad SY podľa skupín) ───────────────────────────────────
-with tab_sy_monitor:
+if steady_yield_section == "Monitor":
     st.subheader("Monitor otvorených pozícií")
     st.caption(
         "**Návod:** Skupiny = **Group ID** z Trade Logu. Pri pripojenom IB sa **|Δ| teraz** ťahá z API; tlačidlo **Načítať pozície z IB** obnoví cache a portfólio. "
@@ -1186,7 +1184,7 @@ with tab_sy_monitor:
 
 
 # ─── Tab: Yield a APR ─────────────────────────────────────────────────────────
-with tab_yield:
+elif steady_yield_section == "Yield a APR":
     st.caption(
         "**Návod:** Vyber **skupinu** s PMCC/diagonálou. Doplň **profil** (očakávaný APR, náklad LEAPS), zapisuj **roll / inkaso** udalosti — "
         "z nich sa rátajú realizované toky a APR. Súhrn a metriky sú pod formulármi."
@@ -1394,7 +1392,7 @@ with tab_yield:
 
 
 # ─── Tab: Monitoring ─────────────────────────────────────────────────────────
-with tab_mon:
+elif steady_yield_section == "Monitoring a roll":
     st.caption(
         "**Návod:** Vyber skupinu, nastav **prahy semafora** (|Δ|, DTE), obnov pozície z IB. Sleduj short nohy, alerty a návrhy rollu — "
         "nič sa neposiela ako príkaz do TWS."
@@ -1718,7 +1716,7 @@ with tab_mon:
 
 
 # ─── Tab: Skener ──────────────────────────────────────────────────────────────
-with tab_scan:
+elif steady_yield_section == "Skener":
     sym_rows = db.get_symbols()
     sym_tickers = [str(s["ticker"]).strip().upper() for s in sym_rows if s.get("ticker")]
     trade_tickers = db.get_distinct_trade_tickers()

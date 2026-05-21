@@ -53,10 +53,11 @@ st.caption(
     "Spot a IV vieš dopĺňať cez **Yahoo Finance** (nižšie v Prehľade)."
 )
 
-tab_add, tab_manage = st.tabs(["Pridať symbol", "Prehľad a úprava"])
+symbol_sections = ["Pridať symbol", "Prehľad a úprava"]
+symbol_section = st.selectbox("Sekcia", symbol_sections, key="symbols_section")
 
 # ─── Tab: Pridať symbol ───────────────────────────────────────────────────────
-with tab_add:
+if symbol_section == "Pridať symbol":
     st.caption(
         "**Návod:** Zadaj ticker a povinné polia; **sektor** vyber zo zoznamu (S&P, už použité symboly, snímky **Sektory**). "
         "Earnings a IR URL sú voliteľné — earnings sa môžu doplniť aj do Kalendára."
@@ -191,7 +192,7 @@ with tab_add:
 
 
 # ─── Tab: Prehľad a úprava ────────────────────────────────────────────────────
-with tab_manage:
+elif symbol_section == "Prehľad a úprava":
     st.subheader("Všetky symboly")
     st.caption(
         "**Návod:** Horná tabuľka je **prehľad** (vrátane sektora). **Úprava** — klikni na **expandér** s tickerom nižšie v sekcii **Editácia**: "

@@ -34,6 +34,34 @@ EVENT_COLORS = {
 
 DAY_NAMES = ["Po", "Ut", "St", "Št", "Pi", "So", "Ne"]
 
+
+def _normalize_event_type(value: str) -> str:
+    """
+    Prevod starších / voľných názvov typu udalosti na hodnotu povolenú DB.
+
+    Pomáha pri starých záznamoch aj pri ručnom vkladaní textu, aby nevznikal
+    CHECK constraint error na tabuľke `events`.
+    """
+    raw = str(value or "").strip().lower()
+    if raw in EVENT_TYPES:
+        return raw
+    compact = raw.replace(" ", "_").replace("-", "_")
+    alias_map = {
+        "wbanalysis": "wb_analysis",
+        "wb_analysis": "wb_analysis",
+        "wb_analyza": "wb_analysis",
+        "wb_analýza": "wb_analysis",
+        "rollovanie": "roll",
+        "roll_up": "roll",
+        "roll_down": "roll",
+        "earningss": "earnings",
+    }
+    if compact in alias_map:
+        return alias_map[compact]
+    if compact in EVENT_TYPES:
+        return compact
+    return "event"
+
 st.title("📅 Kalendár")
 st.caption(
     "**Návod:** Šípkami **Predošlý / Nasledujúci** meníš mesiac. Klikni na **deň** v mriežke — v detaile uvidíš udalosti a môžeš pridávať podľa typu. "
@@ -81,6 +109,31 @@ year  = st.session_state["cal_year"]
 month = st.session_state["cal_month"]
 events = db.get_events(year, month)
 
+# Samospráva starých záznamov: staré typy prepíšeme na kanonické hodnoty.
+_fixed_event_types = 0
+for _ev in events:
+    _ev_id = _ev.get("id")
+    if not isinstance(_ev_id, int):
+        continue
+    _norm = _normalize_event_type(_ev.get("type"))
+    if _norm != _ev.get("type"):
+        try:
+            db.update_event(
+                event_id=int(_ev_id),
+                date=str(_ev.get("date") or ""),
+                event_type=_norm,
+                title=str(_ev.get("title") or ""),
+                ticker=_ev.get("ticker"),
+                description=_ev.get("description"),
+            )
+            _fixed_event_types += 1
+        except Exception:
+            pass
+
+if _fixed_event_types:
+    st.caption(f"Opravené staré typy udalostí v DB: **{_fixed_event_types}**.")
+    events = db.get_events(year, month)
+
 # Zoskup podľa dátumu
 events_by_day: dict[int, list] = {}
 for ev in events:
@@ -109,7 +162,7 @@ with st.expander("Filtre", expanded=False):
         filter_ticker = st.text_input("Filter podľa tickera", "").upper().strip()
 
 def _matches(ev: dict) -> bool:
-    if ev.get("type") not in filter_types:
+    if _normalize_event_type(ev.get("type")) not in filter_types:
         return False
     if filter_ticker and (ev.get("ticker") or "").upper() != filter_ticker:
         return False
@@ -323,7 +376,7 @@ if selected_day:
                 else:
                     db.add_event(
                         date=ev_date_override.isoformat(),
-                        event_type=ev_type_sel,
+                        event_type=_normalize_event_type(ev_type_sel),
                         title=ev_title.strip(),
                         ticker=ev_ticker or None,
                         description=ev_desc.strip() or None,
@@ -353,7 +406,7 @@ with st.expander("📋 Všetky nadchádzajúce udalosti", expanded=True):
 
             rows.append({
                 "Dátum": e.get("date", ""),
-                "Typ": EVENT_LABELS.get(e.get("type", "event"), e.get("type", "")),
+                "Typ": EVENT_LABELS.get(_normalize_event_type(e.get("type", "event")), e.get("type", "")),
                 "Ticker": e.get("ticker") or "—",
                 "Názov": e.get("title", ""),
                 "Popis": (e.get("description") or "")[:60],
@@ -410,7 +463,7 @@ with st.expander("➕ Rýchle pridanie udalosti", expanded=False):
             else:
                 db.add_event(
                     date=q_date.isoformat(),
-                    event_type=q_type,
+                    event_type=_normalize_event_type(q_type),
                     title=q_title.strip(),
                     ticker=q_ticker or None,
                     description=q_desc.strip() or None,

@@ -50,9 +50,8 @@ with st.sidebar:
     )
     st.session_state["selected_claude_model"] = _model_options[_model_sel_idx]
 
-tab_create, tab_manage, tab_assign = st.tabs([
-    "Vytvoriť skupinu", "Prehľad a úprava", "Priradiť obchodom"
-])
+group_sections = ["Vytvoriť skupinu", "Prehľad a úprava", "Priradiť obchodom"]
+group_section = st.selectbox("Sekcia", group_sections, key="groups_section")
 
 STRATEGIES = [
     "Diagonal", "Calendar Spread", "Iron Condor", "Straddle", "Strangle",
@@ -81,7 +80,7 @@ def _ticker_choice_index(choices: list[tuple[str, str]], current: str | None) ->
     return 0
 
 # ─── Tab: Vytvoriť skupinu ────────────────────────────────────────────────────
-with tab_create:
+if group_section == "Vytvoriť skupinu":
     st.caption(
         "**Návod:** Zadaj jedinečný **Group ID** (odporúčaný formát v pomocníku). Tento názov potom vyberáš v **Trade Log**, "
         "**Konzultáciách** a pri hromadnom priradení. Ticker vyberaj zo **Symboly** a stratégia je len orientačné metadáta."
@@ -145,7 +144,7 @@ with tab_create:
 
 
 # ─── Tab: Prehľad a úprava ────────────────────────────────────────────────────
-with tab_manage:
+if group_section == "Prehľad a úprava":
     st.caption(
         "**Návod:** Každá skupina je v **expandéri** — živé dáta z IB (ak si pripojený), AI analýza/plán, úprava poznámok a udalostí. "
         "Nižšie môžeš priradiť obchody hromadne v záložke **Priradiť obchodom**."
@@ -730,7 +729,7 @@ def _groups_assign_leg_label(t: dict) -> str:
     return f"#{tid} · {tk} · {lt} · {ot} · strike {k:.0f} · exp {ex} · ×{q} · teraz: {cur_s}"
 
 
-with tab_assign:
+if group_section == "Priradiť obchodom":
     st.subheader("Priradiť skupinu obchodom")
     st.caption(
         "**Návod:** Vyber **skupinu**, v tabuľke zaškrtni **Patrí do vybranej skupiny** pri nohách, ktoré do nej majú patriť, "

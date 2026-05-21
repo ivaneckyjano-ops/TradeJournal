@@ -7,18 +7,27 @@ from core.page_context import set_tradejournal_page
 db.init_db()
 set_tradejournal_page("notes")
 
+
+def _calendar_event_type_for_note() -> str:
+    """Kanonický typ udalosti pre poznámky v Kalendári."""
+    return "note"
+
 st.title("Konzultácie a Poznámky")
 st.caption(
     "**Návod:** **Nová poznámka** = zápis s Markdownom. **Strategy Timeline** = časová os podľa Group ID. **História** = filtre podľa trade/skupiny. "
     "**Upraviť / Zmazať** = vyber konkrétny záznam. Uložené poznámky sa objavia aj v **Kalendári**."
 )
 
-tab_new, tab_timeline, tab_history, tab_edit = st.tabs([
-    "Nová poznámka", "Strategy Timeline", "História (Log)", "Upraviť / Zmazať"
-])
+notes_sections = ["Nová poznámka", "Strategy Timeline", "História (Log)", "Upraviť / Zmazať"]
+notes_section = st.selectbox(
+    "Sekcia",
+    options=notes_sections,
+    index=0,
+    key="notes_section",
+)
 
 # ─── Tab: Nová poznámka ────────────────────────────────────────────────────────
-with tab_new:
+if notes_section == "Nová poznámka":
     st.caption(
         "**Návod:** Vyplň nadpis a text (Markdown). Voliteľne priraď **konkrétnu nohu** alebo **skupinu** — poznámka sa objaví v Kalendári a v **Strategy Timeline**."
     )
@@ -92,7 +101,7 @@ with tab_new:
                 _ticker = _t["ticker"] if _t else ""
             db.add_event(
                 date=_date.today().isoformat(),
-                event_type="note",
+                event_type=_calendar_event_type_for_note(),
                 title=title,
                 ticker=_ticker or None,
                 description=content[:200] if content else None,
@@ -104,7 +113,7 @@ with tab_new:
 
 
 # ─── Tab: Strategy Timeline ───────────────────────────────────────────────────
-with tab_timeline:
+elif notes_section == "Strategy Timeline":
     st.subheader("Strategy Timeline — Chronologický vývoj stratégie")
     st.caption(
         "**Návod:** Vyber **Group ID** (musí byť nastavený v Trade Log). Zobrazí sa časová os vstupov, výstupov a poznámok; "
@@ -263,7 +272,7 @@ with tab_timeline:
 
 
 # ─── Tab: História ─────────────────────────────────────────────────────────────
-with tab_history:
+elif notes_section == "História (Log)":
     st.subheader("História poznámok")
     st.caption(
         "**Návod:** Filtre podľa **Trade** alebo textového **Group ID** — zoznam všetkých uložených poznámok s expandérom na obsah. "
@@ -312,7 +321,7 @@ with tab_history:
 
 
 # ─── Tab: Upraviť / Zmazať ────────────────────────────────────────────────────
-with tab_edit:
+elif notes_section == "Upraviť / Zmazať":
     st.subheader("Upraviť alebo zmazať poznámku")
     st.caption(
         "**Návod:** Vyber poznámku zo zoznamu, uprav nadpis alebo obsah a **Uložiť zmeny**, prípadne **Zmazať poznámku** — akcie sú mimo formulára (Streamlit), zmeny sa prejavia hneď po kliknutí."

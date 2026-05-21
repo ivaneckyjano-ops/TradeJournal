@@ -1410,14 +1410,15 @@ with st.expander("🔄 Multi-leg Roll — roll celej skupiny naraz", expanded=Fa
             )
 
             # ── Tabuľky ─────────────────────────────────────────────────────
-            _tab_b, _tab_a = st.tabs(["Pred rollom", "Po rolle"])
+            modeler_roll_sections = ["Pred rollom", "Po rolle"]
+            modeler_roll_section = st.selectbox("Sekcia rollu", modeler_roll_sections, key="modeler_roll_section")
             _col_cfg = {
                 "Strike":       st.column_config.NumberColumn(format="$%.0f"),
                 "Theta $/deň":  st.column_config.NumberColumn(format="$%+.2f"),
                 "Delta $":      st.column_config.NumberColumn(format="$%+.0f"),
                 "Vega $":       st.column_config.NumberColumn(format="$%+.2f"),
             }
-            with _tab_b:
+            if modeler_roll_section == "Pred rollom":
                 st.caption(
                     "**Návod:** Tabuľka nôh **pred** navrhovaným rollom — Theta / Delta / Vega v USD; riadok SPOLU = súčet skupiny."
                 )
@@ -1430,7 +1431,7 @@ with st.expander("🔄 Multi-leg Roll — roll celej skupiny naraz", expanded=Fa
                 }]
                 st.dataframe(pd.DataFrame(_rows_b_df), use_container_width=True,
                              hide_index=True, column_config=_col_cfg)
-            with _tab_a:
+            elif modeler_roll_section == "Po rolle":
                 st.caption(
                     "**Návod:** Stav **po** rolle podľa zadaných nových strikov; **Net flow** = odhadovaný tok prémií pri roli."
                 )
@@ -1751,15 +1752,16 @@ with st.expander("PoP kalkulačka — rýchly výpočet pravdepodobnosti (bez po
         })
     st.dataframe(pd.DataFrame(compare_rows), use_container_width=True, hide_index=True)
 
-    tab_bell, tab_sd = st.tabs(["Bell Curve", "SD Línie"])
+    modeler_curve_sections = ["Bell Curve", "SD Línie"]
+    modeler_curve_section = st.selectbox("Sekcia grafu", modeler_curve_sections, key="modeler_curve_section")
     all_strikes = orig_strikes + new_strikes
     all_labels  = orig_labels  + new_labels
-    with tab_bell:
+    if modeler_curve_section == "Bell Curve":
         st.caption(
             "**Návod:** Rozloženie cien (lognormálny model) — zvýraznené zvolené striky pred/po rolle."
         )
         st.plotly_chart(bell_curve_chart(spot, iv, int(dte), ticker, all_strikes, all_labels), width="stretch")
-    with tab_sd:
+    elif modeler_curve_section == "SD Línie":
         st.caption(
             "**Návod:** Pásy ±1σ a ±2σ okolo spotu voči strikom — rýchla orientácia vzdialenosti od podkladu."
         )

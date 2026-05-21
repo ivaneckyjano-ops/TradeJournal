@@ -114,7 +114,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS events (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 date        TEXT NOT NULL,
-                type        TEXT NOT NULL CHECK(type IN ('earnings','expiry','alert','reminder','event','note')),
+                type        TEXT NOT NULL CHECK(type IN ('earnings','expiry','roll','wb_analysis','alert','reminder','event','note')),
                 ticker      TEXT,
                 title       TEXT NOT NULL,
                 description TEXT,
@@ -139,6 +139,7 @@ def init_db() -> None:
     _migrate_ticker_correlation_data(get_connection())
     _migrate_trade_journal_greeks(get_connection())
     _migrate_trading_commands(get_connection())
+    _migrate_events(get_connection())
     with get_connection() as conn:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_events_date ON events (date)")
         conn.commit()
@@ -172,6 +173,48 @@ def _migrate_symbols(conn: sqlite3.Connection) -> None:
         )
     """)
     conn.commit()
+    conn.close()
+
+
+def _migrate_events(conn: sqlite3.Connection) -> None:
+    """
+    Zabezpečí, že `events.type` podporuje aj typy používané v kalendári.
+
+    SQLite nevie upraviť CHECK constraint in-place, preto starú tabuľku
+    prebudujeme do novej schémy a dáta skopírujeme.
+    """
+    try:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='events'"
+        ).fetchone()
+        sql = str(row["sql"] or "") if row else ""
+        if "roll" in sql and "wb_analysis" in sql:
+            return
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS events_new (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                date        TEXT NOT NULL,
+                type        TEXT NOT NULL CHECK(type IN ('earnings','expiry','roll','wb_analysis','alert','reminder','event','note')),
+                ticker      TEXT,
+                title       TEXT NOT NULL,
+                description TEXT,
+                group_id    TEXT,
+                trade_id    INTEGER REFERENCES trades(id) ON DELETE SET NULL,
+                created_at  TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("""
+            INSERT INTO events_new
+            (id, date, type, ticker, title, description, group_id, trade_id, created_at)
+            SELECT id, date, type, ticker, title, description, group_id, trade_id, created_at
+            FROM events
+        """)
+        conn.execute("DROP TABLE events")
+        conn.execute("ALTER TABLE events_new RENAME TO events")
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _migrate_trades(conn: sqlite3.Connection) -> None:
@@ -997,6 +1040,25 @@ CALENDAR_EVENTS_LAST_PURGE_DAY_KEY = "calendar_events_last_purge_day"
 CALENDAR_AUTO_PURGE_ENABLED_KEY = "calendar_auto_purge_enabled"
 
 
+def _normalize_event_type(value: str) -> str:
+    """Normalizuje typ udalosti na hodnotu povolenú v `events.type`."""
+    raw = str(value or "").strip().lower()
+    compact = raw.replace(" ", "_").replace("-", "_")
+    aliases = {
+        "wbanalysis": "wb_analysis",
+        "wb_analyza": "wb_analysis",
+        "wb_analýza": "wb_analysis",
+        "rollovanie": "roll",
+        "roll_up": "roll",
+        "roll_down": "roll",
+    }
+    if compact in aliases:
+        return aliases[compact]
+    if compact in ("earnings", "expiry", "roll", "wb_analysis", "alert", "reminder", "event", "note"):
+        return compact
+    return "event"
+
+
 def purge_old_calendar_events(retention_days: int = CALENDAR_EVENTS_RETENTION_DAYS) -> int:
     """
     Vymaže riadky v ``events``, kde ``date`` (YYYY-MM-DD) je staršia ako ``retention_days``.
@@ -1069,6 +1131,7 @@ def get_event_by_id(event_id: int) -> Optional[dict]:
 
 def add_event(date: str, event_type: str, title: str, ticker: str = None,
               description: str = None, group_id: str = None, trade_id: int = None) -> int:
+    event_type = _normalize_event_type(event_type)
     with get_connection() as conn:
         cur = conn.execute(
             "INSERT INTO events (date, type, ticker, title, description, group_id, trade_id) "
@@ -1080,6 +1143,7 @@ def add_event(date: str, event_type: str, title: str, ticker: str = None,
 
 def update_event(event_id: int, date: str, event_type: str, title: str,
                  ticker: str = None, description: str = None) -> None:
+    event_type = _normalize_event_type(event_type)
     with get_connection() as conn:
         conn.execute(
             "UPDATE events SET date=?, type=?, title=?, ticker=?, description=? WHERE id=?",

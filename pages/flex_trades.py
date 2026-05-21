@@ -56,10 +56,11 @@ if _go and _raw:
         qt = meta.get("type") or "—"
         st.success(f"**Flex query:** {qn} · **typ:** {qt}")
 
-        _tabs = st.tabs([label for _key, label in _BUCKET_ORDER])
+        flex_sections = [label for _key, label in _BUCKET_ORDER]
+        flex_section = st.selectbox("Sekcia", flex_sections, key="flex_trades_section")
         for i, (key, label) in enumerate(_BUCKET_ORDER):
             rows = buckets.get(key) or []
-            with _tabs[i]:
+            if flex_section == label:
                 st.caption(f"**{label}** — {len(rows)} riadkov")
                 if not rows:
                     st.info("Žiadne riadky v tomto bloku.")

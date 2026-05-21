@@ -26,7 +26,8 @@ st.caption(
     "Barchart: názov s `options-exp` alebo `volatility-greeks-exp`, dátum expirácie a snímka `-MM-DD-YYYY.csv`."
 )
 
-tab_import, tab_ibkr, tab_view = st.tabs(["Import CSV", "IBKR", "Prehľad"])
+option_chain_sections = ["Import CSV", "IBKR", "Prehľad"]
+option_chain_section = st.selectbox("Sekcia", option_chain_sections, key="option_chain_section")
 
 
 def _status_label(has_options: bool, has_greeks: bool, in_db: bool) -> str:
@@ -205,7 +206,7 @@ def _render_import_report(report: dict) -> None:
                 st.markdown(f"- {line}")
 
 
-with tab_import:
+if option_chain_section == "Import CSV":
     st.caption(
         "**Návod:** Nahraj **Barchart CSV** (options + greeks pre rovnakú expiráciu a dátum snímky). Skontroluj náhľad, zvoľ **Importovať všetko** alebo **len chýbajúce**. "
         "Formát názvu súboru je v popise stránky hore."
@@ -352,7 +353,7 @@ with tab_import:
             st.rerun()
 
 
-with tab_ibkr:
+elif option_chain_section == "IBKR":
     from core import ibkr as ibkr_ocg
     from core.option_chain_ibkr_sync import (
         parse_expiry_text,
@@ -486,7 +487,7 @@ with tab_ibkr:
                 else:
                     st.warning("Nič sa neimportovalo — skontroluj chyby vyššie alebo trhové dáta.")
 
-with tab_view:
+elif option_chain_section == "Prehľad":
     st.caption(
         "**Návod:** Vyber **ticker** a prípadne filtre expirácie / dátumu snímky — prehliadaš dáta v lokálnej `data/option_chains/<TICKER>.db`, nie v hlavnom journal.db."
     )
