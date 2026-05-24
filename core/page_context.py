@@ -17,9 +17,13 @@ import streamlit as st
 TWS_DASHBOARD_PAGE = "portfolio_tws"
 
 # Slugy z URL cesty = inferovaný ``url_path`` z názvu súboru (``*.py``), pozri Streamlit ``source_util.page_icon_and_name``.
-# Domovská stránka má v URL prázdny path — táto množina ju neobsahuje.
+# Pri prázdnej ceste (root) ``skip_global_autorefresh_for_current_page`` radšej vypne sync (default je ťažký Dashboard).
 HEAVY_PAGE_URL_PATHS_SKIP_GLOBAL_AUTOREFRESH: frozenset[str] = frozenset(
     {
+        # Domov + pomocník: veľa widgetov / expandre; globálny autorefresh tu často spôsobí
+        # React chybu „removeChild: The node to be removed is not a child of this node“.
+        "dashboard",
+        "help",
         "journal_main",
         "portfolio_dashboard",
         "spread_builder",
@@ -76,7 +80,11 @@ def skip_global_autorefresh_for_current_page() -> bool:
     ``tj_active_page`` z predchádzajúceho behu (lepšie ako nič).
     """
     slug = current_navigation_url_slug()
-    if slug and slug in HEAVY_PAGE_URL_PATHS_SKIP_GLOBAL_AUTOREFRESH:
+    # Prázdny pathname (root / prvý beh) — default je ťažký Dashboard; radšej nesyncovať,
+    # kým Streamlit nevyplní ``st.context.url`` (inak občas removeChild v prehliadači).
+    if not slug:
+        return True
+    if slug in HEAVY_PAGE_URL_PATHS_SKIP_GLOBAL_AUTOREFRESH:
         return True
     fb = _slug_from_tj_active_page()
     return bool(fb and fb in HEAVY_PAGE_URL_PATHS_SKIP_GLOBAL_AUTOREFRESH)

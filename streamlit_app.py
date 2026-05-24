@@ -267,8 +267,8 @@ with st.sidebar:
             )
         else:
             st.caption(
-                "Na tejto stránke je **globálna synchronizácia** vypnutá (stabilita prehliadača pri veľkom UI). "
-                "Obnov dáta tlačidlom na stránke alebo choď na **Dashboard** / **Pomocník**, kde môže zostať zapnutá."
+                "Na tejto stránke je **globálna synchronizácia** vypnutá (stabilita prehliadača — veľké UI + periodický rerun "
+                "vedú k chybe *removeChild* v prehliadači). IB dáta obnov **tlačidlami** na danej stránke alebo manuálnym obnovením okna."
             )
     st.caption(f"Aktívne IB pripojenie: `{ibkr.current_connection_label()}`")
     st.caption(f"Aktívna DB: `{os.path.basename(db.get_active_db_path())}`")

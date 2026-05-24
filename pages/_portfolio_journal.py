@@ -106,6 +106,10 @@ Bez IB cache je hodnota **—**.
 **Súčet MV mínus súčet nákladovej bázy** z rovnakých IB riadkov ako vyššie — orientačný **nezrealizovaný P&L** celej skupiny (nie je to samostatné pole z API). Pri neúplnej zhode nôh s IB sú to súčty len z **zhodných** nôh.  
 Bez IB cache je hodnota **—**.
 
+### Horný súčet nad tabuľkou (Σ |vstup| — USD)
+
+Riadok metrík **nad** tabuľkou časopisu: súčet **|entry_price| × contracts** s násobkom **100 len pre opčné** nohy (veľkosť kontraktu). Pre **STK** v denníku je to **|$/akcia| × počet akcií** — násobok 100 sa **nepoužíva** (inak by akciová noha umelo nafukovala súčet).
+
 ### Časté problémy
 
 - **Metriky z IB ≠ TWS:** obnov dáta tlačidlom pri skupine; over, že v účte je **STK** podkladu (pre spot) alebo že v **Symboly** je aktuálny **spot**.
@@ -176,9 +180,20 @@ def _render_delta_hedge_panel() -> None:
         return x
 
     with st.expander("Delta hedge — podklad prvého rádu", expanded=False):
+        _dh_alt_col_help = (
+            "Riadok hovorí, koľko opčných kontraktov kúpiť. "
+            "Delta je na 1 akciu podkladu; ×100 = veľkosť US kontraktu."
+        )
+        _dh_alt_legend = (
+            "**Odporúčanie (opcia)** = jednoduchý odhad: koľko **celých kontraktov** kúpiť. "
+            "Používame orientačnú deltu okolo **0,45** na akciu podkladu (call alebo put podľa smeru). "
+            "V praxi teda čítaš len: **Kúp 1 kontrakt s deltou okolo 0,45** alebo viac kontraktov podľa veľkosti hedgu."
+        )
         st.caption(
             "**Z DB:** otvorené nohy a **Δ aktuálna** (inak Δ vstup). **Úvaha:** skopíruj Δ z OptionTrader/TWS — "
-            "**nič sa neukladá** do denníka. **Neodosiela príkazy** — len orientačné čísla."
+            "**nič sa neukladá** do denníka. **Neodosiela príkazy** — len orientačné čísla. "
+            "**Alternatíva (opcia)** používa orientačnú Δ≈0,45/akcia (call / put); konkrétny kontrakt v TWS si vyber podľa expirácie a striku. "
+            "Odporúčania sú v **dvoch stĺpcoch**, aby sa text v tabuľke neorezával."
         )
         open_tr = [t for t in db.get_open_trades() if str(t.get("status") or "Open").lower() == "open"]
         by_tk = dhp.net_delta_shares_by_ticker(open_tr)
@@ -299,6 +314,7 @@ def _render_delta_hedge_panel() -> None:
                 dd = dhp.dollar_delta(net, spot) if spot > 0 else None
                 hedge = dhp.hedge_shares_for_target(net, float(target_d))
                 _, inside = dhp.apply_deadband(hedge, float(deadband))
+                _rec_stk, _rec_opt = dhp.hedge_table_recommendation_cells(hedge, inside_deadband=inside)
                 rows.append(
                     {
                         "Ticker": tk,
@@ -307,10 +323,24 @@ def _render_delta_hedge_panel() -> None:
                         "$ Δ (opcie)": round(dd, 0) if dd is not None else None,
                         "Hedge podklad (akcie)": round(hedge, 2),
                         "V deadband": "Áno" if inside else "Nie",
-                        "Odporúčanie": dhp.hedge_action_label(hedge) if not inside else "Zatiaľ neobchodovať (deadband)",
+                        "Odporúčanie (podklad)": _rec_stk,
+                        "Odporúčanie (opcia)": _rec_opt,
                     }
                 )
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            _dh_df = pd.DataFrame(rows)
+            st.dataframe(
+                _dh_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Odporúčanie (podklad)": st.column_config.TextColumn(width="large"),
+                    "Odporúčanie (opcia)": st.column_config.TextColumn(
+                        width="large",
+                        help=_dh_alt_col_help,
+                    ),
+                },
+            )
+            st.caption(_dh_alt_legend)
             if any(float(st.session_state.get(f"dh_paper_spot_{tk}", 0.0) or 0.0) <= 0 for tk in tickers):
                 st.warning("Pre ticker bez spotu dopln **Symboly** alebo spot vyššie — inak chýba **$Δ**.")
 
@@ -422,6 +452,7 @@ def _render_delta_hedge_panel() -> None:
         _wdd = dhp.dollar_delta(_wnet, float(w_spot)) if w_spot and w_spot > 0 else None
         _wh = dhp.hedge_shares_for_target(_wnet, float(w_target))
         _w_in = dhp.apply_deadband(_wh, float(w_dead))[1]
+        _w_stk, _w_opt = dhp.hedge_table_recommendation_cells(_wh, inside_deadband=_w_in)
         _wrows = [
             {
                 "Ticker": whatif_tk,
@@ -430,7 +461,8 @@ def _render_delta_hedge_panel() -> None:
                 "$ Δ (opcie)": round(_wdd, 0) if _wdd is not None else None,
                 "Hedge podklad (akcie)": round(_wh, 2),
                 "V deadband": "Áno" if _w_in else "Nie",
-                "Odporúčanie": dhp.hedge_action_label(_wh) if not _w_in else "Zatiaľ neobchodovať (deadband)",
+                "Odporúčanie (podklad)": _w_stk,
+                "Odporúčanie (opcia)": _w_opt,
             }
         ]
         if not _synth:
@@ -438,7 +470,19 @@ def _render_delta_hedge_panel() -> None:
         elif not whatif_tk:
             st.warning("Vyber **ticker** zo Symboly.")
         else:
-            st.dataframe(pd.DataFrame(_wrows), use_container_width=True, hide_index=True)
+            st.dataframe(
+                pd.DataFrame(_wrows),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Odporúčanie (podklad)": st.column_config.TextColumn(width="large"),
+                    "Odporúčanie (opcia)": st.column_config.TextColumn(
+                        width="large",
+                        help=_dh_alt_col_help,
+                    ),
+                },
+            )
+            st.caption(_dh_alt_legend)
 
 
 def _dte(expiry_str: str) -> int | None:
@@ -471,10 +515,18 @@ def _dte_signed(expiry_str: str) -> int | None:
 
 
 def _notional_per_leg(t: dict) -> float:
+    """
+    Orientačná hotovosť z journal ``entry_price`` (USD na akciu z DB / importu IB).
+
+    - **OPT**: prémia × kontrakty × 100 (veľkosť opčného kontraktu).
+    - **STK** (akcie v denníku): cena × počet akcií — **bez** ×100 (inak by súčet bol 100× príliš vysoký).
+    """
     try:
         c = float(t.get("contracts") or 1)
         e = float(t.get("entry_price") or 0)
-        return abs(e) * c * 100.0
+        ot = str(t.get("option_type") or "").strip().upper()
+        mult = 1.0 if ot in ("STK", "STOCK") else 100.0
+        return abs(e) * c * mult
     except (TypeError, ValueError):
         return 0.0
 
@@ -1645,12 +1697,12 @@ m2.metric("Skupín (v zobrazení)", str(n_groups))
 if open_trades:
     notionals = [_notional_per_leg(t) for t in open_trades]
     m3.metric(
-        "Σ |vstupná prémia| × 100",
+        "Σ |vstup| — USD (opcie ×100, STK nie)",
         f"${sum(notionals):,.0f}",
-        help="Súčet |prémia| × kontrakty × 100 z denníka.",
+        help="Opčné nohy: |entry $/akcia| × kontrakty × 100. STK: |$/akcia| × počet ks (bez ×100).",
     )
 else:
-    m3.metric("Σ |vstupná prémia| × 100", "—")
+    m3.metric("Σ |vstup| — USD (opcie ×100, STK nie)", "—")
 
 st.subheader("Otvorené pozície")
 

@@ -318,21 +318,24 @@ if group_section == "Prehľad a úprava":
                         del_btn = st.form_submit_button("Zmazať skupinu", type="secondary",
                                                          use_container_width=True)
 
-                if save_btn:
-                    db.update_group(g["id"], e_name, e_desc, e_ticker, e_strategy)
-                    # Ak sa zmenil názov, aktualizuj aj všetky referencie
-                    if e_name != gname:
-                        db.bulk_set_group_id(
-                            [t["id"] for t in all_trades if t.get("group_id") == gname],
-                            e_name,
-                        )
-                    st.success(f"Skupina **{e_name}** aktualizovaná.")
-                    st.rerun()
+                    # Spracovanie musí byť vnútri formu (Streamlit ≥1.42 spoľahlivo zosúladí submit s hodnotami widgetov).
+                    if save_btn:
+                        db.update_group(g["id"], e_name, e_desc, e_ticker, e_strategy)
+                        # Ak sa zmenil názov, aktualizuj aj všetky referencie
+                        if e_name != gname:
+                            db.bulk_set_group_id(
+                                [t["id"] for t in all_trades if t.get("group_id") == gname],
+                                e_name,
+                            )
+                        st.success(f"Skupina **{e_name}** aktualizovaná.")
+                        st.rerun()
 
-                if del_btn:
-                    db.delete_group(g["id"])
-                    st.warning(f"Skupina **{gname}** zmazaná. Obchody a poznámky si zachovali Group ID text.")
-                    st.rerun()
+                    if del_btn:
+                        db.delete_group(g["id"])
+                        st.warning(
+                            f"Skupina **{gname}** zmazaná. Obchody a poznámky si zachovali Group ID text."
+                        )
+                        st.rerun()
 
                 # Nohy v tejto skupine – zobrazujeme len Open, Closed filtrujeme
                 all_legs = [t for t in all_trades if t.get("group_id") == gname]
