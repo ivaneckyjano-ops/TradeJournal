@@ -181,13 +181,16 @@ def _render_delta_hedge_panel() -> None:
 
     with st.expander("Delta hedge — podklad prvého rádu", expanded=False):
         _dh_alt_col_help = (
-            "Riadok hovorí, koľko opčných kontraktov kúpiť. "
-            "Delta je na 1 akciu podkladu; ×100 = veľkosť US kontraktu."
+            "Odporúčanie berie najbližší reálny kontrakt z posledného uloženého option chainu "
+            "pre daný ticker. Preferuje expiráciu short nohy a minimálne 1 DTE. "
+            "Ak chain chýba, zobrazí sa upozornenie."
         )
         _dh_alt_legend = (
-            "**Odporúčanie (opcia)** = jednoduchý odhad: koľko **celých kontraktov** kúpiť. "
-            "Používame orientačnú deltu okolo **0,45** na akciu podkladu (call alebo put podľa smeru). "
-            "V praxi teda čítaš len: **Kúp 1 kontrakt s deltou okolo 0,45** alebo viac kontraktov podľa veľkosti hedgu."
+            "**Odporúčanie (opcia)** = najbližší **reálny kontrakt** z lokálnej databázy option chainov "
+            "(strana Call/Put podľa smeru hedgu). Preferencia: expirácia podľa **short nohy**, ale aspoň **1 DTE**. "
+            "V rámci tejto expirácie sa vyberá kombinácia **počet kontraktov + skutočná delta**, ktorá čo najlepšie sedí "
+            "na požadovaný hedge. Text ukazuje počet kontraktov, približnú **skutočnú deltu** z chainu a aj "
+            "**strike + expiráciu**, aby si vedel, ktorý kontrakt hľadať v TWS."
         )
         st.caption(
             "**Z DB:** otvorené nohy a **Δ aktuálna** (inak Δ vstup). **Úvaha:** skopíruj Δ z OptionTrader/TWS — "
@@ -314,7 +317,13 @@ def _render_delta_hedge_panel() -> None:
                 dd = dhp.dollar_delta(net, spot) if spot > 0 else None
                 hedge = dhp.hedge_shares_for_target(net, float(target_d))
                 _, inside = dhp.apply_deadband(hedge, float(deadband))
-                _rec_stk, _rec_opt = dhp.hedge_table_recommendation_cells(hedge, inside_deadband=inside)
+                _pref_exp = dhp.preferred_short_expiry_for_ticker(open_tr, tk)
+                _rec_stk, _rec_opt = dhp.hedge_table_recommendation_cells(
+                    hedge,
+                    inside_deadband=inside,
+                    ticker=tk,
+                    preferred_expiry=_pref_exp,
+                )
                 rows.append(
                     {
                         "Ticker": tk,
@@ -452,7 +461,11 @@ def _render_delta_hedge_panel() -> None:
         _wdd = dhp.dollar_delta(_wnet, float(w_spot)) if w_spot and w_spot > 0 else None
         _wh = dhp.hedge_shares_for_target(_wnet, float(w_target))
         _w_in = dhp.apply_deadband(_wh, float(w_dead))[1]
-        _w_stk, _w_opt = dhp.hedge_table_recommendation_cells(_wh, inside_deadband=_w_in)
+        _w_stk, _w_opt = dhp.hedge_table_recommendation_cells(
+            _wh,
+            inside_deadband=_w_in,
+            ticker=whatif_tk,
+        )
         _wrows = [
             {
                 "Ticker": whatif_tk,
