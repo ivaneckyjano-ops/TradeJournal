@@ -353,6 +353,7 @@ def journal_group_pl_stoploss_short_window(
         "x_spot_minus_short": x_rel,
         "spots": spots,
         "k_short": float(K_short),
+        "short_option_type": str(leg_s.get("option_type") or "") if leg_s else "",
         "short_expiry": short_exp,
         "ticker": ticker,
         "marker_spot": marker_spot,

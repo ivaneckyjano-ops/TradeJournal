@@ -138,6 +138,12 @@ def init_db() -> None:
     _migrate_sector_performance_snapshots(get_connection())
     _migrate_ticker_correlation_data(get_connection())
     _migrate_trade_journal_greeks(get_connection())
+    for _db_path in {path, LIVE_DB_PATH, PAPER_DB_PATH}:
+        if _db_path != path and not os.path.isfile(_db_path):
+            continue
+        with get_connection(_db_path) as _conn_tgs_fk:
+            _migrate_trade_greek_snapshots_fk(_conn_tgs_fk)
+            _conn_tgs_fk.commit()
     _migrate_trading_commands(get_connection())
     _migrate_events(get_connection())
     with get_connection() as conn:
@@ -355,6 +361,37 @@ def _migrate_trade_journal_greeks(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_tgs_trade_time ON trade_greek_snapshots (trade_id, recorded_at)"
     )
     conn.commit()
+    _migrate_trade_greek_snapshots_fk(conn)
+    conn.commit()
+
+
+def _migrate_trade_greek_snapshots_fk(conn: sqlite3.Connection) -> None:
+    """
+    Opraví FK ``trade_greek_snapshots.trade_id`` → ``trades(id)``.
+
+    Po migrácii STK mohla tabuľka vzniknúť s REFERENCES na ``trades_mig_old``,
+    hoci rodič ``trades`` už existuje — potom každý INSERT spadne na FK.
+    """
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='trade_greek_snapshots'"
+    ).fetchone():
+        return
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='trades'"
+    ).fetchone():
+        return
+    fks = conn.execute('PRAGMA foreign_key_list("trade_greek_snapshots")').fetchall()
+    if not fks:
+        return
+    parent = str(fks[0][2] or "")
+    if parent == "trades":
+        return
+    fk_prev = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        _rebuild_table_fix_fk_parent(conn, "trade_greek_snapshots", parent, "trades")
+    finally:
+        conn.execute(f"PRAGMA foreign_keys={int(fk_prev)}")
 
 
 def _migrate_trading_commands(conn: sqlite3.Connection) -> None:
@@ -1067,21 +1104,32 @@ def set_trade_portfolio_greeks(
 ) -> None:
     """
     Journal / Portfolio: vstupné a aktuálne Gréky + IV v denníku (doplnenie oproti TWS).
-    ``None`` pri volaní znamená „nezmenené“ len ak volajúci posiela výhradne staré API — pri úplnom zápise z UI pošli všetky hodnoty z riadka.
+    ``None`` pri volaní znamená „nezmenené“.
+    To je dôležité pri neúplnom live fetche z TWS: už raz uložené gréky/IV sa nesmú
+    zmazať len preto, že ďalší fetch niektoré polia nevrátil.
     """
     with get_connection() as conn:
+        row = conn.execute(
+            "SELECT iv_at_entry, delta_at_entry, theta_at_entry, delta_current, "
+            "vega_at_entry, vega_current, iv_current, theta_current "
+            "FROM trades WHERE id=?",
+            (trade_id,),
+        ).fetchone()
+        if not row:
+            return
+        cur = dict(row)
         conn.execute(
             "UPDATE trades SET iv_at_entry=?, delta_at_entry=?, theta_at_entry=?, delta_current=?, "
             "vega_at_entry=?, vega_current=?, iv_current=?, theta_current=? WHERE id=?",
             (
-                iv_at_entry,
-                delta_at_entry,
-                theta_at_entry,
-                delta_current,
-                vega_at_entry,
-                vega_current,
-                iv_current,
-                theta_current,
+                cur.get("iv_at_entry") if iv_at_entry is None else iv_at_entry,
+                cur.get("delta_at_entry") if delta_at_entry is None else delta_at_entry,
+                cur.get("theta_at_entry") if theta_at_entry is None else theta_at_entry,
+                cur.get("delta_current") if delta_current is None else delta_current,
+                cur.get("vega_at_entry") if vega_at_entry is None else vega_at_entry,
+                cur.get("vega_current") if vega_current is None else vega_current,
+                cur.get("iv_current") if iv_current is None else iv_current,
+                cur.get("theta_current") if theta_current is None else theta_current,
                 trade_id,
             ),
         )
@@ -1104,6 +1152,8 @@ def insert_trade_greek_snapshot(
     ts = recorded_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     src = (source or "journal").strip() or "journal"
     with get_connection() as conn:
+        if not conn.execute("SELECT 1 FROM trades WHERE id=?", (rid,)).fetchone():
+            return 0
         cur = conn.execute(
             """
             INSERT INTO trade_greek_snapshots (trade_id, recorded_at, delta, theta_usd, vega, iv, source)

@@ -1520,6 +1520,14 @@ def _journal_leg_theta_vega_usd(trade: dict, greeks: dict) -> tuple[float | None
 
 def _journal_write_live_greeks_for_trade(trade: dict, positions: list[dict]) -> bool:
     """Zápis aktuálnych Grékov z IB/TWS cache do DB pre jednu nohu. Vráti True ak sa podarilo."""
+    try:
+        tid = int(trade["id"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    db_trade = db.get_trade_by_id(tid)
+    if not db_trade or str(db_trade.get("status") or "Open").strip().lower() != "open":
+        return False
+    trade = db_trade
     g, src = greek_for_trade(trade, positions, {}, {})
     if src not in ("live", "bs") or not g:
         return False
@@ -1527,7 +1535,6 @@ def _journal_write_live_greeks_for_trade(trade: dict, positions: list[dict]) -> 
         g.get(k) not in (None, 0, 0.0) for k in ("delta", "theta", "vega", "iv")
     ):
         return False
-    tid = int(trade["id"])
     th_usd, ve_usd = _journal_leg_theta_vega_usd(trade, g)
     try:
         dc = float(g["delta"]) if g.get("delta") is not None else None
@@ -1549,6 +1556,22 @@ def _journal_write_live_greeks_for_trade(trade: dict, positions: list[dict]) -> 
         theta_entry = th_usd
     if vega_entry is None and ve_usd is not None:
         vega_entry = ve_usd
+
+    _old_dc = trade.get("delta_current")
+    _old_tc = trade.get("theta_current")
+    _old_vc = trade.get("vega_current")
+    _old_ivc = trade.get("iv_current")
+
+    def _changed(a, b, tol: float = 1e-9) -> bool:
+        if a is None and b is None:
+            return False
+        if a is None or b is None:
+            return True
+        try:
+            return abs(float(a) - float(b)) > tol
+        except (TypeError, ValueError):
+            return str(a) != str(b)
+
     db.set_trade_portfolio_greeks(
         tid,
         iv_entry,
@@ -1560,6 +1583,23 @@ def _journal_write_live_greeks_for_trade(trade: dict, positions: list[dict]) -> 
         iv_current=iv_c,
         theta_current=th_usd,
     )
+    if any(v is not None for v in (dc, th_usd, ve_usd, iv_c)) and any(
+        _changed(old, new)
+        for old, new in (
+            (_old_dc, dc),
+            (_old_tc, th_usd),
+            (_old_vc, ve_usd),
+            (_old_ivc, iv_c),
+        )
+    ):
+        db.insert_trade_greek_snapshot(
+            tid,
+            delta=dc,
+            theta_usd=th_usd,
+            vega=ve_usd,
+            iv=iv_c,
+            source="tws_sync",
+        )
     return True
 
 
@@ -1575,11 +1615,19 @@ def _journal_refresh_group_from_tws(legs_edit: list[dict]) -> tuple[bool, str]:
     poss = list(res.get("positions") or [])
     ibkr.set_scoped_session_value("live_positions", poss)
     st.session_state["last_sync"] = datetime.now().strftime("%H:%M:%S")
+    open_by_id = {int(t["id"]): t for t in db.get_open_trades()}
     n_ok = 0
     for tr in legs_edit:
         if str(tr.get("status") or "Open").strip().lower() != "open":
             continue
-        if _journal_write_live_greeks_for_trade(tr, poss):
+        try:
+            tid = int(tr["id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        fresh = open_by_id.get(tid)
+        if not fresh:
+            continue
+        if _journal_write_live_greeks_for_trade(fresh, poss):
             n_ok += 1
     n_legs = len(legs_edit)
     return True, f"TWS: cache obnovená; do DB zapísané Gréky pre **{n_ok}** / **{n_legs}** nôh tejto skupiny."
@@ -2136,6 +2184,57 @@ else:
                     _m_th_c,
                     help="Súčet Θ aktuálna ($/deň) — expander Vysvetlivky k metrikám.",
                 )
+
+            with st.expander(
+                "Sledovanie short nohy (rýchly prehľad)",
+                expanded=False,
+            ):
+                _tk_sl_q = str(legs_edit[0].get("ticker") or "").strip().upper() if legs_edit else ""
+                _s0sl_q, _src_sl_q = _journal_resolve_spot_for_pl(_tk_sl_q, _pf_live_pos)
+                _pl_stop_q = journal_group_pl_stoploss_short_window(
+                    legs_edit, spot_center=_s0sl_q, marker_source=_src_sl_q
+                )
+                if _pl_stop_q is None:
+                    st.caption(
+                        "Treba aspoň jednu **short opčnú nohu** so strike a expiráciou na jednom tickeri."
+                    )
+                else:
+                    _kq = float(_pl_stop_q["k_short"])
+                    _sq = _pl_stop_q.get("marker_spot")
+                    _xrel_q = _pl_stop_q.get("marker_x_rel")
+                    _ep_q = _pl_stop_q.get("short_entry_per_share")
+                    _ex_q = str(_pl_stop_q.get("short_expiry") or "")
+                    _ot_q = str(_pl_stop_q.get("short_option_type") or "").strip().upper()
+                    _q1, _q2, _q3, _q4 = st.columns(4)
+                    _q1.metric("Short strike", f"{_kq:g}")
+                    _q2.metric("Short exp.", _ex_q or "—")
+                    _q3.metric("Spot teraz", f"{float(_sq):.2f}" if _sq is not None else "—")
+                    _q4.metric("spot − K", f"{float(_xrel_q):+,.2f}" if _xrel_q is not None else "—")
+                    if _xrel_q is not None:
+                        _xq = float(_xrel_q)
+                        if abs(_xq) < 0.01:
+                            st.warning("Short noha je teraz prakticky **na strike**.")
+                        elif _xq > 0:
+                            _msg = f"Short noha je teraz približne **{_xq:.2f} USD nad strike**."
+                            if _ot_q.startswith("C"):
+                                st.error(_msg)
+                            else:
+                                st.success(_msg)
+                        else:
+                            _msg = f"Short noha je teraz približne **{abs(_xq):.2f} USD pod strike**."
+                            if _ot_q.startswith("P"):
+                                st.error(_msg)
+                            else:
+                                st.success(_msg)
+                    st.caption(
+                        f"Vstupná prémia short nohy: **{abs(float(_ep_q)):.2f} $/akcia**."
+                        if _ep_q is not None
+                        else "Vstupná prémia short nohy zatiaľ nie je k dispozícii."
+                    )
+                    st.caption(
+                        "Detailný graf a tabuľka P&L podľa short nohy sú nižšie v sekcii "
+                        "**Stop-loss: P&L vs. podklad**."
+                    )
     
             _dd_ib, _n_dd_ib = _journal_group_delta_dollars_ib(
                 edited, orig_by_id, _pf_live_pos
